@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.39
+
+- Added a comparison table for `lctr` against sist2, Cardinal, fuz, KatSearch, File Find, fsindex, WindFind, cling, and fd.
+- Added a Windows PowerShell installer with GitHub Release download and Rust fallback.
+- Added a cross-platform release workflow that packages macOS, Linux, and Windows binaries.
+- Expanded CI to run on macOS, Linux, and Windows.
+- Documented the Windows `winget` path and native NTFS scan optimization plan.
+
 ## 0.1.38
 
 - Relicensed locator as GPL-3.0-only for Homebrew core eligibility.

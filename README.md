@@ -6,7 +6,7 @@ Fast local file metadata search from the terminal.
 
 ## Install
 
-Recommended installer:
+macOS recommended installer:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/NotTanJune/locator/main/install.sh | sh
@@ -29,7 +29,7 @@ brew upgrade lctr
 From GitHub:
 
 ```bash
-cargo install --git https://github.com/NotTanJune/locator --tag v0.1.38
+cargo install --git https://github.com/NotTanJune/locator --tag v0.1.39
 ```
 
 From a local checkout:
@@ -37,6 +37,22 @@ From a local checkout:
 ```bash
 cargo install --path .
 ```
+
+Windows installer:
+
+```powershell
+irm https://raw.githubusercontent.com/NotTanJune/locator/main/install.ps1 | iex
+```
+
+The Windows installer downloads the latest release asset when one is available. If no release asset exists yet and Rust is installed, it falls back to `cargo install --git https://github.com/NotTanJune/locator`.
+
+Future Windows package manager target:
+
+```powershell
+winget install lctr
+```
+
+That short command requires acceptance into the Windows Package Manager Community Repository.
 
 Optional zsh integration:
 
@@ -190,6 +206,30 @@ lctr scan /Volumes/MyDrive --no-stage-index --no-profile-detail
 - v1 does not index file contents.
 - Scanner is session-scoped, not a background daemon.
 - Common noisy files and directories are skipped: `.DS_Store`, `._*`, `__MACOSX`, `.git`, `.locator`, `node_modules`, caches, build outputs, DerivedData, Spotlight metadata, and trash.
+
+## Comparison
+
+`lctr` is for people who want local file search from the terminal: a fast metadata index, a dense keyboard-first TUI, and a scriptable `find` command. It intentionally does not index file contents in v1.
+
+| Tool | Focus | Interface | Index model | Content search | Platform | How `lctr` differs |
+|---|---|---|---|---|---|---|
+| `lctr` | Local metadata search | CLI + TUI | SQLite metadata index | No | macOS and Linux now, Windows release path in progress | Terminal-first, local `.locator` indexes, hybrid indexed/live search, no daemon |
+| [sist2](https://github.com/sist2app/sist2) | Full file system indexing with media extraction | Web UI + CLI | SQLite or Elasticsearch search index | Yes, including OCR and archives | Docker on Windows, Linux, and macOS; executable path is Linux/WSL focused | `lctr` is lighter, terminal-native, and metadata-only |
+| [Cardinal](https://github.com/cardisoft/cardinal) | Fast macOS file search app | Native GUI | App-managed search index | Yes | macOS | `lctr` is CLI/TUI first and built for repeatable terminal workflows |
+| [fuz](https://github.com/Magnushhoie/fuz) | Fuzzy text, file, and folder search | Terminal fuzzy UI | Live toolchain over `fzf`, `rg`, and `bat` | Yes for text workflows | Shell environments with required tools | `lctr` persists a metadata index for fast repeated filename/path searches |
+| [KatSearch](https://github.com/sveinbjornt/KatSearch) | macOS filesystem catalog search | Native GUI | No persistent index | No | macOS | `lctr` stores portable SQLite indexes and adds scriptable CLI output |
+| [File Find](https://github.com/Pixel-Master/File-Find) | Desktop file search utility | GUI | Cache-based search | Limited raw text search | macOS, Linux, Windows | `lctr` is lower-friction for terminal users and automation |
+| [fsindex](https://github.com/xandwr/fsindex) | Filesystem indexing library | Rust API | Library-managed index | Optional content/chunk features | Rust library | `lctr` is an end-user command, not an embedded library |
+| [WindFind](https://github.com/kingToolbox/WindFind) | Windows-first instant file location | CLI | Compact Windows-focused index | No | Windows | `lctr` aims to bring indexed search to a cross-platform CLI/TUI workflow |
+| [cling](https://github.com/root-project/cling) | C++ interpreter | REPL | Not a file search tool | Not a file search tool | Cross-platform source | Not a direct competitor; included only because it came up in the comparison set |
+| [fd](https://github.com/sharkdp/fd) | Fast live filesystem finding | CLI | No persistent index | No | Cross-platform | `lctr` trades an initial scan for instant indexed search, richer metadata filters, and an interactive TUI |
+
+## Windows Status
+
+Windows support is being added in two steps:
+
+1. Release binaries and installer: publish `lctr-x86_64-pc-windows-msvc.zip`, install with PowerShell, then submit a `winget` manifest.
+2. Native Windows scan speed: add an NTFS-aware backend behind Windows-only code, with automatic fallback to the current parallel filesystem walk for non-NTFS, network, or permission-limited roots.
 
 ## License
 
