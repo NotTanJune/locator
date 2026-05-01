@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.40
+
+- Fixed Linux and Windows `cargo clippy --all-targets -- -D warnings` by marking macOS-native scanner helpers as intentionally unused on non-macOS targets.
+
 ## 0.1.39
 
 - Added a comparison table for `lctr` against sist2, Cardinal, fuz, KatSearch, File Find, fsindex, WindFind, cling, and fd.

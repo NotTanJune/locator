@@ -657,6 +657,7 @@ pub(crate) fn kind_for(path: &Path, is_dir: bool) -> String {
     .to_string()
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn kind_for_extension(extension: Option<&str>) -> String {
     match extension {
         Some("pdf") => "pdf",
@@ -830,6 +831,7 @@ impl<'a> ScanWriter<'a> {
     }
 }
 
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 enum NativeScanEntry {
     File(FileRecord),
     Files(Vec<FileRecord>),

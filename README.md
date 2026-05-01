@@ -29,7 +29,7 @@ brew upgrade lctr
 From GitHub:
 
 ```bash
-cargo install --git https://github.com/NotTanJune/locator --tag v0.1.39
+cargo install --git https://github.com/NotTanJune/locator --tag v0.1.40
 ```
 
 From a local checkout:
