@@ -1,6 +1,6 @@
 # Contributing
 
-This project is source-available, not open source. Public redistribution or published forks are not permitted without written permission.
+This project is licensed under GPL-3.0-only.
 
 ## Development
 

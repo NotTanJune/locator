@@ -1,11 +1,11 @@
 [package]
 name = "locator"
-version = "0.1.37"
+version = "0.1.38"
 edition = "2021"
 description = "Fast local file metadata search"
-repository = "https://github.com/nottanjune/locator"
-homepage = "https://github.com/nottanjune/locator"
-license-file = "LICENSE"
+repository = "https://github.com/NotTanJune/locator"
+homepage = "https://github.com/NotTanJune/locator"
+license = "GPL-3.0-only"
 
 [lib]
 name = "locator"

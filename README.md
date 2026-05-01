@@ -6,16 +6,30 @@ Fast local file metadata search from the terminal.
 
 ## Install
 
-Homebrew, after the tap is published:
+Recommended installer:
 
 ```bash
-brew install nottanjune/locator/lctr
+curl -fsSL https://raw.githubusercontent.com/NotTanJune/locator/main/install.sh | sh
+```
+
+Manual Homebrew install:
+
+```bash
+brew tap NotTanJune/locator https://github.com/NotTanJune/locator
+brew install lctr
+```
+
+After the tap is installed, future installs and upgrades can use the short formula name:
+
+```bash
+brew install lctr
+brew upgrade lctr
 ```
 
 From GitHub:
 
 ```bash
-cargo install --git https://github.com/nottanjune/locator --tag v0.1.37
+cargo install --git https://github.com/NotTanJune/locator --tag v0.1.38
 ```
 
 From a local checkout:
@@ -179,4 +193,8 @@ lctr scan /Volumes/MyDrive --no-stage-index --no-profile-detail
 
 ## License
 
-This project is source-available for personal use. See [LICENSE](LICENSE).
+This project is licensed under GPL-3.0-only. See [LICENSE](LICENSE).
+
+## Homebrew Core Status
+
+The current tap-based install works now. Bare first-time `brew install lctr` for users who have not tapped this repository requires acceptance into `homebrew/core`. The project has been relicensed to GPL-3.0-only and includes a Homebrew formula to prepare that submission.
