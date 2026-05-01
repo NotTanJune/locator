@@ -1,5 +1,6 @@
 use std::fs;
 use std::io;
+#[cfg(unix)]
 use std::os::unix::fs::symlink;
 
 use locator::db::Database;
@@ -239,6 +240,7 @@ fn scanner_classifies_common_metadata_errors() {
 }
 
 #[test]
+#[cfg(unix)]
 fn scanner_indexes_broken_symlink_without_metadata_error() {
     let dir = tempdir().expect("temp dir");
     symlink(

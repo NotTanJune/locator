@@ -1,6 +1,7 @@
 use assert_cmd::Command;
 use predicates::prelude::PredicateBooleanExt;
 use predicates::str::contains;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use tempfile::tempdir;
 
@@ -134,6 +135,7 @@ fn staged_scan_creates_directory_local_index() {
 }
 
 #[test]
+#[cfg(unix)]
 fn staged_scan_readonly_root_falls_back_to_app_support_index() {
     let root = tempdir().expect("root");
     let data = tempdir().expect("data dir");
@@ -177,6 +179,7 @@ fn staged_scan_readonly_root_falls_back_to_app_support_index() {
 }
 
 #[test]
+#[cfg(unix)]
 fn scan_readonly_root_falls_back_to_app_support_index() {
     let root = tempdir().expect("root");
     let data = tempdir().expect("data dir");

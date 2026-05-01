@@ -2,7 +2,7 @@ class Lctr < Formula
   desc "Fast local file metadata search"
   homepage "https://github.com/NotTanJune/locator"
   url "https://github.com/NotTanJune/locator.git",
-      tag: "v0.1.40"
+      tag: "v0.1.41"
   license "GPL-3.0-only"
   head "https://github.com/NotTanJune/locator.git", branch: "main"
 
@@ -13,6 +13,6 @@ class Lctr < Formula
   end
 
   test do
-    assert_match "lctr 0.1.40", shell_output("#{bin}/lctr --version")
+    assert_match "lctr 0.1.41", shell_output("#{bin}/lctr --version")
   end
 end

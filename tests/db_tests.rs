@@ -4,6 +4,7 @@ use locator::db::{
     fallback_db_path_for_root, local_db_path_for_root, Database, FileRecord, ScanCompletion,
 };
 use locator::query::{QueryMode, SearchFilters, SearchOptions, SortField};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Mutex;
 use tempfile::tempdir;
@@ -68,6 +69,7 @@ fn finds_records_by_keyword_and_filters() {
 }
 
 #[test]
+#[cfg(unix)]
 fn readonly_existing_database_can_be_searched_without_migration() {
     let dir = tempdir().expect("temp dir");
     let db_path = dir.path().join("index.sqlite");
