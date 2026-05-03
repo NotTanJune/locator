@@ -6,17 +6,27 @@ Fast local file metadata search from the terminal.
 
 ## Demo
 
-### Indexed External SSD
+<details>
+<summary>Click to expand the indexed external SSD demo GIF</summary>
+
+### External SSD
 
 Finder search is so slow on this indexed external SSD workflow that it is literally pointless to use here. `lctr` returns local metadata results immediately from the terminal.
 
 ![lctr search on an indexed external SSD](assets/ssd-30fps.gif)
 
-### Indexed Internal SSD
+</details>
+
+<details>
+<summary>Click to expand the indexed internal SSD demo GIF</summary>
+
+### Internal SSD
 
 On the internal SSD, `lctr` is still faster by a bit, and the returned results are more relevant than Finder search while arriving sooner.
 
 ![lctr search on an indexed internal SSD](assets/internal-ssd.gif)
+
+</details>
 
 ## Install
 
