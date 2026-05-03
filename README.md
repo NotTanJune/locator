@@ -302,3 +302,7 @@ Windows scanning also has room for a native speed pass. The current Windows path
 ## License
 
 This project is licensed under GPL-3.0-only. See [LICENSE](LICENSE).
+
+## Star History
+
+[![Star History Chart](https://api.star-history.com/chart?repos=NotTanJune/locator&type=date&legend=top-left)](https://www.star-history.com/?repos=NotTanJune%2Flocator&type=date&legend=top-left)
