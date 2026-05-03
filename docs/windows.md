@@ -2,7 +2,27 @@
 
 ## Install Path
 
-Current target:
+Recommended Scoop path:
+
+```powershell
+scoop bucket add locator https://github.com/NotTanJune/locator
+scoop install lctr
+```
+
+This repository contains a Scoop bucket manifest at:
+
+```text
+bucket/lctr.json
+```
+
+Upgrade through Scoop:
+
+```powershell
+scoop update
+scoop update lctr
+```
+
+Direct PowerShell installer:
 
 ```powershell
 irm https://raw.githubusercontent.com/NotTanJune/locator/main/install.ps1 | iex
@@ -20,9 +40,19 @@ It adds that directory to the user PATH. If the release asset is missing and Rus
 cargo install --git https://github.com/NotTanJune/locator --locked --force
 ```
 
+## Scoop Maintenance
+
+The current Scoop manifest installs the Windows release asset:
+
+```text
+https://github.com/NotTanJune/locator/releases/download/v0.1.41/lctr-x86_64-pc-windows-msvc.zip
+```
+
+The manifest uses GitHub release checking and Scoop autoupdate with download hashing, so future releases can be updated with Scoop's `checkver.ps1` workflow.
+
 ## WinGet Path
 
-After the first tagged release publishes a Windows zip:
+After the Windows install path has usage and validation:
 
 1. Generate SHA256 for `lctr-x86_64-pc-windows-msvc.zip`.
 2. Add a package manifest to `microsoft/winget-pkgs`.
