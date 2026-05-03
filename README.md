@@ -64,7 +64,7 @@ Local checkout:
 cargo install --path .
 ```
 
-###🪟 Windows
+### 🪟 Windows
 
 Scoop:
 
