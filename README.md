@@ -9,6 +9,8 @@ Fast local file metadata search from the terminal.
 ### External SSD
 
 Finder search is so slow on this indexed external SSD workflow that it is literally pointless to use here. `lctr` returns local metadata results immediately from the terminal.
+
+Apple does try to index external drives, but in practice it can be slow, fail silently, or lose usefulness when a drive is disconnected. `lctr` keeps the searchable index tied to the directory or drive you scan, so the workflow is explicit and repeatable.
 <details>
 <summary>Click to expand the indexed external SSD demo GIF</summary>
 
@@ -249,13 +251,28 @@ lctr scan /Volumes/MyDrive --no-stage-index --no-profile-detail
 
 `--stage-index` builds a fresh SQLite database in app-support storage, then copies the finished index into `<ROOT>/.locator/index.sqlite`. If the root is read-only, the finished index stays in app-support fallback storage.
 
-## Privacy
+## Security, Privacy, And Index Deletion
 
-- Metadata stays local.
-- v1 indexes paths, filenames, extensions, roots, volumes, file kinds, sizes, and dates.
-- v1 does not index file contents.
-- Scanner is session-scoped, not a background daemon.
-- Common noisy files and directories are skipped: `.DS_Store`, `._*`, `__MACOSX`, `.git`, `.locator`, `node_modules`, caches, build outputs, DerivedData, Spotlight metadata, and trash.
+`lctr` does not collect, upload, sell, or transmit any information from your machine. There is no account, telemetry, analytics, cloud sync, or background service.
+
+Indexes are local SQLite files. By default, a scan writes to the directory you scan:
+
+```bash
+<ROOT>/.locator/index.sqlite
+```
+
+If that location is not writable, `lctr` stores a fallback index in local app-support storage for your user account. The indexed data is metadata only: paths, filenames, extensions, roots, volumes, file kinds, sizes, and dates. `lctr` does not index file contents.
+
+Delete an index whenever you want:
+
+```bash
+lctr delete-index
+lctr delete-index /Volumes/MyDrive
+```
+
+After deletion, `lctr search` falls back to live filesystem search until you scan that directory again.
+
+Scanner behavior is session-scoped, not a daemon. Common noisy files and directories are skipped: `.DS_Store`, `._*`, `__MACOSX`, `.git`, `.locator`, `node_modules`, caches, build outputs, DerivedData, Spotlight metadata, and trash.
 
 ## Comparison
 
