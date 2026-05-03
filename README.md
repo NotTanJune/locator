@@ -1,10 +1,10 @@
-# locator
+# 🔍 locator
 
 Fast local file metadata search from the terminal.
 
 `locator` builds a local SQLite index for filenames, paths, file kinds, sizes, and dates. The command is `lctr`. It does not upload data and does not index file contents.
 
-## Demo
+## ✨ Demo
 
 ### External Drives
 
@@ -12,7 +12,7 @@ Finder search is so slow on this indexed external SSD workflow that it is litera
 
 Apple does try to index external drives, but in practice it can be slow, fail silently, or lose usefulness when a drive is disconnected. `lctr` keeps the searchable index tied to the directory or drive you scan, so the workflow is explicit and repeatable.
 <details>
-<summary><b>Click to expand the indexed external SSD demo GIF</b></summary>
+<summary><b> 🎬 Click to expand the indexed external SSD demo GIF</b></summary>
 
 ![lctr search on an indexed external SSD](assets/ssd-30fps.gif)
 
@@ -22,7 +22,7 @@ Apple does try to index external drives, but in practice it can be slow, fail si
 
 On the internal SSD, `lctr` is still faster by a bit, and the returned results are more relevant than Finder search while arriving sooner.
 <details>
-<summary><b>Click to expand the indexed internal SSD demo GIF</b></summary>
+<summary><b> 🎬 Click to expand the indexed internal SSD demo GIF</b></summary>
 
 ![lctr search on an indexed internal SSD](assets/internal-ssd.gif)
 
@@ -30,7 +30,7 @@ On the internal SSD, `lctr` is still faster by a bit, and the returned results a
 
 ## Install
 
-### macOS And Linux
+### 🍎 macOS And Linux
 
 Homebrew:
 
@@ -64,7 +64,7 @@ Local checkout:
 cargo install --path .
 ```
 
-### Windows
+###🪟 Windows
 
 Scoop:
 
@@ -274,7 +274,7 @@ After deletion, `lctr search` falls back to live filesystem search until you sca
 
 Scanner behavior is session-scoped, not a daemon. Common noisy files and directories are skipped: `.DS_Store`, `._*`, `__MACOSX`, `.git`, `.locator`, `node_modules`, caches, build outputs, DerivedData, Spotlight metadata, and trash.
 
-## Comparison
+##📊 Comparison
 
 `lctr` is for people who want local file search from the terminal: a fast metadata index, a dense keyboard-first TUI, and a scriptable `find` command. It intentionally does not index file contents in v1.
 
@@ -291,7 +291,7 @@ Scanner behavior is session-scoped, not a daemon. Common noisy files and directo
 | [cling](https://github.com/root-project/cling) | C++ interpreter | REPL | Not a file search tool | Not a file search tool | Cross-platform source | Not a direct competitor; included only because it came up in the comparison set |
 | [fd](https://github.com/sharkdp/fd) | Fast live filesystem finding | CLI | No persistent index | No | Cross-platform | `lctr` trades an initial scan for instant indexed search, richer metadata filters, and an interactive TUI |
 
-## Future Improvements
+##🗓️ Future Improvements
 
 The current distribution story is intentionally practical: Homebrew works through the project tap, Windows works through Scoop and the direct PowerShell installer, and GitHub Releases publish platform binaries.
 
@@ -303,7 +303,7 @@ Windows scanning also has room for a native speed pass. The current Windows path
 
 This project is licensed under GPL-3.0-only. See [LICENSE](LICENSE).
 
-## Star History
+## ⭐️ Star History
 
 <a href="https://www.star-history.com/?repos=NotTanJune%2Flocator&type=date&legend=top-left">
  <picture>
