@@ -274,7 +274,7 @@ After deletion, `lctr search` falls back to live filesystem search until you sca
 
 Scanner behavior is session-scoped, not a daemon. Common noisy files and directories are skipped: `.DS_Store`, `._*`, `__MACOSX`, `.git`, `.locator`, `node_modules`, caches, build outputs, DerivedData, Spotlight metadata, and trash.
 
-##📊 Comparison
+## 📊 Comparison
 
 `lctr` is for people who want local file search from the terminal: a fast metadata index, a dense keyboard-first TUI, and a scriptable `find` command. It intentionally does not index file contents in v1.
 
@@ -291,7 +291,7 @@ Scanner behavior is session-scoped, not a daemon. Common noisy files and directo
 | [cling](https://github.com/root-project/cling) | C++ interpreter | REPL | Not a file search tool | Not a file search tool | Cross-platform source | Not a direct competitor; included only because it came up in the comparison set |
 | [fd](https://github.com/sharkdp/fd) | Fast live filesystem finding | CLI | No persistent index | No | Cross-platform | `lctr` trades an initial scan for instant indexed search, richer metadata filters, and an interactive TUI |
 
-##🗓️ Future Improvements
+## 🗓️ Future Improvements
 
 The current distribution story is intentionally practical: Homebrew works through the project tap, Windows works through Scoop and the direct PowerShell installer, and GitHub Releases publish platform binaries.
 
