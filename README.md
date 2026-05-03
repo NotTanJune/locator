@@ -4,6 +4,20 @@ Fast local file metadata search from the terminal.
 
 `locator` builds a local SQLite index for filenames, paths, file kinds, sizes, and dates. The command is `lctr`. It does not upload data and does not index file contents.
 
+## Demo
+
+### Indexed External SSD
+
+Finder search is so slow on this indexed external SSD workflow that it is literally pointless to use here. `lctr` returns local metadata results immediately from the terminal.
+
+![lctr search on an indexed external SSD](assets/ssd-30fps.gif)
+
+### Indexed Internal SSD
+
+On the internal SSD, `lctr` is still faster by a bit, and the returned results are more relevant than Finder search while arriving sooner.
+
+![lctr search on an indexed internal SSD](assets/internal-ssd.gif)
+
 ## Install
 
 ### macOS And Linux
@@ -90,15 +104,17 @@ With shell integration installed, `lctr scan ~/Documents` scans `~/Documents`, s
 
 ## Usage
 
-Scan your home folder:
+Scan the current folder:
 
 ```bash
 lctr scan
 ```
 
-Scan a target folder or external drive:
+Scan your home folder, a target folder, or an external drive:
 
 ```bash
+lctr scan ~
+lctr scan ~/Documents
 lctr scan /Volumes/MyDrive
 ```
 

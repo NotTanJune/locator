@@ -33,6 +33,8 @@ mod theme;
 
 use theme::Theme;
 
+const INDEXED_INPUT_GRACE: Duration = Duration::from_millis(1500);
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SearchBackend {
     Indexed { db_path: PathBuf, root: PathBuf },
@@ -140,6 +142,7 @@ fn run_loop(
     let mut search_worker = SearchWorker::spawn(search_backend)?;
     let mut loading_query: Option<String> = None;
     let mut last_edit = Instant::now();
+    let mut indexed_input_exit_deadline: Option<Instant> = None;
 
     loop {
         while let Some(response) = search_worker.try_recv() {
@@ -158,8 +161,12 @@ fn run_loop(
                         );
                         normalize_selection(&mut selected, results.len());
                         if response.complete {
-                            input_mode =
-                                input_mode_after_indexed_response(input_mode, true, backend_label);
+                            indexed_input_exit_deadline = indexed_response_exit_deadline(
+                                response.complete,
+                                response.live_backfill,
+                                backend_label,
+                                Instant::now(),
+                            );
                             loading_query = None;
                             if response.live_backfill {
                                 search_state.mark_live_complete(response.options.query.clone());
@@ -183,6 +190,18 @@ fn run_loop(
             }
         }
 
+        if !input_mode {
+            indexed_input_exit_deadline = None;
+        } else if !input_mode_after_indexed_grace(
+            input_mode,
+            indexed_input_exit_deadline,
+            Instant::now(),
+        ) {
+            input_mode = false;
+            indexed_input_exit_deadline = None;
+            status = "normal mode".to_string();
+        }
+
         let query = input.as_str();
         if search_state.should_auto_submit(query, backend_label, last_edit.elapsed()) {
             let options = SearchOptions::new(query)
@@ -199,6 +218,7 @@ fn run_loop(
             {
                 search_state.mark_submitted(options, false);
                 loading_query = Some(query.to_string());
+                indexed_input_exit_deadline = None;
                 status = format!("searching {backend_label} index for {query}");
             }
         }
@@ -370,17 +390,20 @@ fn run_loop(
                 match key.code {
                     KeyCode::Esc if input_mode => {
                         input_mode = false;
+                        indexed_input_exit_deadline = None;
                         status = "normal mode".to_string();
                     }
                     KeyCode::Esc => break,
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => break,
                     KeyCode::Char('/') if !input_mode => {
                         input_mode = true;
+                        indexed_input_exit_deadline = None;
                         status = "search mode".to_string();
                     }
                     KeyCode::Backspace if input_mode && input.backspace() => {
                         search_state.mark_dirty();
                         last_edit = Instant::now();
+                        indexed_input_exit_deadline = None;
                         if backend_label == "live" {
                             all_results.clear();
                             results.clear();
@@ -491,6 +514,7 @@ fn run_loop(
                                 input.insert(ch);
                                 search_state.mark_dirty();
                                 last_edit = Instant::now();
+                                indexed_input_exit_deadline = None;
                                 if backend_label == "live" {
                                     all_results.clear();
                                     results.clear();
@@ -529,6 +553,7 @@ fn run_loop(
                                     live_backfill,
                                 })?;
                                 input_mode = input_mode_after_submit(true);
+                                indexed_input_exit_deadline = None;
                                 search_state.mark_submitted(options, live_backfill);
                                 loading_query = Some(query.to_string());
                                 if backend_label == "live" || live_backfill {
@@ -544,6 +569,7 @@ fn run_loop(
                             }
                             EnterAction::ConfirmSearch => {
                                 input_mode = false;
+                                indexed_input_exit_deadline = None;
                                 status = "search confirmed".to_string();
                             }
                             EnterAction::OpenSelection => {
@@ -773,12 +799,25 @@ fn input_mode_after_submit(submitted: bool) -> bool {
     !submitted
 }
 
-fn input_mode_after_indexed_response(
-    input_mode: bool,
+fn indexed_response_exit_deadline(
     response_complete: bool,
+    live_backfill: bool,
     backend_label: &str,
+    now: Instant,
+) -> Option<Instant> {
+    if response_complete && !live_backfill && matches!(backend_label, "indexed" | "hybrid") {
+        Some(now + INDEXED_INPUT_GRACE)
+    } else {
+        None
+    }
+}
+
+fn input_mode_after_indexed_grace(
+    input_mode: bool,
+    exit_deadline: Option<Instant>,
+    now: Instant,
 ) -> bool {
-    input_mode && !(response_complete && matches!(backend_label, "indexed" | "hybrid"))
+    input_mode && exit_deadline.is_none_or(|deadline| now < deadline)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1318,15 +1357,15 @@ mod tests {
     use crate::tui::theme::Theme;
     use crate::tui::{
         apply_local_result_options, controls_panel_height, enter_action, format_result_summary,
-        initial_input_mode, input_mode_after_indexed_response, input_mode_after_submit,
-        search_backend_for_directory, search_bar_line, search_hybrid, should_show_results,
-        sort_label, toggle_sort_order, top_chrome_height, top_controls_lines, top_status_line,
-        EnterAction, SearchBackend, SearchInput, SearchRequest, SearchState, SearchWorker,
-        TopPanelArgs,
+        indexed_response_exit_deadline, initial_input_mode, input_mode_after_indexed_grace,
+        input_mode_after_submit, search_backend_for_directory, search_bar_line, search_hybrid,
+        should_show_results, sort_label, toggle_sort_order, top_chrome_height, top_controls_lines,
+        top_status_line, EnterAction, SearchBackend, SearchInput, SearchRequest, SearchState,
+        SearchWorker, TopPanelArgs, INDEXED_INPUT_GRACE,
     };
     use ratatui::text::Line;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     fn test_result(
         name: &str,
@@ -1471,12 +1510,35 @@ mod tests {
     }
 
     #[test]
-    fn indexed_response_completion_exits_input_mode() {
-        assert!(!input_mode_after_indexed_response(true, true, "indexed"));
-        assert!(!input_mode_after_indexed_response(true, true, "hybrid"));
-        assert!(input_mode_after_indexed_response(true, false, "indexed"));
-        assert!(input_mode_after_indexed_response(true, true, "live"));
-        assert!(!input_mode_after_indexed_response(false, true, "indexed"));
+    fn indexed_response_completion_keeps_input_mode_until_grace_expires() {
+        let now = Instant::now();
+        let deadline = indexed_response_exit_deadline(true, false, "indexed", now);
+        let expected_grace = Duration::from_millis(1500);
+
+        assert_eq!(INDEXED_INPUT_GRACE, expected_grace);
+        assert_eq!(deadline, Some(now + expected_grace));
+        assert!(input_mode_after_indexed_grace(
+            true,
+            deadline,
+            now + expected_grace - Duration::from_millis(1)
+        ));
+        assert!(!input_mode_after_indexed_grace(
+            true,
+            deadline,
+            now + expected_grace
+        ));
+        assert!(!input_mode_after_indexed_grace(false, deadline, now));
+    }
+
+    #[test]
+    fn indexed_response_grace_starts_only_for_complete_indexed_results() {
+        let now = Instant::now();
+
+        assert!(indexed_response_exit_deadline(true, false, "indexed", now).is_some());
+        assert!(indexed_response_exit_deadline(true, false, "hybrid", now).is_some());
+        assert!(indexed_response_exit_deadline(false, false, "indexed", now).is_none());
+        assert!(indexed_response_exit_deadline(true, true, "hybrid", now).is_none());
+        assert!(indexed_response_exit_deadline(true, false, "live", now).is_none());
     }
 
     #[test]

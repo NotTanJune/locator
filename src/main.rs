@@ -24,7 +24,7 @@ struct Cli {
 #[allow(clippy::large_enum_variant)]
 enum Commands {
     Scan {
-        #[arg(default_value_os_t = home_dir())]
+        #[arg(default_value_os_t = current_dir())]
         root: PathBuf,
         #[arg(long, value_enum, default_value_t = ScanBackend::Dirent)]
         backend: ScanBackend,
@@ -168,7 +168,7 @@ fn main() -> Result<()> {
             };
             let mut frame_index = 0usize;
             let mut last_draw = Instant::now() - Duration::from_secs(1);
-            let stats = scan_root_with_progress(&db, root, options, |progress| {
+            let stats = scan_root_with_progress(&db, &root, options, |progress| {
                 if last_draw.elapsed() >= Duration::from_millis(90)
                     || matches!(
                         progress.phase,
@@ -198,8 +198,14 @@ fn main() -> Result<()> {
                 stats.indexed_files, stats.skipped_entries, stats.error_entries
             );
             print_scan_profile(&stats, show_profile_detail);
-            println!("next: run `lctr search` or `lctr find <query>` from this directory");
-            println!("cleanup: run `lctr delete-index` from this directory to remove this index");
+            println!(
+                "next: run `lctr search {}` or `lctr find <query>` from that directory",
+                root.display()
+            );
+            println!(
+                "cleanup: run `lctr delete-index {}` to remove this index",
+                root.display()
+            );
             if !stats.error_summaries.is_empty() {
                 println!("error summary:");
                 for (kind, summary) in &stats.error_summaries {
@@ -465,8 +471,8 @@ fn build_search_options(args: &FindArgs) -> Result<SearchOptions> {
         .with_filters(filters))
 }
 
-fn home_dir() -> PathBuf {
-    dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
+fn current_dir() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
 fn scan_spinner() -> ProgressBar {

@@ -74,6 +74,30 @@ fn scan_creates_directory_local_index_and_find_uses_current_directory() {
 }
 
 #[test]
+fn scan_without_root_indexes_current_directory() {
+    let root = tempdir().expect("root");
+    let root_path = root.path().canonicalize().expect("canonical root");
+    let home = tempdir().expect("home");
+    let data = tempdir().expect("data dir");
+    std::fs::write(root_path.join("invoice.pdf"), "fake").expect("write file");
+
+    let mut scan = Command::cargo_bin("lctr").expect("binary exists");
+    scan.current_dir(&root_path)
+        .env("HOME", home.path())
+        .env("LCTR_DATA_DIR", data.path())
+        .arg("scan")
+        .assert()
+        .success()
+        .stdout(contains(format!(
+            "staged index copied to {}",
+            root_path.join(".locator/index.sqlite").display()
+        )));
+
+    assert!(root_path.join(".locator/index.sqlite").exists());
+    assert!(!home.path().join(".locator/index.sqlite").exists());
+}
+
+#[test]
 fn scan_defaults_to_high_throughput_staged_profile() {
     let root = tempdir().expect("root");
     let data = tempdir().expect("data dir");
