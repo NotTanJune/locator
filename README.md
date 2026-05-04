@@ -12,9 +12,11 @@ Finder search is so slow on this indexed external SSD workflow that it is litera
 
 Apple does try to index external drives, but in practice it can be slow, fail silently, or lose usefulness when a drive is disconnected. `lctr` keeps the searchable index tied to the directory or drive you scan, so the workflow is explicit and repeatable.
 <details>
-<summary><b> 🎬 Click to expand the indexed external SSD demo GIF</b></summary>
+<summary><b> 🎬 Click to expand the indexed external SSD demo video</b></summary>
 
-![lctr search on an indexed external SSD](assets/vid-demo-lctr.mp4)
+<video src="assets/vid-demo-lctr.mp4" controls muted playsinline>
+  Your browser does not support embedded MP4 video. Open assets/vid-demo-lctr.mp4 to view the demo.
+</video>
 
 </details>
 
