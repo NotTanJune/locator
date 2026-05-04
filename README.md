@@ -14,7 +14,7 @@ Apple does try to index external drives, but in practice it can be slow, fail si
 <details>
 <summary><b> 🎬 Click to expand the indexed external SSD demo GIF</b></summary>
 
-![lctr search on an indexed external SSD](assets/ssd-30fps.gif)
+![lctr search on an indexed external SSD](assets/vid-demo-lctr.mp4)
 
 </details>
 
