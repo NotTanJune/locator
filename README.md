@@ -14,9 +14,14 @@ Apple does try to index external drives, but in practice it can be slow, fail si
 <details>
 <summary><b> 🎬 Click to expand the indexed external SSD demo video</b></summary>
 
-<video src="assets/vid-demo-lctr.mp4" controls muted playsinline>
-  Your browser does not support embedded MP4 video. Open assets/vid-demo-lctr.mp4 to view the demo.
+<video
+  src="https://github.com/user-attachments/assets/d564d410-cfd0-4685-a534-99d274d15863"
+  controls
+  muted
+  playsinline
+  width="100%">
 </video>
+
 
 </details>
 
