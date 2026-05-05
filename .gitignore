@@ -3,3 +3,4 @@
 *.sqlite-shm
 *.sqlite-wal
 .DS_Store
+social.md
