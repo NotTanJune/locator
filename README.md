@@ -23,7 +23,7 @@ Apple does try to index external drives, but in practice it can be slow, fail si
 
 ### Internal Drive
 
-On the internal SSD, `lctr` is still faster by a bit, and the returned results are more relevant than Finder search while arriving sooner.
+On the internal SSD, `lctr` is still faster by quite a bit, and the returned results are also more relevant than Finder search.
 
 <video
   src="https://github.com/user-attachments/assets/666fcb99-568f-426e-bcd5-3adcfc46b36a"
