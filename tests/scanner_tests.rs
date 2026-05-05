@@ -4,7 +4,7 @@ use std::io;
 use std::os::unix::fs::symlink;
 
 use locator::db::Database;
-use locator::query::SearchFilters;
+use locator::query::{SearchFilters, SearchOptions};
 use locator::scanner::{
     classify_scan_error, scan_root, scan_root_with_progress, ScanErrorKind, ScanOptions, ScanPhase,
 };
@@ -202,6 +202,31 @@ fn fresh_index_scan_skips_stale_mark() {
 
     assert_eq!(stats.indexed_files, 1);
     assert_eq!(stats.profile.stale_mark.as_secs(), 0);
+}
+
+#[test]
+fn rescan_marks_deleted_files_stale() {
+    let dir = tempdir().expect("temp dir");
+    let gone = dir.path().join("gone.txt");
+    let keep = dir.path().join("keep.txt");
+    fs::write(&gone, "gone").expect("write removed file");
+    fs::write(&keep, "keep").expect("write kept file");
+
+    let db = Database::open_in_memory().expect("db opens");
+    scan_root(&db, dir.path(), ScanOptions::default()).expect("initial scan succeeds");
+    fs::remove_file(&gone).expect("remove indexed file");
+    scan_root(&db, dir.path(), ScanOptions::default()).expect("rescan succeeds");
+
+    assert!(db
+        .search_with_options(&SearchOptions::new("gone"))
+        .expect("search works")
+        .is_empty());
+    assert_eq!(
+        db.search_with_options(&SearchOptions::new("keep"))
+            .expect("search works")
+            .len(),
+        1
+    );
 }
 
 #[test]

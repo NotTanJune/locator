@@ -1,6 +1,12 @@
 use std::fs;
+use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
+use std::thread;
+use std::time::Duration;
 
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
@@ -11,7 +17,7 @@ use locator::db::{
 };
 use locator::query::{QueryMode, SearchFilters, SearchOptions, SortField};
 use locator::scan_ui::{render_scan_frame_with_eta, ScanAnimation};
-use locator::scanner::{scan_root_with_progress, ScanBackend, ScanOptions};
+use locator::scanner::{scan_root_with_progress, ScanBackend, ScanOptions, ScanProgress};
 
 #[derive(Debug, Parser)]
 #[command(name = "lctr", version, about = "Fast local file metadata search")]
@@ -53,6 +59,16 @@ enum Commands {
     },
     ShellInit {
         shell: String,
+    },
+    SetupShell {
+        #[arg(long, help = "Shell to configure: zsh, bash, fish, or powershell")]
+        shell: Option<String>,
+        #[arg(long, help = "Shell profile file to edit")]
+        profile: Option<PathBuf>,
+        #[arg(long, help = "Enable shell integration without prompting")]
+        yes: bool,
+        #[arg(long, help = "Skip shell integration without prompting")]
+        no: bool,
     },
     Status,
     Search {
@@ -166,26 +182,22 @@ fn main() -> Result<()> {
                 estimate_totals: show_eta,
                 ..Default::default()
             };
-            let mut frame_index = 0usize;
-            let mut last_draw = Instant::now() - Duration::from_secs(1);
-            let stats = scan_root_with_progress(&db, &root, options, |progress| {
-                if last_draw.elapsed() >= Duration::from_millis(90)
-                    || matches!(
-                        progress.phase,
-                        locator::scanner::ScanPhase::Discovering
-                            | locator::scanner::ScanPhase::Optimizing
-                            | locator::scanner::ScanPhase::Done
-                    )
-                {
-                    spinner.set_message(render_scan_frame_with_eta(
-                        progress,
-                        ScanAnimation::frame(frame_index),
-                        show_eta,
-                    ));
-                    frame_index = frame_index.wrapping_add(1);
-                    last_draw = Instant::now();
+            let latest_progress = Arc::new(Mutex::new(None::<ScanProgress>));
+            let renderer_running = Arc::new(AtomicBool::new(true));
+            let renderer = spawn_scan_renderer(
+                spinner.clone(),
+                Arc::clone(&latest_progress),
+                Arc::clone(&renderer_running),
+                show_eta,
+            );
+            let scan_result = scan_root_with_progress(&db, &root, options, |progress| {
+                if let Ok(mut latest) = latest_progress.lock() {
+                    *latest = Some(progress.clone());
                 }
-            })?;
+            });
+            renderer_running.store(false, Ordering::Relaxed);
+            let _ = renderer.join();
+            let stats = scan_result?;
             if let Some(target) = staged_target {
                 db.checkpoint()?;
                 drop(db);
@@ -218,6 +230,14 @@ fn main() -> Result<()> {
         }
         Commands::ShellInit { shell } => {
             print_shell_init(&shell)?;
+        }
+        Commands::SetupShell {
+            shell,
+            profile,
+            yes,
+            no,
+        } => {
+            setup_shell_integration(shell.as_deref(), profile.as_deref(), yes, no)?;
         }
         Commands::Status => {
             let db = Database::open_default_for_search()?;
@@ -372,17 +392,34 @@ fn is_readonly_or_permission_error(error: &std::io::Error) -> bool {
 }
 
 fn print_shell_init(shell: &str) -> Result<()> {
-    if shell != "zsh" {
-        anyhow::bail!("unsupported shell '{shell}', expected zsh");
-    }
+    println!("{}", shell_init_script(shell)?);
+    Ok(())
+}
 
-    println!(
+fn shell_init_script(shell: &str) -> Result<String> {
+    match shell {
+        "zsh" | "bash" => posix_shell_init(shell),
+        "fish" => fish_shell_init(),
+        "powershell" | "pwsh" | "power-shell" => powershell_init(),
+        _ => anyhow::bail!("unsupported shell '{shell}', expected zsh, bash, fish, or powershell"),
+    }
+}
+
+fn posix_shell_init(shell: &str) -> Result<String> {
+    let arg_count = if shell == "zsh" { "$#" } else { "${#args[@]}" };
+    let arg_at = if shell == "zsh" {
+        "${argv[$i]}"
+    } else {
+        "${args[$((i - 1))]}"
+    };
+    Ok(format!(
         r#"function lctr() {{
   if [[ "$1" == "scan" ]]; then
+    local args=("$@")
     local root=""
     local i=2
-    while (( i <= $# )); do
-      local arg="${{argv[$i]}}"
+    while (( i <= {arg_count} )); do
+      local arg="{arg_at}"
       case "$arg" in
         --backend)
           (( i += 2 ))
@@ -399,11 +436,11 @@ fn print_shell_init(shell: &str) -> Result<()> {
         --batch-size=*|--writer-queue-batches=*|--native-buffer-mb=*|--native-workers=*|--native-output-batch-size=*)
           (( i += 1 ))
           ;;
-        --stage-index|--profile-detail)
+        --eta|--no-eta|--stage-index|--no-stage-index|--profile-detail|--no-profile-detail)
           (( i += 1 ))
           ;;
         --)
-          root="${{argv[$(( i + 1 ))]}}"
+          root={next_arg}
           break
           ;;
         -*)
@@ -418,20 +455,259 @@ fn print_shell_init(shell: &str) -> Result<()> {
 
     command lctr "$@"
     local exit_code=$?
-    if [[ $exit_code -eq 0 ]]; then
-      if [[ -n "$root" ]]; then
-        cd -- "$root"
-      else
-        cd -- "$HOME"
-      fi
+    if [[ $exit_code -eq 0 && -n "$root" ]]; then
+      cd -- "$root"
     fi
     return $exit_code
   fi
 
   command lctr "$@"
-}}"#
+}}"#,
+        arg_count = arg_count,
+        arg_at = arg_at,
+        next_arg = if shell == "zsh" {
+            "\"${argv[$(( i + 1 ))]}\""
+        } else {
+            "\"${args[$i]}\""
+        },
+    ))
+}
+
+fn fish_shell_init() -> Result<String> {
+    Ok(r#"function lctr
+    if test (count $argv) -gt 0; and test "$argv[1]" = "scan"
+        set -l root ""
+        set -l i 2
+        while test $i -le (count $argv)
+            set -l arg $argv[$i]
+            switch $arg
+                case --backend --batch-size --writer-queue-batches --native-buffer-mb --native-workers --native-output-batch-size
+                    set i (math $i + 2)
+                case '--backend=*' '--batch-size=*' '--writer-queue-batches=*' '--native-buffer-mb=*' '--native-workers=*' '--native-output-batch-size=*' --no-eta --eta --stage-index --no-stage-index --profile-detail --no-profile-detail
+                    set i (math $i + 1)
+                case --
+                    set root $argv[(math $i + 1)]
+                    break
+                case '-*'
+                    set i (math $i + 1)
+                case '*'
+                    set root $arg
+                    break
+            end
+        end
+
+        command lctr $argv
+        set -l exit_code $status
+        if test $exit_code -eq 0; and test -n "$root"
+            cd -- "$root"
+        end
+        return $exit_code
+    end
+
+    command lctr $argv
+end"#
+    .to_string())
+}
+
+fn powershell_init() -> Result<String> {
+    Ok(r#"function lctr {
+    if ($args.Count -gt 0 -and $args[0] -eq "scan") {
+        $root = $null
+        $i = 1
+        while ($i -lt $args.Count) {
+            $arg = $args[$i]
+            switch -Regex ($arg) {
+                '^(--backend|--batch-size|--writer-queue-batches|--native-buffer-mb|--native-workers|--native-output-batch-size)$' {
+                    $i += 2
+                    continue
+                }
+                '^(--backend|--batch-size|--writer-queue-batches|--native-buffer-mb|--native-workers|--native-output-batch-size)=' {
+                    $i += 1
+                    continue
+                }
+                '^(--no-eta|--eta|--stage-index|--no-stage-index|--profile-detail|--no-profile-detail)$' {
+                    $i += 1
+                    continue
+                }
+                '^--$' {
+                    if ($i + 1 -lt $args.Count) { $root = $args[$i + 1] }
+                    break
+                }
+                '^-' {
+                    $i += 1
+                    continue
+                }
+                default {
+                    $root = $arg
+                    break
+                }
+            }
+        }
+
+        & lctr @args
+        $exitCode = $LASTEXITCODE
+        if ($exitCode -eq 0 -and $root) {
+            Set-Location -LiteralPath $root
+        }
+        $global:LASTEXITCODE = $exitCode
+        return
+    }
+
+    & lctr @args
+}"#
+    .to_string())
+}
+
+fn setup_shell_integration(
+    shell_override: Option<&str>,
+    profile_override: Option<&Path>,
+    yes: bool,
+    no: bool,
+) -> Result<()> {
+    let shell = shell_override
+        .map(ToOwned::to_owned)
+        .or_else(|| std::env::var("LCTR_SHELL").ok())
+        .or_else(detect_current_shell)
+        .ok_or_else(|| {
+            anyhow::anyhow!("could not detect shell, pass --shell zsh|bash|fish|powershell")
+        })?;
+    let canonical_shell = normalize_shell_name(&shell)?;
+    let profile = match profile_override {
+        Some(path) => path.to_path_buf(),
+        None => default_shell_profile(&canonical_shell)?,
+    };
+    let block = format!(
+        "# >>> lctr shell integration >>>\n{}\n# <<< lctr shell integration <<<\n",
+        shell_init_script(&canonical_shell)?
     );
+
+    let choice = shell_setup_choice(yes, no)?;
+    if !choice {
+        println!("Shell integration skipped.");
+        return Ok(());
+    }
+
+    if let Ok(existing) = fs::read_to_string(&profile) {
+        if existing.contains("lctr shell-init") || existing.contains("lctr shell integration") {
+            println!("Shell integration already present in {}", profile.display());
+            return Ok(());
+        }
+    }
+
+    if let Some(parent) = profile.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&profile)?;
+    writeln!(file)?;
+    write!(file, "{block}")?;
+
+    println!("Added lctr shell integration to {}", profile.display());
+    match canonical_shell.as_str() {
+        "fish" => println!("Restart your shell or run: source {}", profile.display()),
+        "powershell" => println!("Restart PowerShell or run: . {}", profile.display()),
+        _ => println!("Restart your shell or run: . {}", profile.display()),
+    }
     Ok(())
+}
+
+fn shell_setup_choice(yes: bool, no: bool) -> Result<bool> {
+    if yes && no {
+        anyhow::bail!("--yes and --no cannot be used together");
+    }
+    if yes {
+        return Ok(true);
+    }
+    if no {
+        return Ok(false);
+    }
+
+    match std::env::var("LCTR_INSTALL_SHELL_INTEGRATION")
+        .ok()
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("1" | "yes" | "true") => return Ok(true),
+        Some("0" | "no" | "false") => return Ok(false),
+        Some(value) => anyhow::bail!(
+            "invalid LCTR_INSTALL_SHELL_INTEGRATION value '{value}', expected yes or no"
+        ),
+        None => {}
+    }
+
+    if !io::stdin().is_terminal() {
+        println!("Shell integration skipped in non-interactive mode.");
+        println!("Run `lctr setup-shell` later to enable scan auto-cd.");
+        return Ok(false);
+    }
+
+    print!("Add shell integration so `lctr scan <dir>` moves your shell into <dir>? [y/N] ");
+    io::stdout().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+fn detect_current_shell() -> Option<String> {
+    if cfg!(windows) {
+        return Some("powershell".to_string());
+    }
+
+    std::env::var("SHELL")
+        .ok()
+        .and_then(|shell| Path::new(&shell).file_name().map(|name| name.to_owned()))
+        .and_then(|name| name.to_str().map(ToOwned::to_owned))
+}
+
+fn normalize_shell_name(shell: &str) -> Result<String> {
+    match shell {
+        "zsh" | "bash" | "fish" => Ok(shell.to_string()),
+        "powershell" | "pwsh" | "power-shell" => Ok("powershell".to_string()),
+        _ => anyhow::bail!("unsupported shell '{shell}', expected zsh, bash, fish, or powershell"),
+    }
+}
+
+fn default_shell_profile(shell: &str) -> Result<PathBuf> {
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("could not determine home directory, pass --profile"))?;
+
+    match shell {
+        "zsh" => Ok(std::env::var_os("ZDOTDIR")
+            .map(PathBuf::from)
+            .unwrap_or(home)
+            .join(".zshrc")),
+        "bash" => Ok(home.join(".bashrc")),
+        "fish" => Ok(std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".config"))
+            .join("fish")
+            .join("config.fish")),
+        "powershell" => {
+            if let Some(profile) = std::env::var_os("LCTR_POWERSHELL_PROFILE") {
+                return Ok(PathBuf::from(profile));
+            }
+            if cfg!(windows) {
+                Ok(home
+                    .join("Documents")
+                    .join("PowerShell")
+                    .join("Microsoft.PowerShell_profile.ps1"))
+            } else {
+                Ok(home
+                    .join(".config")
+                    .join("powershell")
+                    .join("Microsoft.PowerShell_profile.ps1"))
+            }
+        }
+        _ => anyhow::bail!("unsupported shell '{shell}'"),
+    }
 }
 
 fn build_search_options(args: &FindArgs) -> Result<SearchOptions> {
@@ -473,6 +749,42 @@ fn build_search_options(args: &FindArgs) -> Result<SearchOptions> {
 
 fn current_dir() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn spawn_scan_renderer(
+    spinner: ProgressBar,
+    latest_progress: Arc<Mutex<Option<ScanProgress>>>,
+    running: Arc<AtomicBool>,
+    show_eta: bool,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut frame_index = 0usize;
+        while running.load(Ordering::Relaxed) {
+            draw_latest_scan_progress(&spinner, &latest_progress, frame_index, show_eta);
+            frame_index = frame_index.wrapping_add(1);
+            thread::sleep(Duration::from_millis(90));
+        }
+        draw_latest_scan_progress(&spinner, &latest_progress, frame_index, show_eta);
+    })
+}
+
+fn draw_latest_scan_progress(
+    spinner: &ProgressBar,
+    latest_progress: &Arc<Mutex<Option<ScanProgress>>>,
+    frame_index: usize,
+    show_eta: bool,
+) {
+    let progress = latest_progress
+        .lock()
+        .ok()
+        .and_then(|latest| latest.clone());
+    if let Some(progress) = progress {
+        spinner.set_message(render_scan_frame_with_eta(
+            &progress,
+            ScanAnimation::frame(frame_index),
+            show_eta,
+        ));
+    }
 }
 
 fn scan_spinner() -> ProgressBar {

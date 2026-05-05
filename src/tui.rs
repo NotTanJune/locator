@@ -34,6 +34,7 @@ mod theme;
 use theme::Theme;
 
 const INDEXED_INPUT_GRACE: Duration = Duration::from_millis(1500);
+const TUI_RESULT_LIMIT: usize = 1000;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SearchBackend {
@@ -153,7 +154,7 @@ fn run_loop(
                         all_results = next_results;
                         results = apply_local_result_options(
                             &all_results,
-                            &SearchOptions::new(input.as_str())
+                            &tui_search_options(input.as_str())
                                 .with_mode(mode)
                                 .with_sort(sort)
                                 .with_reverse(reverse)
@@ -204,7 +205,7 @@ fn run_loop(
 
         let query = input.as_str();
         if search_state.should_auto_submit(query, backend_label, last_edit.elapsed()) {
-            let options = SearchOptions::new(query)
+            let options = tui_search_options(query)
                 .with_mode(mode)
                 .with_sort(sort)
                 .with_reverse(reverse)
@@ -439,7 +440,7 @@ fn run_loop(
                                 mode = mode.next();
                                 results = apply_local_result_options(
                                     &all_results,
-                                    &SearchOptions::new(input.as_str())
+                                    &tui_search_options(input.as_str())
                                         .with_mode(mode)
                                         .with_sort(sort)
                                         .with_reverse(reverse)
@@ -454,7 +455,7 @@ fn run_loop(
                                 filters = cycle_kind_filter(filters);
                                 results = apply_local_result_options(
                                     &all_results,
-                                    &SearchOptions::new(input.as_str())
+                                    &tui_search_options(input.as_str())
                                         .with_mode(mode)
                                         .with_sort(sort)
                                         .with_reverse(reverse)
@@ -469,7 +470,7 @@ fn run_loop(
                                 sort = sort.next();
                                 results = apply_local_result_options(
                                     &all_results,
-                                    &SearchOptions::new(input.as_str())
+                                    &tui_search_options(input.as_str())
                                         .with_mode(mode)
                                         .with_sort(sort)
                                         .with_reverse(reverse)
@@ -482,7 +483,7 @@ fn run_loop(
                                 reverse = toggle_sort_order(reverse);
                                 results = apply_local_result_options(
                                     &all_results,
-                                    &SearchOptions::new(input.as_str())
+                                    &tui_search_options(input.as_str())
                                         .with_mode(mode)
                                         .with_sort(sort)
                                         .with_reverse(reverse)
@@ -543,7 +544,7 @@ fn run_loop(
                             should_show_results(query),
                         ) {
                             EnterAction::SubmitSearch => {
-                                let options = SearchOptions::new(query)
+                                let options = tui_search_options(query)
                                     .with_mode(mode)
                                     .with_sort(sort)
                                     .with_reverse(reverse)
@@ -600,7 +601,9 @@ fn search_for_tui(db: &Database, options: &SearchOptions) -> Result<Vec<SearchRe
 }
 
 fn open_search_database(path: &Path) -> Result<Database> {
-    Database::open(path).or_else(|_| Database::open_readonly(path))
+    Database::open(path)
+        .or_else(|_| Database::open_readonly(path))
+        .map(Database::with_search_path_verification)
 }
 
 fn search_hybrid(db: &Database, root: &Path, options: &SearchOptions) -> Result<Vec<SearchResult>> {
@@ -789,6 +792,10 @@ fn merge_results(
 
 fn should_show_results(query: &str) -> bool {
     query.chars().filter(|ch| ch.is_alphanumeric()).count() >= 2
+}
+
+fn tui_search_options(query: &str) -> SearchOptions {
+    SearchOptions::new(query).with_limit(TUI_RESULT_LIMIT)
 }
 
 fn initial_input_mode() -> bool {
@@ -1360,8 +1367,9 @@ mod tests {
         indexed_response_exit_deadline, initial_input_mode, input_mode_after_indexed_grace,
         input_mode_after_submit, search_backend_for_directory, search_bar_line, search_hybrid,
         should_show_results, sort_label, toggle_sort_order, top_chrome_height, top_controls_lines,
-        top_status_line, EnterAction, SearchBackend, SearchInput, SearchRequest, SearchState,
-        SearchWorker, TopPanelArgs, INDEXED_INPUT_GRACE,
+        top_status_line, tui_search_options, EnterAction, SearchBackend, SearchInput,
+        SearchRequest, SearchState, SearchWorker, TopPanelArgs, INDEXED_INPUT_GRACE,
+        TUI_RESULT_LIMIT,
     };
     use ratatui::text::Line;
     use std::thread;
@@ -1623,6 +1631,12 @@ mod tests {
 
         assert_eq!(visible.len(), 1);
         assert_eq!(visible[0].name, "archive.zip");
+    }
+
+    #[test]
+    fn tui_search_options_use_larger_result_limit() {
+        assert_eq!(tui_search_options("archive").limit, TUI_RESULT_LIMIT);
+        assert!(TUI_RESULT_LIMIT > SearchOptions::new("archive").limit);
     }
 
     #[test]

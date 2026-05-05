@@ -43,6 +43,7 @@ Homebrew:
 ```bash
 brew tap NotTanJune/locator https://github.com/NotTanJune/locator
 brew install lctr
+lctr setup-shell
 ```
 
 After the tap is installed:
@@ -58,16 +59,24 @@ Install script:
 curl -fsSL https://raw.githubusercontent.com/NotTanJune/locator/main/install.sh | sh
 ```
 
+The install script asks whether to enable shell integration. For non-interactive installs:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/NotTanJune/locator/main/install.sh | LCTR_INSTALL_SHELL_INTEGRATION=1 sh
+```
+
 Cargo:
 
 ```bash
-cargo install --git https://github.com/NotTanJune/locator --tag v0.1.41
+cargo install --git https://github.com/NotTanJune/locator --tag v0.1.51
+lctr setup-shell
 ```
 
 Local checkout:
 
 ```bash
 cargo install --path .
+lctr setup-shell
 ```
 
 ### 🪟 Windows
@@ -77,6 +86,7 @@ Scoop:
 ```powershell
 scoop bucket add locator https://github.com/NotTanJune/locator
 scoop install lctr
+lctr setup-shell --shell powershell
 ```
 
 Scoop upgrades:
@@ -90,6 +100,12 @@ PowerShell installer:
 
 ```powershell
 irm https://raw.githubusercontent.com/NotTanJune/locator/main/install.ps1 | iex
+```
+
+The PowerShell installer asks whether to enable shell integration. For non-interactive installs:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/NotTanJune/locator/main/install.ps1))) -ShellIntegration yes
 ```
 
 Future WinGet target:
@@ -110,13 +126,32 @@ lctr search
 
 ### Shell Integration
 
-Optional zsh integration:
+Optional shell integration makes `lctr scan <dir>` move your current shell into `<dir>` after a successful scan. The install scripts can set this up during install. Package-manager installs can enable it afterward:
+
+```bash
+lctr setup-shell
+```
+
+Manual shell integration:
 
 ```bash
 eval "$(lctr shell-init zsh)"
+eval "$(lctr shell-init bash)"
 ```
 
-With shell integration installed, `lctr scan ~/Documents` scans `~/Documents`, stores the index in `~/Documents/.locator/index.sqlite`, and moves your current shell into `~/Documents` after a successful scan.
+Fish:
+
+```fish
+lctr shell-init fish | source
+```
+
+PowerShell:
+
+```powershell
+Invoke-Expression (& lctr shell-init powershell)
+```
+
+With shell integration installed, `lctr scan ~/Documents` scans `~/Documents`, stores the index in `~/Documents/.locator/index.sqlite`, and moves your current shell into `~/Documents` after a successful scan. Plain `lctr scan ~/Documents` cannot change the parent shell directory without this integration.
 
 ## Usage
 
@@ -179,7 +214,8 @@ lctr roots
 lctr remove-root <ROOT>
 lctr delete-index [ROOT]
 lctr vacuum
-lctr shell-init zsh
+lctr setup-shell [--shell zsh|bash|fish|powershell] [--yes|--no]
+lctr shell-init zsh|bash|fish|powershell
 ```
 
 ## Search UI Keys

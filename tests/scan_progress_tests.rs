@@ -50,6 +50,29 @@ fn scan_dashboard_frame_contains_ascii_art_eta_counts_and_backend() {
 }
 
 #[test]
+fn scan_dashboard_animation_changes_between_frames() {
+    let progress = ScanProgress {
+        phase: ScanPhase::Optimizing,
+        indexed_files: 250,
+        skipped_entries: 0,
+        error_entries: 0,
+        indexed_bytes: 0,
+        total_files: None,
+        total_bytes: None,
+        elapsed: Duration::from_secs(10),
+        current_path: "/tmp/Documents".to_string(),
+        backend: ScanBackend::Dirent,
+    };
+
+    let first = render_scan_frame(&progress, ScanAnimation::frame(1));
+    let second = render_scan_frame(&progress, ScanAnimation::frame(2));
+
+    assert_ne!(first, second);
+    assert!(first.contains("optimizing"));
+    assert!(second.contains("optimizing"));
+}
+
+#[test]
 fn scan_dashboard_frame_labels_dirent_backend() {
     let progress = ScanProgress {
         phase: ScanPhase::Indexing,

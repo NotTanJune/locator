@@ -6,6 +6,7 @@ use locator::db::{
 use locator::query::{QueryMode, SearchFilters, SearchOptions, SortField};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
 use std::sync::Mutex;
 use tempfile::tempdir;
 
@@ -18,6 +19,29 @@ fn record(path: &str, name: &str, ext: Option<&str>, size: u64, modified_year: i
         parent: "/tmp".into(),
         extension: ext.map(str::to_string),
         root: "/tmp".into(),
+        volume: "local".into(),
+        kind: ext.unwrap_or("file").into(),
+        size_bytes: size,
+        created_at: Some(Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap()),
+        modified_at: Some(Utc.with_ymd_and_hms(modified_year, 1, 1, 0, 0, 0).unwrap()),
+    }
+}
+
+fn record_for_path(path: &Path, ext: Option<&str>, size: u64, modified_year: i32) -> FileRecord {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("utf-8 file name");
+    let parent = path
+        .parent()
+        .and_then(|parent| parent.to_str())
+        .expect("utf-8 parent");
+    FileRecord {
+        path: path.to_string_lossy().to_string(),
+        name: name.to_string(),
+        parent: parent.to_string(),
+        extension: ext.map(str::to_string),
+        root: parent.to_string(),
         volume: "local".into(),
         kind: ext.unwrap_or("file").into(),
         size_bytes: size,
@@ -471,6 +495,45 @@ fn interactive_search_handles_missing_filename_match_without_error() {
         .expect("interactive search works");
 
     assert!(results.is_empty());
+}
+
+#[test]
+fn verified_search_drops_missing_persistent_paths() {
+    let dir = tempdir().expect("temp dir");
+    let db_path = dir.path().join("index.sqlite");
+    let existing_path = dir.path().join("report-existing.pdf");
+    let missing_path = dir.path().join("report-missing.pdf");
+    std::fs::write(&existing_path, "real").expect("write existing file");
+
+    {
+        let db = Database::open(&db_path).expect("db opens");
+        db.upsert_file(&record_for_path(&missing_path, Some("pdf"), 100, 2024))
+            .expect("insert missing");
+        db.upsert_file(&record_for_path(&existing_path, Some("pdf"), 100, 2024))
+            .expect("insert existing");
+    }
+
+    let db = Database::open_readonly(&db_path)
+        .expect("readonly db opens")
+        .with_search_path_verification();
+    let assert_only_existing = |results: Vec<locator::db::SearchResult>| {
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].path, existing_path.to_string_lossy());
+        assert_eq!(results[0].size_bytes, 4);
+    };
+
+    assert_only_existing(
+        db.search("report", &SearchFilters::new(), 10)
+            .expect("fts search works"),
+    );
+    assert_only_existing(
+        db.search_with_options(&SearchOptions::new("report"))
+            .expect("option search works"),
+    );
+    assert_only_existing(
+        db.search_interactive("report", 10)
+            .expect("interactive search works"),
+    );
 }
 
 #[test]

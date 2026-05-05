@@ -12,6 +12,15 @@ class Lctr < Formula
     system "cargo", "install", *std_cargo_args
   end
 
+  def caveats
+    <<~EOS
+      To enable scan auto-cd shell integration, run:
+        lctr setup-shell
+
+      This lets `lctr scan <dir>` move your current shell into <dir> after a successful scan.
+    EOS
+  end
+
   test do
     assert_match "lctr 0.1.41", shell_output("#{bin}/lctr --version")
   end

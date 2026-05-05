@@ -41,6 +41,7 @@ pub struct SearchResult {
 pub struct Database {
     conn: Connection,
     path: Option<PathBuf>,
+    verify_paths_on_search: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -65,7 +66,9 @@ impl Database {
 
     pub fn open_default_for_search() -> Result<Self> {
         let path = default_db_path()?;
-        Self::open(&path).or_else(|_| Self::open_readonly(&path))
+        Self::open(&path)
+            .or_else(|_| Self::open_readonly(&path))
+            .map(Self::with_search_path_verification)
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -79,6 +82,7 @@ impl Database {
         let db = Self {
             conn,
             path: Some(path.to_path_buf()),
+            verify_paths_on_search: false,
         };
         db.migrate()?;
         Ok(db)
@@ -92,6 +96,7 @@ impl Database {
         Ok(Self {
             conn,
             path: Some(path.to_path_buf()),
+            verify_paths_on_search: false,
         })
     }
 
@@ -106,6 +111,7 @@ impl Database {
         let db = Self {
             conn,
             path: Some(path.to_path_buf()),
+            verify_paths_on_search: false,
         };
         db.configure_fast_staging_connection()?;
         db.create_fresh_scan_schema()?;
@@ -125,6 +131,7 @@ impl Database {
         Ok(Self {
             conn,
             path: Some(path.to_path_buf()),
+            verify_paths_on_search: false,
         })
     }
 
@@ -135,6 +142,7 @@ impl Database {
         let db = Self {
             conn,
             path: Some(path.to_path_buf()),
+            verify_paths_on_search: false,
         };
         db.configure_fast_staging_connection()?;
         Ok(db)
@@ -161,9 +169,15 @@ impl Database {
         let db = Self {
             conn: Connection::open_in_memory().context("open in-memory database")?,
             path: None,
+            verify_paths_on_search: false,
         };
         db.migrate()?;
         Ok(db)
+    }
+
+    pub fn with_search_path_verification(mut self) -> Self {
+        self.verify_paths_on_search = true;
+        self
     }
 
     pub fn upsert_file(&self, record: &FileRecord) -> Result<()> {
@@ -464,15 +478,17 @@ impl Database {
         }
 
         sql.push_str(" ORDER BY f.modified_at DESC NULLS LAST, f.name ASC LIMIT ?");
-        values.push((limit as i64).into());
+        values.push((search_candidate_limit(self.verify_paths_on_search, limit) as i64).into());
 
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(values), search_result_from_row)?;
 
-        hydrate_search_results(
+        let mut results = self.hydrate_search_results(
             rows.collect::<rusqlite::Result<Vec<_>>>()
                 .context("collect search results")?,
-        )
+        )?;
+        results.truncate(limit);
+        Ok(results)
     }
 
     pub fn search_with_options(&self, options: &SearchOptions) -> Result<Vec<SearchResult>> {
@@ -494,20 +510,21 @@ impl Database {
 
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(values), search_result_from_row)?;
-        let mut results = hydrate_search_results(
-            rows.collect::<rusqlite::Result<Vec<_>>>()
-                .context("collect search results")?,
-        )?
-        .into_iter()
-        .filter(|result| {
-            candidate_matches(
-                options.mode,
-                &options.query,
-                [result.name.as_str(), result.path.as_str()],
-            )
-            .unwrap_or(false)
-        })
-        .collect::<Vec<_>>();
+        let mut results = self
+            .hydrate_search_results(
+                rows.collect::<rusqlite::Result<Vec<_>>>()
+                    .context("collect search results")?,
+            )?
+            .into_iter()
+            .filter(|result| {
+                candidate_matches(
+                    options.mode,
+                    &options.query,
+                    [result.name.as_str(), result.path.as_str()],
+                )
+                .unwrap_or(false)
+            })
+            .collect::<Vec<_>>();
 
         sort_results(&mut results, options);
         results.truncate(options.limit);
@@ -522,42 +539,44 @@ impl Database {
             return Ok(Vec::new());
         }
 
-        let mut results = Vec::with_capacity(limit.min(50));
+        let candidate_limit = search_candidate_limit(self.verify_paths_on_search, limit);
+        let mut results = Vec::with_capacity(candidate_limit.min(50));
         let mut seen_paths = HashSet::new();
 
         self.collect_filename_matches(
             "f.name_lower = ?1",
             &[&needle as &dyn rusqlite::ToSql],
-            limit,
+            candidate_limit,
             &mut seen_paths,
             &mut results,
         )?;
 
-        if results.len() < limit {
+        if results.len() < candidate_limit {
             let stem_prefix = format!("{needle}.");
             if let Some(stem_end) = next_prefix_bound(&stem_prefix) {
                 self.collect_filename_matches(
                     "f.name_lower >= ?1 AND f.name_lower < ?2",
                     &[&stem_prefix as &dyn rusqlite::ToSql, &stem_end],
-                    limit,
+                    candidate_limit,
                     &mut seen_paths,
                     &mut results,
                 )?;
             }
         }
 
-        if results.len() < limit {
+        if results.len() < candidate_limit {
             if let Some(end) = next_prefix_bound(&needle) {
                 self.collect_filename_matches(
                     "f.name_lower >= ?1 AND f.name_lower < ?2 AND f.name_lower != ?1",
                     &[&needle as &dyn rusqlite::ToSql, &end],
-                    limit,
+                    candidate_limit,
                     &mut seen_paths,
                     &mut results,
                 )?;
             }
         }
 
+        results.truncate(limit);
         Ok(results)
     }
 
@@ -859,9 +878,10 @@ impl Database {
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(values), search_result_from_row)?;
         for row in rows {
-            let result = hydrate_search_result(row?)?;
-            if seen_paths.insert(result.path.clone()) {
-                results.push(result);
+            if let Some(result) = self.hydrate_search_result(row?)? {
+                if seen_paths.insert(result.path.clone()) {
+                    results.push(result);
+                }
             }
         }
         Ok(())
@@ -1137,29 +1157,44 @@ fn search_result_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SearchRes
     })
 }
 
-fn hydrate_search_results(results: Vec<SearchResult>) -> Result<Vec<SearchResult>> {
-    results
-        .into_iter()
-        .map(hydrate_search_result)
-        .collect::<Result<Vec<_>>>()
+impl Database {
+    fn hydrate_search_results(&self, results: Vec<SearchResult>) -> Result<Vec<SearchResult>> {
+        let mut hydrated = Vec::with_capacity(results.len());
+        for result in results {
+            if let Some(result) = self.hydrate_search_result(result)? {
+                hydrated.push(result);
+            }
+        }
+        Ok(hydrated)
+    }
+
+    fn hydrate_search_result(&self, mut result: SearchResult) -> Result<Option<SearchResult>> {
+        let metadata = match fs::symlink_metadata(&result.path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                return Ok((!self.verify_paths_on_search).then_some(result));
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("read metadata for {}", result.path));
+            }
+        };
+
+        result.size_bytes = metadata.len();
+        result.created_at = metadata.created().ok().map(DateTime::<Utc>::from);
+        result.modified_at = metadata.modified().ok().map(DateTime::<Utc>::from);
+        if metadata.is_dir() {
+            result.kind = "folder".to_string();
+        }
+        Ok(Some(result))
+    }
 }
 
-fn hydrate_search_result(mut result: SearchResult) -> Result<SearchResult> {
-    let metadata = match fs::symlink_metadata(&result.path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(result),
-        Err(error) => {
-            return Err(error).with_context(|| format!("read metadata for {}", result.path));
-        }
-    };
-
-    result.size_bytes = metadata.len();
-    result.created_at = metadata.created().ok().map(DateTime::<Utc>::from);
-    result.modified_at = metadata.modified().ok().map(DateTime::<Utc>::from);
-    if metadata.is_dir() {
-        result.kind = "folder".to_string();
+fn search_candidate_limit(verify_paths_on_search: bool, limit: usize) -> usize {
+    if verify_paths_on_search {
+        limit.saturating_mul(20).max(200)
+    } else {
+        limit
     }
-    Ok(result)
 }
 
 fn timestamp_to_datetime(value: Option<i64>) -> Option<DateTime<Utc>> {

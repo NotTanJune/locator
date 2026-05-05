@@ -1,6 +1,8 @@
 param(
     [string]$Version = "latest",
-    [string]$InstallDir = "$env:LOCALAPPDATA\Programs\lctr\bin"
+    [string]$InstallDir = "$env:LOCALAPPDATA\Programs\lctr\bin",
+    [ValidateSet("prompt", "yes", "no")]
+    [string]$ShellIntegration = "prompt"
 )
 
 $ErrorActionPreference = "Stop"
@@ -32,6 +34,33 @@ function Install-FromCargo {
     Write-Host "No Windows release asset found. Falling back to cargo install from GitHub."
     cargo install --git "https://github.com/$Repo" --locked --force
     lctr --version
+    Invoke-LctrShellSetup -LctrCommand "lctr"
+}
+
+function Invoke-LctrShellSetup {
+    param([string]$LctrCommand)
+
+    $profilePath = $PROFILE.CurrentUserCurrentHost
+    if (-not $profilePath) {
+        $profilePath = $PROFILE
+    }
+
+    $setupArgs = @("setup-shell", "--shell", "powershell")
+    if ($profilePath) {
+        $setupArgs += @("--profile", $profilePath)
+    }
+
+    if ($ShellIntegration -eq "yes") {
+        $setupArgs += "--yes"
+    } elseif ($ShellIntegration -eq "no") {
+        $setupArgs += "--no"
+    }
+
+    try {
+        & $LctrCommand @setupArgs
+    } catch {
+        Write-Warning "Shell integration setup skipped. Run 'lctr setup-shell --shell powershell' later to enable scan auto-cd."
+    }
 }
 
 function Get-Release {
@@ -73,7 +102,9 @@ try {
 
     Copy-Item -Path $exe.FullName -Destination (Join-Path $InstallDir "lctr.exe") -Force
     Add-LctrPath -PathToAdd $InstallDir
-    & (Join-Path $InstallDir "lctr.exe") --version
+    $lctrPath = Join-Path $InstallDir "lctr.exe"
+    & $lctrPath --version
+    Invoke-LctrShellSetup -LctrCommand $lctrPath
 } finally {
     if (Test-Path $tempRoot) {
         Remove-Item -Path $tempRoot -Recurse -Force

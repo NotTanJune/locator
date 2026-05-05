@@ -7,6 +7,7 @@ Recommended Scoop path:
 ```powershell
 scoop bucket add locator https://github.com/NotTanJune/locator
 scoop install lctr
+lctr setup-shell --shell powershell
 ```
 
 This repository contains a Scoop bucket manifest at:
@@ -28,6 +29,14 @@ Direct PowerShell installer:
 irm https://raw.githubusercontent.com/NotTanJune/locator/main/install.ps1 | iex
 ```
 
+The direct installer asks whether to enable shell integration. That integration lets `lctr scan <dir>` move the current PowerShell session into `<dir>` after a successful scan.
+
+Non-interactive install with shell integration enabled:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/NotTanJune/locator/main/install.ps1))) -ShellIntegration yes
+```
+
 The installer downloads `lctr-x86_64-pc-windows-msvc.zip` from the latest GitHub Release and installs `lctr.exe` into:
 
 ```text
@@ -38,6 +47,12 @@ It adds that directory to the user PATH. If the release asset is missing and Rus
 
 ```powershell
 cargo install --git https://github.com/NotTanJune/locator --locked --force
+```
+
+Cargo installs can enable shell integration after installation:
+
+```powershell
+lctr setup-shell --shell powershell
 ```
 
 ## Scoop Maintenance

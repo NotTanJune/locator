@@ -280,7 +280,7 @@ fn unfiltered_find_prefers_filename_matches_over_parent_path_matches() {
 }
 
 #[test]
-fn shell_init_zsh_prints_cd_wrapper() {
+fn shell_init_zsh_prints_cd_wrapper_without_default_home_cd() {
     let mut cmd = Command::cargo_bin("lctr").expect("binary exists");
     cmd.arg("shell-init")
         .arg("zsh")
@@ -294,7 +294,72 @@ fn shell_init_zsh_prints_cd_wrapper() {
         .stdout(contains("--native-buffer-mb"))
         .stdout(contains("--native-workers"))
         .stdout(contains("--native-output-batch-size"))
+        .stdout(contains("cd -- \"$root\""))
+        .stdout(predicates::str::contains("cd -- \"$HOME\"").not())
         .stdout(predicates::str::contains("local status=").not());
+}
+
+#[test]
+fn shell_init_supports_common_shells() {
+    for shell in ["bash", "fish", "powershell"] {
+        let mut cmd = Command::cargo_bin("lctr").expect("binary exists");
+        cmd.arg("shell-init")
+            .arg(shell)
+            .assert()
+            .success()
+            .stdout(contains("lctr"))
+            .stdout(contains("scan"));
+    }
+
+    let mut powershell = Command::cargo_bin("lctr").expect("binary exists");
+    powershell
+        .arg("shell-init")
+        .arg("powershell")
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("{{").not())
+        .stdout(predicates::str::contains("}}").not());
+}
+
+#[test]
+fn setup_shell_writes_profile_when_confirmed() {
+    let root = tempdir().expect("root");
+    let profile = root.path().join(".zshrc");
+
+    let mut cmd = Command::cargo_bin("lctr").expect("binary exists");
+    cmd.arg("setup-shell")
+        .arg("--shell")
+        .arg("zsh")
+        .arg("--profile")
+        .arg(&profile)
+        .arg("--yes")
+        .assert()
+        .success()
+        .stdout(contains("Added lctr shell integration"));
+
+    let contents = std::fs::read_to_string(&profile).expect("profile contents");
+    assert!(contents.contains("# >>> lctr shell integration >>>"));
+    assert!(contents.contains("function lctr()"));
+    assert!(contents.contains("cd -- \"$root\""));
+}
+
+#[test]
+fn setup_shell_can_skip_profile_write() {
+    let root = tempdir().expect("root");
+    let profile = root.path().join(".bashrc");
+
+    let mut cmd = Command::cargo_bin("lctr").expect("binary exists");
+    cmd.arg("setup-shell")
+        .arg("--shell")
+        .arg("bash")
+        .arg("--profile")
+        .arg(&profile)
+        .arg("--no")
+        .assert()
+        .success()
+        .stdout(contains("Shell integration skipped."));
+
+    assert!(!profile.exists());
 }
 
 #[test]

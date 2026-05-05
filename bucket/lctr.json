@@ -3,6 +3,11 @@
     "description": "Fast local file metadata search from the terminal.",
     "homepage": "https://github.com/NotTanJune/locator",
     "license": "GPL-3.0-only",
+    "notes": [
+        "To enable scan auto-cd shell integration, run:",
+        "lctr setup-shell --shell powershell",
+        "This lets 'lctr scan <dir>' move your current PowerShell session into <dir> after a successful scan."
+    ],
     "architecture": {
         "64bit": {
             "url": "https://github.com/NotTanJune/locator/releases/download/v0.1.41/lctr-x86_64-pc-windows-msvc.zip",
