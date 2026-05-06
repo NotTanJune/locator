@@ -229,7 +229,7 @@ impl Database {
                     record.root,
                     record.volume,
                     record.kind,
-                    record.size_bytes,
+                    sqlite_size_bytes(record.size_bytes),
                     record.created_at.map(|dt| dt.timestamp()),
                     record.modified_at.map(|dt| dt.timestamp()),
                     indexed_at,
@@ -450,11 +450,11 @@ impl Database {
         }
         if let Some(min_size) = filters.min_size {
             sql.push_str(" AND f.size_bytes >= ?");
-            values.push((min_size as i64).into());
+            values.push(sqlite_size_bytes(min_size).into());
         }
         if let Some(max_size) = filters.max_size {
             sql.push_str(" AND f.size_bytes <= ?");
-            values.push((max_size as i64).into());
+            values.push(sqlite_size_bytes(max_size).into());
         }
         if let Some(created_after) = filters.created_after {
             sql.push_str(" AND f.created_at >= ?");
@@ -1151,7 +1151,7 @@ fn search_result_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SearchRes
         name: row.get(1)?,
         extension: row.get(2)?,
         kind: row.get(3)?,
-        size_bytes: row.get::<_, i64>(4)? as u64,
+        size_bytes: row_size_bytes(row.get(4)?),
         created_at: timestamp_to_datetime(row.get(5)?),
         modified_at: timestamp_to_datetime(row.get(6)?),
     })
@@ -1201,6 +1201,14 @@ fn timestamp_to_datetime(value: Option<i64>) -> Option<DateTime<Utc>> {
     value.and_then(|ts| DateTime::from_timestamp(ts, 0))
 }
 
+fn sqlite_size_bytes(size_bytes: u64) -> i64 {
+    i64::try_from(size_bytes).unwrap_or(i64::MAX)
+}
+
+fn row_size_bytes(size_bytes: i64) -> u64 {
+    u64::try_from(size_bytes).unwrap_or(0)
+}
+
 fn apply_filter_sql(
     sql: &mut String,
     values: &mut Vec<rusqlite::types::Value>,
@@ -1224,11 +1232,11 @@ fn apply_filter_sql(
     }
     if let Some(min_size) = filters.min_size {
         sql.push_str(" AND f.size_bytes >= ?");
-        values.push((min_size as i64).into());
+        values.push(sqlite_size_bytes(min_size).into());
     }
     if let Some(max_size) = filters.max_size {
         sql.push_str(" AND f.size_bytes <= ?");
-        values.push((max_size as i64).into());
+        values.push(sqlite_size_bytes(max_size).into());
     }
     if let Some(created_after) = filters.created_after {
         sql.push_str(" AND f.created_at >= ?");

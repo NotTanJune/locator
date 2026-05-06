@@ -31,8 +31,13 @@ function Install-FromCargo {
         throw "No Windows release asset was found and cargo is not installed. Install Rust from https://rustup.rs or wait for the next locator release."
     }
 
+    if (Get-Command rustup -ErrorAction SilentlyContinue) {
+        Write-Host "Updating Rust toolchain before cargo fallback install."
+        rustup update
+    }
+
     Write-Host "No Windows release asset found. Falling back to cargo install from GitHub."
-    cargo install --git "https://github.com/$Repo" --locked --force
+    cargo install --git "https://github.com/$Repo" --force
     lctr --version
     Invoke-LctrShellSetup -LctrCommand "lctr"
 }

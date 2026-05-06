@@ -16,7 +16,10 @@ use locator::db::{
     local_db_path_for_root, staging_db_path_for_root, Database,
 };
 use locator::query::{QueryMode, SearchFilters, SearchOptions, SortField};
-use locator::scan_ui::{render_scan_frame_with_eta, ScanAnimation};
+use locator::scan_ui::{
+    render_scan_frame_for_terminal, render_scan_frame_with_eta_and_root, render_scan_summary,
+    render_scan_summary_for_terminal, ScanAnimation, ScanSummary,
+};
 use locator::scanner::{scan_root_with_progress, ScanBackend, ScanOptions, ScanProgress};
 
 #[derive(Debug, Parser)]
@@ -149,14 +152,9 @@ fn main() -> Result<()> {
             } else {
                 None
             };
-            let (db, db_path) = if let Some(target) = &staged_target {
+            let (db, db_path) = if staged_target.is_some() {
                 let staging_path = staging_db_path_for_root(&root)?;
                 delete_index_files(&staging_path)?;
-                println!(
-                    "staging index at {} before copying to {}",
-                    staging_path.display(),
-                    target.display()
-                );
                 (
                     Database::open_fresh_staged_scan(&staging_path)?,
                     staging_path,
@@ -171,6 +169,7 @@ fn main() -> Result<()> {
                 db_path.display()
             ));
             let show_eta = eta && !no_eta;
+            let live_color = io::stderr().is_terminal();
             let options = ScanOptions {
                 backend,
                 batch_size,
@@ -189,6 +188,8 @@ fn main() -> Result<()> {
                 Arc::clone(&latest_progress),
                 Arc::clone(&renderer_running),
                 show_eta,
+                root.clone(),
+                live_color,
             );
             let scan_result = scan_root_with_progress(&db, &root, options, |progress| {
                 if let Ok(mut latest) = latest_progress.lock() {
@@ -198,34 +199,25 @@ fn main() -> Result<()> {
             renderer_running.store(false, Ordering::Relaxed);
             let _ = renderer.join();
             let stats = scan_result?;
+            let final_index_path = staged_target.clone().unwrap_or_else(|| db_path.clone());
+            let used_stage_index = staged_target.is_some();
             if let Some(target) = staged_target {
                 db.checkpoint()?;
                 drop(db);
                 copy_finished_index(&db_path, &target)?;
-                println!("staged index copied to {}", target.display());
             }
             spinner.finish_and_clear();
-            println!(
-                "indexed {} files, skipped {} entries, errors {}",
-                stats.indexed_files, stats.skipped_entries, stats.error_entries
-            );
-            print_scan_profile(&stats, show_profile_detail);
-            println!(
-                "next: run `lctr search {}` or `lctr find <query>` from that directory",
-                root.display()
-            );
-            println!(
-                "cleanup: run `lctr delete-index {}` to remove this index",
-                root.display()
-            );
-            if !stats.error_summaries.is_empty() {
-                println!("error summary:");
-                for (kind, summary) in &stats.error_summaries {
-                    println!("  {}: {}", kind.label(), summary.count);
-                    for sample in &summary.samples {
-                        println!("    {}", sample.display());
-                    }
-                }
+            let summary = ScanSummary {
+                stats: &stats,
+                root: &root,
+                index_path: &final_index_path,
+                staged: used_stage_index,
+                detail: show_profile_detail,
+            };
+            if io::stdout().is_terminal() {
+                println!("{}", render_scan_summary_for_terminal(&summary));
+            } else {
+                println!("{}", render_scan_summary(&summary));
             }
         }
         Commands::ShellInit { shell } => {
@@ -292,66 +284,6 @@ fn main() -> Result<()> {
     }
 
     Ok(())
-}
-
-fn print_scan_profile(stats: &locator::scanner::ScanStats, detail: bool) {
-    let total = stats.profile.total.as_secs_f64();
-    let walk = stats.profile.walk.as_secs_f64();
-    let sqlite = stats.profile.sqlite_writes.as_secs_f64();
-    let cleanup = stats.profile.cleanup.as_secs_f64();
-    let discovery = stats.profile.discovery.as_secs_f64();
-    let files_per_second = if total > 0.0 {
-        stats.profile.indexed_files as f64 / total
-    } else {
-        0.0
-    };
-    let mb_per_second = if total > 0.0 {
-        (stats.profile.indexed_bytes as f64 / 1_000_000.0) / total
-    } else {
-        0.0
-    };
-
-    println!(
-        "scan profile: total {:.2}s, {:.1} files/s, {:.1} MB/s",
-        total, files_per_second, mb_per_second
-    );
-    println!(
-        "  discovery {:.2}s, walk+metadata {:.2}s, sqlite writes {:.2}s over {} batches, cleanup {:.2}s",
-        discovery, walk, sqlite, stats.profile.batches, cleanup
-    );
-    if detail {
-        println!("profile detail:");
-        println!(
-            "  record handling {:.2}s, writer wait {:.2}s",
-            stats.profile.record_handling.as_secs_f64(),
-            stats.profile.writer_wait.as_secs_f64()
-        );
-        println!(
-            "  stale mark {:.2}s, fts rebuild {:.2}s, index rebuild {:.2}s, trigger recreate {:.2}s",
-            stats.profile.stale_mark.as_secs_f64(),
-            stats.profile.fts_rebuild.as_secs_f64(),
-            stats.profile.index_rebuild.as_secs_f64(),
-            stats.profile.trigger_recreate.as_secs_f64()
-        );
-        println!("native detail:");
-        println!(
-            "  dirs opened {}, dirs seen {}, files seen {}, entries seen {}, getattr calls {}, unknown type {}",
-            stats.profile.native_dirs_opened,
-            stats.profile.native_dirs_seen,
-            stats.profile.native_files_seen,
-            stats.profile.native_entries_seen,
-            stats.profile.native_getattr_calls,
-            stats.profile.native_unknown_type
-        );
-        println!(
-            "  open dir {:.2}s, getattr {:.2}s, native parse {:.2}s, native emit {:.2}s, native queue wait {:.2}s",
-            stats.profile.native_open_dir.as_secs_f64(),
-            stats.profile.native_getattr.as_secs_f64(),
-            stats.profile.native_parse.as_secs_f64(),
-            stats.profile.native_emit.as_secs_f64(),
-            stats.profile.native_queue_wait.as_secs_f64()
-        );
-    }
 }
 
 fn copy_finished_index(source: &Path, target: &Path) -> Result<()> {
@@ -756,15 +688,31 @@ fn spawn_scan_renderer(
     latest_progress: Arc<Mutex<Option<ScanProgress>>>,
     running: Arc<AtomicBool>,
     show_eta: bool,
+    root: PathBuf,
+    color: bool,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut frame_index = 0usize;
         while running.load(Ordering::Relaxed) {
-            draw_latest_scan_progress(&spinner, &latest_progress, frame_index, show_eta);
+            draw_latest_scan_progress(
+                &spinner,
+                &latest_progress,
+                frame_index,
+                show_eta,
+                &root,
+                color,
+            );
             frame_index = frame_index.wrapping_add(1);
             thread::sleep(Duration::from_millis(90));
         }
-        draw_latest_scan_progress(&spinner, &latest_progress, frame_index, show_eta);
+        draw_latest_scan_progress(
+            &spinner,
+            &latest_progress,
+            frame_index,
+            show_eta,
+            &root,
+            color,
+        );
     })
 }
 
@@ -773,17 +721,30 @@ fn draw_latest_scan_progress(
     latest_progress: &Arc<Mutex<Option<ScanProgress>>>,
     frame_index: usize,
     show_eta: bool,
+    root: &Path,
+    color: bool,
 ) {
     let progress = latest_progress
         .lock()
         .ok()
         .and_then(|latest| latest.clone());
     if let Some(progress) = progress {
-        spinner.set_message(render_scan_frame_with_eta(
-            &progress,
-            ScanAnimation::frame(frame_index),
-            show_eta,
-        ));
+        let frame = if color {
+            render_scan_frame_for_terminal(
+                &progress,
+                ScanAnimation::frame(frame_index),
+                show_eta,
+                root,
+            )
+        } else {
+            render_scan_frame_with_eta_and_root(
+                &progress,
+                ScanAnimation::frame(frame_index),
+                show_eta,
+                Some(root),
+            )
+        };
+        spinner.set_message(frame);
     }
 }
 

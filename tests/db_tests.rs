@@ -220,6 +220,26 @@ fn batch_upsert_indexes_multiple_records() {
 }
 
 #[test]
+fn stores_large_sizes_as_sqlite_safe_values() {
+    let db = Database::open_in_memory().expect("db opens");
+    db.upsert_file(&record(
+        "/tmp/huge.bin",
+        "huge.bin",
+        Some("bin"),
+        u64::MAX,
+        2024,
+    ))
+    .expect("insert huge file");
+
+    let results = db
+        .search("huge", &SearchFilters::new(), 10)
+        .expect("search huge file");
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].size_bytes, i64::MAX as u64);
+}
+
+#[test]
 fn light_bulk_upsert_writes_searchable_name_path_rows() {
     let db = Database::open_in_memory().expect("db opens");
     let records = vec![

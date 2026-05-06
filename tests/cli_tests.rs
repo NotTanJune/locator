@@ -35,7 +35,7 @@ fn cli_scans_and_finds_file_with_temp_database() {
         .arg(root.path())
         .assert()
         .success()
-        .stdout(contains("indexed 1 files"));
+        .stdout(contains("1 files indexed"));
 
     let mut find = Command::cargo_bin("lctr").expect("binary exists");
     find.env("LCTR_DB", app.path().join("index.sqlite"))
@@ -60,7 +60,7 @@ fn scan_creates_directory_local_index_and_find_uses_current_directory() {
         .arg(root.path())
         .assert()
         .success()
-        .stdout(contains("indexed 1 files"));
+        .stdout(contains("1 files indexed"));
 
     assert!(root.path().join(".locator/index.sqlite").exists());
 
@@ -88,10 +88,9 @@ fn scan_without_root_indexes_current_directory() {
         .arg("scan")
         .assert()
         .success()
-        .stdout(contains(format!(
-            "staged index copied to {}",
-            root_path.join(".locator/index.sqlite").display()
-        )));
+        .stdout(contains("scan complete"))
+        .stdout(contains("staging index at").not())
+        .stdout(contains("staged index copied").not());
 
     assert!(root_path.join(".locator/index.sqlite").exists());
     assert!(!home.path().join(".locator/index.sqlite").exists());
@@ -109,10 +108,10 @@ fn scan_defaults_to_high_throughput_staged_profile() {
         .arg(root.path())
         .assert()
         .success()
-        .stdout(contains("staging index at"))
-        .stdout(contains("indexed 1 files"))
-        .stdout(contains("profile detail:"))
-        .stdout(contains("native detail:"));
+        .stdout(contains("staging index at").not())
+        .stdout(contains("1 files indexed"))
+        .stdout(contains("post-scan index build"))
+        .stdout(contains("filesystem scan counts"));
 }
 
 #[test]
@@ -127,7 +126,7 @@ fn scan_can_disable_staged_index_and_profile_detail() {
         .arg("--no-profile-detail")
         .assert()
         .success()
-        .stdout(contains("indexed 1 files"))
+        .stdout(contains("1 files indexed"))
         .stdout(contains("staging index at").not())
         .stdout(contains("profile detail:").not());
 }
@@ -145,7 +144,8 @@ fn staged_scan_creates_directory_local_index() {
         .arg("--stage-index")
         .assert()
         .success()
-        .stdout(contains("staged index copied"));
+        .stdout(contains("scan complete"))
+        .stdout(contains("staged index copied").not());
 
     assert!(root.path().join(".locator/index.sqlite").exists());
 
@@ -182,7 +182,8 @@ fn staged_scan_readonly_root_falls_back_to_app_support_index() {
         .assert()
         .success()
         .stdout(contains("using fallback staged target"))
-        .stdout(contains("staged index copied"));
+        .stdout(contains("scan complete"))
+        .stdout(contains("staged index copied").not());
 
     assert!(!root.path().join(".locator/index.sqlite").exists());
 
@@ -225,7 +226,7 @@ fn scan_readonly_root_falls_back_to_app_support_index() {
         .arg("--no-eta")
         .assert()
         .success()
-        .stdout(contains("indexed 1 files"));
+        .stdout(contains("1 files indexed"));
 
     assert!(!root.path().join(".locator/index.sqlite").exists());
 
@@ -404,16 +405,14 @@ fn scan_profile_detail_prints_expanded_timings() {
         .arg("--profile-detail")
         .assert()
         .success()
-        .stdout(contains("profile detail:"))
-        .stdout(contains("record handling"))
-        .stdout(contains("writer wait"))
-        .stdout(contains("fts rebuild"))
-        .stdout(contains("index rebuild"))
-        .stdout(contains("native detail:"))
-        .stdout(contains("dirs opened"))
-        .stdout(contains("getattr calls"))
-        .stdout(contains("native parse"))
-        .stdout(contains("native queue wait"));
+        .stdout(contains("post-scan index build"))
+        .stdout(contains("filesystem scan counts"))
+        .stdout(contains("filename index"))
+        .stdout(contains("metadata reads"))
+        .stdout(contains("sort"))
+        .stdout(contains("profile detail:").not())
+        .stdout(contains("native detail:").not())
+        .stdout(contains("getattr calls").not());
 }
 
 #[test]
@@ -514,7 +513,8 @@ fn scan_output_includes_profile_timing_summary() {
         .arg(root.path())
         .assert()
         .success()
-        .stdout(contains("scan profile:"))
+        .stdout(contains("scan complete"))
+        .stdout(contains("timing breakdown"))
         .stdout(contains("walk+metadata"))
         .stdout(contains("sqlite writes"));
 }

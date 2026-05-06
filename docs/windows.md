@@ -5,6 +5,7 @@
 Recommended Scoop path:
 
 ```powershell
+scoop update
 scoop bucket add locator https://github.com/NotTanJune/locator
 scoop install lctr
 lctr setup-shell --shell powershell
@@ -46,8 +47,10 @@ The installer downloads `lctr-x86_64-pc-windows-msvc.zip` from the latest GitHub
 It adds that directory to the user PATH. If the release asset is missing and Rust is installed, it falls back to:
 
 ```powershell
-cargo install --git https://github.com/NotTanJune/locator --locked --force
+cargo install --git https://github.com/NotTanJune/locator --force
 ```
+
+If the fallback path is used and `rustup` is available, the installer updates the Rust toolchain before running Cargo.
 
 Cargo installs can enable shell integration after installation:
 

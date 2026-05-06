@@ -41,6 +41,7 @@ On the internal SSD, `lctr` is still faster by quite a bit, and the returned res
 Homebrew:
 
 ```bash
+brew update
 brew tap NotTanJune/locator https://github.com/NotTanJune/locator
 brew install lctr
 lctr setup-shell
@@ -49,6 +50,7 @@ lctr setup-shell
 After the tap is installed:
 
 ```bash
+brew update
 brew install lctr
 brew upgrade lctr
 ```
@@ -68,13 +70,15 @@ curl -fsSL https://raw.githubusercontent.com/NotTanJune/locator/main/install.sh 
 Cargo:
 
 ```bash
-cargo install --git https://github.com/NotTanJune/locator --tag v0.1.51
+rustup update
+cargo install --git https://github.com/NotTanJune/locator --tag v0.1.58
 lctr setup-shell
 ```
 
 Local checkout:
 
 ```bash
+rustup update
 cargo install --path .
 lctr setup-shell
 ```
@@ -84,6 +88,7 @@ lctr setup-shell
 Scoop:
 
 ```powershell
+scoop update
 scoop bucket add locator https://github.com/NotTanJune/locator
 scoop install lctr
 lctr setup-shell --shell powershell

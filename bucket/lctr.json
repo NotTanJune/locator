@@ -4,6 +4,7 @@
     "homepage": "https://github.com/NotTanJune/locator",
     "license": "GPL-3.0-only",
     "notes": [
+        "Before installing or upgrading, run: scoop update",
         "To enable scan auto-cd shell integration, run:",
         "lctr setup-shell --shell powershell",
         "This lets 'lctr scan <dir>' move your current PowerShell session into <dir> after a successful scan."

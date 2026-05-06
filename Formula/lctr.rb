@@ -14,6 +14,9 @@ class Lctr < Formula
 
   def caveats
     <<~EOS
+      To refresh Homebrew metadata before install or upgrade, run:
+        brew update
+
       To enable scan auto-cd shell integration, run:
         lctr setup-shell
 

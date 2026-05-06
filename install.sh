@@ -9,6 +9,9 @@ if ! command -v brew >/dev/null 2>&1; then
   exit 1
 fi
 
+echo "Updating Homebrew metadata..."
+brew update
+
 brew tap "$TAP" "$URL"
 brew install lctr
 lctr --version
