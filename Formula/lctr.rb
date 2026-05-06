@@ -1,8 +1,8 @@
 class Lctr < Formula
   desc "Fast local file metadata search"
   homepage "https://github.com/NotTanJune/locator"
-  url "https://github.com/NotTanJune/locator/archive/refs/tags/v0.1.41.tar.gz"
-  sha256 "6f1415de83c2f37e0778c3493c14c19faa0c5e828f98c3cb734d2ae0371b3692"
+  url "https://github.com/NotTanJune/locator/archive/refs/tags/v0.1.58.tar.gz"
+  sha256 "3180b8058a4d617de71dab4809dd1040cf401699c6834172416ce0b0fb90cb4f"
   license "GPL-3.0-only"
   head "https://github.com/NotTanJune/locator.git", branch: "main"
 
@@ -25,6 +25,6 @@ class Lctr < Formula
   end
 
   test do
-    assert_match "lctr 0.1.41", shell_output("#{bin}/lctr --version")
+    assert_match "lctr 0.1.58", shell_output("#{bin}/lctr --version")
   end
 end
