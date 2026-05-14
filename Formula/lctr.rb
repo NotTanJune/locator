@@ -1,15 +1,36 @@
 class Lctr < Formula
   desc "Fast local file metadata search"
   homepage "https://github.com/NotTanJune/locator"
-  url "https://github.com/NotTanJune/locator/archive/refs/tags/v0.1.58.tar.gz"
-  sha256 "3180b8058a4d617de71dab4809dd1040cf401699c6834172416ce0b0fb90cb4f"
+  url "https://github.com/NotTanJune/locator/releases/download/v0.1.58/lctr-aarch64-apple-darwin.tar.gz"
+  sha256 "67b8ebf6829233748822db4919d048da80cf151fcaf553d04ca02685f867d2ae"
   license "GPL-3.0-only"
-  head "https://github.com/NotTanJune/locator.git", branch: "main"
 
-  depends_on "rust" => :build
+  head do
+    url "https://github.com/NotTanJune/locator.git", branch: "main"
+
+    depends_on "rust" => :build
+  end
 
   def install
-    system "cargo", "install", *std_cargo_args
+    if build.head?
+      system "cargo", "install", *std_cargo_args
+    else
+      unless OS.mac?
+        odie <<~EOS
+          Stable Homebrew install currently ships the Apple silicon macOS binary only.
+          On Linux, use `brew install --HEAD lctr` to build from source.
+        EOS
+      end
+
+      unless Hardware::CPU.arm?
+        odie <<~EOS
+          Stable Homebrew install currently ships the Apple silicon macOS binary only.
+          On Intel macOS, use `brew install --HEAD lctr` to build from source.
+        EOS
+      end
+
+      bin.install "lctr"
+    end
   end
 
   def caveats

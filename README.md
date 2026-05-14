@@ -1,8 +1,6 @@
 # 🔍 locator
 
-Fast local file metadata search from the terminal.
-
-`locator` builds a local SQLite index for filenames, paths, file kinds, sizes, and dates. The command is `lctr`. It does not upload data and does not index file contents.
+`lctr` is a Rust-built local metadata search CLI/TUI. It stores local SQLite indexes for filenames, paths, file kinds, sizes, and dates. It does not upload data and does not index file contents.
 
 ## ✨ Demo
 
@@ -36,106 +34,109 @@ On the internal SSD, `lctr` is still faster by quite a bit, and the returned res
 
 ## Install
 
-### 🍎 macOS And Linux
+### macOS
 
 Homebrew:
 
 ```bash
-brew update
 brew tap NotTanJune/locator https://github.com/NotTanJune/locator
 brew install lctr
 lctr setup-shell
 ```
 
-After the tap is installed:
-
-```bash
-brew update
-brew install lctr
-brew upgrade lctr
-```
-
-Install script:
+Curl:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/NotTanJune/locator/main/install.sh | sh
 ```
 
-The install script asks whether to enable shell integration. For non-interactive installs:
+Note: macOS Homebrew installs the prebuilt Rust binary on Apple silicon, so users do not need local Rust or LLVM.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/NotTanJune/locator/main/install.sh | LCTR_INSTALL_SHELL_INTEGRATION=1 sh
-```
-
-Cargo:
-
-```bash
-rustup update
-cargo install --git https://github.com/NotTanJune/locator --tag v0.1.58
-lctr setup-shell
-```
-
-Local checkout:
-
-```bash
-rustup update
-cargo install --path .
-lctr setup-shell
-```
-
-### 🪟 Windows
+### Windows
 
 Scoop:
 
 ```powershell
-scoop update
 scoop bucket add locator https://github.com/NotTanJune/locator
 scoop install lctr
 lctr setup-shell --shell powershell
 ```
 
-Scoop upgrades:
-
-```powershell
-scoop update
-scoop update lctr
-```
-
-PowerShell installer:
+Curl:
 
 ```powershell
 irm https://raw.githubusercontent.com/NotTanJune/locator/main/install.ps1 | iex
 ```
 
-The PowerShell installer asks whether to enable shell integration. For non-interactive installs:
+## Usage
 
-```powershell
-& ([scriptblock]::Create((irm https://raw.githubusercontent.com/NotTanJune/locator/main/install.ps1))) -ShellIntegration yes
-```
+| Command | Purpose | Example |
+|---|---|---|
+| `lctr scan [ROOT]` | Build or refresh a metadata index. | `lctr scan /Volumes/MyDrive` |
+| `lctr search [ROOT]` | Open the interactive search UI. | `lctr search ~/Documents` |
+| `lctr find <QUERY> [FILTERS]` | Run scriptable one-shot search. | `lctr find invoice --type pdf --modified-after 2024-01-01` |
+| `lctr status` | Show index status for current or target root. | `lctr status` |
+| `lctr delete-index [ROOT]` | Delete the local index. | `lctr delete-index /Volumes/MyDrive` |
+| `lctr setup-shell [OPTIONS]` | Enable scan auto-cd shell integration. | `lctr setup-shell --shell zsh` |
 
-Future WinGet target:
+If no index exists, `lctr search` uses live filesystem search. If an interrupted scan left an incomplete index, `lctr search` uses hybrid search: indexed results first, then live search for paths missing from the partial index.
 
-```powershell
-winget install lctr
-```
+## Privacy
 
-That command requires acceptance into the Windows Package Manager Community Repository.
+`lctr` does not collect, upload, sell, or transmit any information from your machine. There is no account, telemetry, analytics, cloud sync, or background service.
 
-### After Install
-
-```bash
-lctr --version
-lctr scan
-lctr search
-```
-
-### Shell Integration
-
-Optional shell integration makes `lctr scan <dir>` move your current shell into `<dir>` after a successful scan. The install scripts can set this up during install. Package-manager installs can enable it afterward:
+Indexes are local SQLite files. By default, a scan writes to the directory you scan:
 
 ```bash
-lctr setup-shell
+<ROOT>/.locator/index.sqlite
 ```
+
+If that location is not writable, `lctr` stores a fallback index in local app-support storage for your user account:
+
+```bash
+~/Library/Application Support/locator/index.sqlite
+```
+
+When you run `lctr search`, `lctr find`, or `lctr status`, locator first looks for the nearest `.locator/index.sqlite` in the current directory or its parents. If none exists, it uses the default app-support index.
+
+The indexed data is metadata only: paths, filenames, extensions, roots, volumes, file kinds, sizes, and dates. `lctr` does not index file contents.
+
+Delete an index whenever you want:
+
+```bash
+lctr delete-index
+lctr delete-index /Volumes/MyDrive
+```
+
+After deletion, `lctr search` falls back to live filesystem search until you scan that directory again.
+
+Scanner behavior is session-scoped, not a daemon. Common noisy files and directories are skipped: `.DS_Store`, `._*`, `__MACOSX`, `.git`, `.locator`, `node_modules`, caches, build outputs, DerivedData, Spotlight metadata, and trash.
+
+<details>
+<summary>Advanced commands</summary>
+
+### Scan Tuning
+
+Default scans are tuned for high-throughput local and external-drive indexing:
+
+```bash
+lctr scan /Volumes/MyDrive --backend dirent --no-eta --stage-index --batch-size 500000 --writer-queue-batches 32 --native-workers 8 --native-output-batch-size 4096 --profile-detail
+```
+
+Useful tuning options:
+
+```bash
+lctr scan ~/Documents --backend auto
+lctr scan ~/Documents --backend native
+lctr scan ~/Documents --backend dirent
+lctr scan ~/Documents --backend parallel
+lctr scan ~/Documents --eta
+lctr scan /Volumes/MyDrive --no-stage-index --no-profile-detail
+```
+
+`--stage-index` builds a fresh SQLite database in app-support storage, then copies the finished index into `<ROOT>/.locator/index.sqlite`. If the root is read-only, the finished index stays in app-support fallback storage.
+
+### Shell Integration Internals
 
 Manual shell integration:
 
@@ -158,72 +159,23 @@ Invoke-Expression (& lctr shell-init powershell)
 
 With shell integration installed, `lctr scan ~/Documents` scans `~/Documents`, stores the index in `~/Documents/.locator/index.sqlite`, and moves your current shell into `~/Documents` after a successful scan. Plain `lctr scan ~/Documents` cannot change the parent shell directory without this integration.
 
-## Usage
-
-Scan the current folder:
+### Index Management
 
 ```bash
-lctr scan
-```
-
-Scan your home folder, a target folder, or an external drive:
-
-```bash
-lctr scan ~
-lctr scan ~/Documents
-lctr scan /Volumes/MyDrive
-```
-
-Open the interactive search UI:
-
-```bash
-lctr search
-```
-
-Search a specific indexed or unindexed folder:
-
-```bash
-lctr search /Volumes/MyDrive
-```
-
-If no index exists, `lctr search` uses live filesystem search. If an interrupted scan left an incomplete index, `lctr search` uses hybrid search: indexed results first, then live search for paths missing from the partial index.
-
-Scriptable one-shot search:
-
-```bash
-lctr find invoice --type pdf --min-size 100kb --modified-after 2024-01-01
-```
-
-More filters:
-
-```bash
-lctr find passport --ext jpg,png --created-after 2023-01-01 --limit 20
-```
-
-Sort and reverse order:
-
-```bash
-lctr find archive --sort size
-lctr find archive --sort size --reverse
-```
-
-## Commands
-
-```bash
-lctr scan [ROOT]
-lctr status
-lctr search [ROOT]
-lctr find <QUERY> [FILTERS]
 lctr watch [ROOT]
 lctr roots
 lctr remove-root <ROOT>
-lctr delete-index [ROOT]
 lctr vacuum
-lctr setup-shell [--shell zsh|bash|fish|powershell] [--yes|--no]
-lctr shell-init zsh|bash|fish|powershell
 ```
 
-## Search UI Keys
+### Path Overrides
+
+```bash
+LCTR_DB=/tmp/locator.sqlite lctr scan /tmp/files
+LCTR_DATA_DIR=/tmp/locator-data lctr scan /tmp/files
+```
+
+### Search UI Keys
 
 ```text
 /      focus search
@@ -242,84 +194,7 @@ y      copy path
 ?      show help text
 ```
 
-## Index Storage
-
-Directory-local index:
-
-```bash
-<ROOT>/.locator/index.sqlite
-```
-
-Default app-support index:
-
-```bash
-~/Library/Application Support/locator/index.sqlite
-```
-
-When you run `lctr search`, `lctr find`, or `lctr status`, locator first looks for the nearest `.locator/index.sqlite` in the current directory or its parents. If none exists, it uses the default app-support index.
-
-Delete the current directory index:
-
-```bash
-lctr delete-index
-```
-
-Delete a target directory index:
-
-```bash
-lctr delete-index /Volumes/MyDrive
-```
-
-Override paths for tests or experiments:
-
-```bash
-LCTR_DB=/tmp/locator.sqlite lctr scan /tmp/files
-LCTR_DATA_DIR=/tmp/locator-data lctr scan /tmp/files
-```
-
-## Scan Notes
-
-Default scans are tuned for high-throughput local and external-drive indexing:
-
-```bash
-lctr scan /Volumes/MyDrive --backend dirent --no-eta --stage-index --batch-size 500000 --writer-queue-batches 32 --native-workers 8 --native-output-batch-size 4096 --profile-detail
-```
-
-Useful tuning options:
-
-```bash
-lctr scan ~/Documents --backend auto
-lctr scan ~/Documents --backend native
-lctr scan ~/Documents --backend dirent
-lctr scan ~/Documents --backend parallel
-lctr scan ~/Documents --eta
-lctr scan /Volumes/MyDrive --no-stage-index --no-profile-detail
-```
-
-`--stage-index` builds a fresh SQLite database in app-support storage, then copies the finished index into `<ROOT>/.locator/index.sqlite`. If the root is read-only, the finished index stays in app-support fallback storage.
-
-## Security, Privacy, And Index Deletion
-
-`lctr` does not collect, upload, sell, or transmit any information from your machine. There is no account, telemetry, analytics, cloud sync, or background service.
-
-Indexes are local SQLite files. By default, a scan writes to the directory you scan:
-
-```bash
-<ROOT>/.locator/index.sqlite
-```
-
-If that location is not writable, `lctr` stores a fallback index in local app-support storage for your user account. The indexed data is metadata only: paths, filenames, extensions, roots, volumes, file kinds, sizes, and dates. `lctr` does not index file contents.
-
-Delete an index whenever you want:
-
-```bash
-lctr delete-index
-lctr delete-index /Volumes/MyDrive
-```
-
-After deletion, `lctr search` falls back to live filesystem search until you scan that directory again.
-
-Scanner behavior is session-scoped, not a daemon. Common noisy files and directories are skipped: `.DS_Store`, `._*`, `__MACOSX`, `.git`, `.locator`, `node_modules`, caches, build outputs, DerivedData, Spotlight metadata, and trash.
+</details>
 
 ## 📊 Comparison
 
@@ -338,14 +213,6 @@ Scanner behavior is session-scoped, not a daemon. Common noisy files and directo
 | [WindFind](https://github.com/kingToolbox/WindFind) | Windows-first instant file location | CLI | Compact Windows-focused index | No | Windows | `lctr` aims to bring indexed search to a cross-platform CLI/TUI workflow |
 | [cling](https://github.com/root-project/cling) | C++ interpreter | REPL | Not a file search tool | Not a file search tool | Cross-platform source | Not a direct competitor; included only because it came up in the comparison set |
 | [fd](https://github.com/sharkdp/fd) | Fast live filesystem finding | CLI | No persistent index | No | Cross-platform | `lctr` trades an initial scan for instant indexed search, richer metadata filters, and an interactive TUI |
-
-## 🗓️ Future Improvements
-
-The current distribution story is intentionally practical: Homebrew works through the project tap, Windows works through Scoop and the direct PowerShell installer, and GitHub Releases publish platform binaries.
-
-The bigger packaging goal is still zero-friction installation from the default package channels. For Homebrew, that means a future `homebrew/core` submission once the project has enough public usage to clear Homebrew's notability checks. For Windows, Scoop is available now, while WinGet is the next native package-manager target after more release validation.
-
-Windows scanning also has room for a native speed pass. The current Windows path uses the portable parallel filesystem walker. A later NTFS-aware backend can make large local-volume scans faster while falling back to the portable scanner for non-NTFS, network, or permission-limited roots.
 
 ## License
 

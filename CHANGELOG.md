@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.1.59
+
+- Switched stable Homebrew installs on Apple silicon macOS to the prebuilt release binary.
+- Added release automation for Homebrew and Scoop manifest updates.
+- Tightened README install, usage, and privacy docs.
+
 ## 0.1.41
 
 - Gated Unix-only permission and symlink tests so Windows CI can compile all test targets.

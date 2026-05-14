@@ -25,3 +25,6 @@ jobs:
         run: cargo test
       - name: Package
         run: cargo package --no-verify
+      - name: Release manifest updater
+        if: runner.os != 'Windows'
+        run: scripts/test-update-release-manifests.sh
