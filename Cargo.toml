@@ -1,6 +1,6 @@
 [package]
 name = "locator"
-version = "0.1.59"
+version = "0.1.60"
 edition = "2021"
 description = "Fast local file metadata search"
 repository = "https://github.com/NotTanJune/locator"
@@ -30,6 +30,7 @@ ratatui = "0.30"
 regex = "1.12"
 rusqlite = { version = "0.39", features = ["bundled", "chrono"] }
 tempfile = "3.13"
+ureq = "2.10"
 walkdir = "2.5"
 
 [dev-dependencies]

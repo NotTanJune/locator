@@ -59,6 +59,8 @@ enum Commands {
         eta: bool,
         #[arg(long)]
         no_eta: bool,
+        #[arg(long)]
+        no_update_check: bool,
     },
     ShellInit {
         shell: String,
@@ -77,6 +79,8 @@ enum Commands {
     Search {
         #[arg(default_value_os_t = std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))]
         root: PathBuf,
+        #[arg(long)]
+        no_update_check: bool,
     },
     Find(FindArgs),
     Watch {
@@ -143,6 +147,7 @@ fn main() -> Result<()> {
             no_profile_detail,
             eta,
             no_eta,
+            no_update_check,
         } => {
             let use_stage_index =
                 !no_stage_index && (stage_index || std::env::var_os("LCTR_DB").is_none());
@@ -219,6 +224,16 @@ fn main() -> Result<()> {
             } else {
                 println!("{}", render_scan_summary(&summary));
             }
+            if no_update_check {
+                locator::update_check::persist_disable();
+            }
+            if let Some(s) = locator::update_check::check(no_update_check) {
+                let line = format!(
+                    "\u{2728} lctr {} available, run `{}`",
+                    s.latest, s.update_cmd
+                );
+                println!("{}", line);
+            }
         }
         Commands::ShellInit { shell } => {
             print_shell_init(&shell)?;
@@ -235,8 +250,11 @@ fn main() -> Result<()> {
             let db = Database::open_default_for_search()?;
             println!("{} indexed files", db.count_active()?);
         }
-        Commands::Search { root } => {
-            locator::tui::run_for_directory(root)?;
+        Commands::Search { root, no_update_check } => {
+            if no_update_check {
+                locator::update_check::persist_disable();
+            }
+            locator::tui::run_for_directory(root, no_update_check)?;
         }
         Commands::Find(args) => {
             let db = Database::open_default_for_search()?;

@@ -1,5 +1,6 @@
-# Changelog - v0.1.59
+# Changelog - v0.1.60
 
-- Homebrew now installs the prebuilt Apple silicon macOS binary instead of building from source.
-- Release automation now updates Homebrew and Scoop manifests from published release artifacts.
-- README install and usage docs are shorter and focused on current macOS and Windows paths.
+- Added automatic GitHub release check: `lctr` now notifies you when a newer version is available whenever you run `scan` or `search`.
+- The update notice appears as a banner in the search TUI, and as a line after the scan summary.
+- The check is cached for 24 hours so it never slows down repeated launches.
+- Opt out with `--no-update-check` (persists across runs) or `LCTR_NO_UPDATE_CHECK=1`.

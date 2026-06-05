@@ -84,23 +84,29 @@ pub fn search_backend_for_directory(start: impl AsRef<Path>) -> Result<SearchBac
 }
 
 pub fn run_for_current_dir() -> Result<()> {
-    run_for_directory(std::env::current_dir().context("locate current directory")?)
+    run_for_directory(
+        std::env::current_dir().context("locate current directory")?,
+        false,
+    )
 }
 
-pub fn run_for_directory(root: impl AsRef<Path>) -> Result<()> {
+pub fn run_for_directory(root: impl AsRef<Path>, update_check_disabled: bool) -> Result<()> {
     let backend = search_backend_for_directory(root)?;
-    run_with_backend(backend)
+    run_with_backend(backend, update_check_disabled)
 }
 
 pub fn run(db: &Database, db_path: PathBuf) -> Result<()> {
     let _ = db;
-    run_with_backend(SearchBackend::Indexed {
-        db_path,
-        root: std::env::current_dir().context("locate current directory")?,
-    })
+    run_with_backend(
+        SearchBackend::Indexed {
+            db_path,
+            root: std::env::current_dir().context("locate current directory")?,
+        },
+        false,
+    )
 }
 
-pub fn run_with_backend(search_backend: SearchBackend) -> Result<()> {
+pub fn run_with_backend(search_backend: SearchBackend, update_check_disabled: bool) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(
@@ -111,7 +117,7 @@ pub fn run_with_backend(search_backend: SearchBackend) -> Result<()> {
     )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    let result = run_loop(&mut terminal, search_backend);
+    let result = run_loop(&mut terminal, search_backend, update_check_disabled);
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -124,6 +130,7 @@ pub fn run_with_backend(search_backend: SearchBackend) -> Result<()> {
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     search_backend: SearchBackend,
+    update_check_disabled: bool,
 ) -> Result<()> {
     let mut input = SearchInput::default();
     let mut all_results = Vec::new();
@@ -144,6 +151,8 @@ fn run_loop(
     let mut loading_query: Option<String> = None;
     let mut last_edit = Instant::now();
     let mut indexed_input_exit_deadline: Option<Instant> = None;
+    let update_rx = crate::update_check::check_async(update_check_disabled);
+    let mut update_status: Option<crate::update_check::UpdateStatus> = None;
 
     loop {
         while let Some(response) = search_worker.try_recv() {
@@ -224,6 +233,12 @@ fn run_loop(
             }
         }
 
+        if update_status.is_none() {
+            if let Ok(Some(s)) = update_rx.try_recv() {
+                update_status = Some(s);
+            }
+        }
+
         terminal.draw(|frame| {
             let query = input.as_str();
             let has_detail = frame.area().height >= 20;
@@ -241,14 +256,41 @@ fn run_loop(
                 status: status.as_str(),
             };
             let controls_height = controls_panel_height(&top_args);
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(top_chrome_height(&top_args)),
-                    Constraint::Min(6),
-                    Constraint::Length(if has_detail { 3 } else { 0 }),
-                ])
-                .split(frame.area());
+            let show_banner = update_status.is_some();
+            let all_chunks = if show_banner {
+                Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1),
+                        Constraint::Length(top_chrome_height(&top_args)),
+                        Constraint::Min(6),
+                        Constraint::Length(if has_detail { 3 } else { 0 }),
+                    ])
+                    .split(frame.area())
+            } else {
+                Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(top_chrome_height(&top_args)),
+                        Constraint::Min(6),
+                        Constraint::Length(if has_detail { 3 } else { 0 }),
+                    ])
+                    .split(frame.area())
+            };
+            let offset = if show_banner { 1 } else { 0 };
+            let chunks = &all_chunks[offset..];
+
+            if show_banner {
+                if let Some(ref s) = update_status {
+                    let banner_text = format!(
+                        "\u{2728} lctr {} available, run `{}`",
+                        s.latest, s.update_cmd
+                    );
+                    let banner = Paragraph::new(banner_text)
+                        .style(Style::default().fg(theme.warn).add_modifier(Modifier::BOLD));
+                    frame.render_widget(banner, all_chunks[0]);
+                }
+            }
 
             let top_chunks = Layout::default()
                 .direction(Direction::Vertical)

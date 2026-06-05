@@ -5,4 +5,5 @@ pub mod query;
 pub mod scan_ui;
 pub mod scanner;
 pub mod tui;
+pub mod update_check;
 pub mod watch;
