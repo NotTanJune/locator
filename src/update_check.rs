@@ -19,7 +19,11 @@ fn cache_file() -> Option<PathBuf> {
 }
 
 fn disable_marker_file() -> Option<PathBuf> {
-    Some(dirs::config_dir()?.join("locator").join("update_check_disabled"))
+    Some(
+        dirs::config_dir()?
+            .join("locator")
+            .join("update_check_disabled"),
+    )
 }
 
 fn read_cache() -> Option<(u64, String)> {
@@ -48,13 +52,13 @@ pub fn checks_disabled() -> bool {
             return true;
         }
     }
-    disable_marker_file()
-        .map(|p| p.exists())
-        .unwrap_or(false)
+    disable_marker_file().map(|p| p.exists()).unwrap_or(false)
 }
 
 pub fn persist_disable() {
-    let Some(path) = disable_marker_file() else { return };
+    let Some(path) = disable_marker_file() else {
+        return;
+    };
     if let Some(parent) = path.parent() {
         let _ = fs::create_dir_all(parent);
     }

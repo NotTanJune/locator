@@ -250,7 +250,10 @@ fn main() -> Result<()> {
             let db = Database::open_default_for_search()?;
             println!("{} indexed files", db.count_active()?);
         }
-        Commands::Search { root, no_update_check } => {
+        Commands::Search {
+            root,
+            no_update_check,
+        } => {
             if no_update_check {
                 locator::update_check::persist_disable();
             }
