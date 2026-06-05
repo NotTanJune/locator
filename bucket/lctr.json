@@ -12,7 +12,7 @@
     "architecture": {
         "64bit": {
             "url": "https://github.com/NotTanJune/locator/releases/download/v0.1.60/lctr-x86_64-pc-windows-msvc.zip",
-            "hash": "de76864b70f65208972b27a8cda4c0e0c992a07903c03be2ecd087e7243ad025"
+            "hash": "aa9603a91ea73096565d83328af6c269c03dbeae6da0a4ed7a26906a2224ba38"
         }
     },
     "bin": "lctr.exe",
