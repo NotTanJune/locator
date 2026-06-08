@@ -1017,7 +1017,14 @@ fn format_duration(duration: Duration) -> String {
 }
 
 fn format_seconds(duration: Duration) -> String {
-    format!("{:.1}s", duration.as_secs_f64())
+    let secs = duration.as_secs_f64();
+    // A stage that ran but is faster than 0.005s would round to 0.00s and look
+    // broken; show <0.00s so a very fast stage reads as fast, not stalled.
+    if secs > 0.0 && secs < 0.005 {
+        "<0.00s".to_string()
+    } else {
+        format!("{secs:.2}s")
+    }
 }
 
 fn format_number(value: u64) -> String {

@@ -1,5 +1,8 @@
 use chrono::{TimeZone, Utc};
-use locator::query::{FileKind, QueryMode, SearchFilters, SearchOptions, SizeBound, SortField};
+use locator::query::{
+    CompiledQuery, FileKind, QueryMode, QueryScorer, SearchFilters, SearchOptions, SizeBound,
+    SortField,
+};
 
 #[test]
 fn parses_size_filters_with_units() {
@@ -82,4 +85,48 @@ fn query_modes_match_filename_and_path_candidates() {
 fn invalid_pattern_modes_return_errors() {
     assert!(QueryMode::Regex.matches("[", "report.pdf").is_err());
     assert!(QueryMode::Glob.matches("[", "report.pdf").is_err());
+}
+
+#[test]
+fn match_positions_report_highlight_ranges() {
+    let mut scorer = QueryScorer::new();
+
+    // Contains: the substring "port" of "Report" sits at char indices 11..15.
+    let contains = CompiledQuery::compile(QueryMode::Contains, "port").unwrap();
+    assert_eq!(
+        contains.match_positions(&mut scorer, "QuarterlyReport.pdf"),
+        vec![11, 12, 13, 14]
+    );
+
+    // Prefix highlights the leading run.
+    let prefix = CompiledQuery::compile(QueryMode::Prefix, "quar").unwrap();
+    assert_eq!(
+        prefix.match_positions(&mut scorer, "QuarterlyReport.pdf"),
+        vec![0, 1, 2, 3]
+    );
+
+    // Fuzzy returns the matched subsequence positions, sorted and deduped.
+    let fuzzy = CompiledQuery::compile(QueryMode::Fuzzy, "qrep").unwrap();
+    let positions = fuzzy.match_positions(&mut scorer, "QuarterlyReport.pdf");
+    assert!(!positions.is_empty());
+    assert!(positions.windows(2).all(|w| w[0] < w[1]));
+    assert_eq!(positions.len(), 4);
+
+    // Empty query highlights nothing.
+    let empty = CompiledQuery::compile(QueryMode::Contains, "").unwrap();
+    assert!(empty
+        .match_positions(&mut scorer, "QuarterlyReport.pdf")
+        .is_empty());
+}
+
+#[test]
+fn fuzzy_rank_orders_better_matches_higher() {
+    let mut scorer = QueryScorer::new();
+    let compiled = CompiledQuery::compile(QueryMode::Fuzzy, "report").unwrap();
+
+    let tight = compiled.fuzzy_rank(&mut scorer, ["report.pdf"]);
+    let loose = compiled.fuzzy_rank(&mut scorer, ["quarterly_report_archive.pdf"]);
+
+    assert!(tight.is_some() && loose.is_some());
+    assert!(tight.unwrap() >= loose.unwrap());
 }

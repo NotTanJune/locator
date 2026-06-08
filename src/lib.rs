@@ -1,6 +1,10 @@
+pub mod config;
+pub mod config_ui;
 pub mod db;
+pub mod live_index;
 pub mod live_search;
 pub mod open;
+pub mod preview;
 pub mod query;
 pub mod scan_ui;
 pub mod scanner;

@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, NaiveDate, Utc};
 use clap::ValueEnum;
+use nucleo_matcher::{Config, Matcher, Utf32Str};
 use regex::{Regex, RegexBuilder};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
@@ -40,32 +41,188 @@ impl QueryMode {
         }
     }
 
+    /// Convenience one-shot match. Compiles the query and matches a single
+    /// candidate. For hot loops, prefer [`CompiledQuery`] which compiles once.
     pub fn matches(self, query: &str, candidate: &str) -> Result<bool> {
-        let query = query.trim();
-        if query.is_empty() {
-            return Ok(true);
-        }
+        let compiled = CompiledQuery::compile(self, query)?;
+        let mut scorer = QueryScorer::new();
+        Ok(compiled.is_match(&mut scorer, candidate))
+    }
+}
 
-        let candidate_lower = candidate.to_ascii_lowercase();
-        let query_lower = query.to_ascii_lowercase();
-        Ok(match self {
-            Self::Contains => candidate_lower.contains(&query_lower),
-            Self::Exact => candidate_lower == query_lower,
-            Self::Prefix => candidate_lower.starts_with(&query_lower),
-            Self::Suffix => {
-                let stem_matches = std::path::Path::new(&candidate_lower)
-                    .file_stem()
-                    .and_then(|stem| stem.to_str())
-                    .is_some_and(|stem| stem.ends_with(&query_lower));
-                candidate_lower.ends_with(&query_lower) || stem_matches
-            }
-            Self::Fuzzy => fuzzy_match(&query_lower, &candidate_lower),
-            Self::Regex => Regex::new(query)
-                .map_err(|error| anyhow!("invalid regex '{query}': {error}"))?
-                .is_match(candidate),
-            Self::Glob => glob_regex(query)?.is_match(candidate),
+/// Reusable fuzzy-match scratch space (nucleo `Matcher` plus buffers). Construct
+/// once per search (or per draw) and reuse across all candidates to avoid
+/// repeated allocation.
+pub struct QueryScorer {
+    matcher: Matcher,
+    needle_buf: Vec<char>,
+    hay_buf: Vec<char>,
+    idx_buf: Vec<u32>,
+}
+
+impl Default for QueryScorer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl QueryScorer {
+    pub fn new() -> Self {
+        Self {
+            matcher: Matcher::new(Config::DEFAULT),
+            needle_buf: Vec::new(),
+            hay_buf: Vec::new(),
+            idx_buf: Vec::new(),
+        }
+    }
+
+    fn fuzzy_score(&mut self, needle_lower: &str, hay_lower: &str) -> Option<u32> {
+        let Self {
+            matcher,
+            needle_buf,
+            hay_buf,
+            ..
+        } = self;
+        let needle = Utf32Str::new(needle_lower, needle_buf);
+        let hay = Utf32Str::new(hay_lower, hay_buf);
+        matcher.fuzzy_match(hay, needle).map(u32::from)
+    }
+
+    fn fuzzy_positions(&mut self, needle_lower: &str, hay_lower: &str) -> Vec<usize> {
+        let Self {
+            matcher,
+            needle_buf,
+            hay_buf,
+            idx_buf,
+        } = self;
+        idx_buf.clear();
+        let needle = Utf32Str::new(needle_lower, needle_buf);
+        let hay = Utf32Str::new(hay_lower, hay_buf);
+        if matcher.fuzzy_indices(hay, needle, idx_buf).is_none() {
+            return Vec::new();
+        }
+        idx_buf.sort_unstable();
+        idx_buf.dedup();
+        idx_buf.iter().map(|&i| i as usize).collect()
+    }
+}
+
+/// A query compiled once for a given mode + string. Regex/glob are compiled a
+/// single time here rather than per candidate.
+pub enum CompiledQuery {
+    Empty,
+    Contains(String),
+    Exact(String),
+    Prefix(String),
+    Suffix(String),
+    Fuzzy(String),
+    Regex(Regex),
+    Glob(Regex),
+}
+
+impl CompiledQuery {
+    pub fn compile(mode: QueryMode, query: &str) -> Result<Self> {
+        let trimmed = query.trim();
+        if trimmed.is_empty() {
+            return Ok(Self::Empty);
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        Ok(match mode {
+            QueryMode::Contains => Self::Contains(lower),
+            QueryMode::Exact => Self::Exact(lower),
+            QueryMode::Prefix => Self::Prefix(lower),
+            QueryMode::Suffix => Self::Suffix(lower),
+            QueryMode::Fuzzy => Self::Fuzzy(lower),
+            QueryMode::Regex => Self::Regex(
+                Regex::new(trimmed)
+                    .map_err(|error| anyhow!("invalid regex '{trimmed}': {error}"))?,
+            ),
+            QueryMode::Glob => Self::Glob(glob_regex(trimmed)?),
         })
     }
+
+    pub fn is_match(&self, scorer: &mut QueryScorer, candidate: &str) -> bool {
+        match self {
+            Self::Empty => true,
+            Self::Contains(q) => candidate.to_ascii_lowercase().contains(q),
+            Self::Exact(q) => candidate.to_ascii_lowercase() == *q,
+            Self::Prefix(q) => candidate.to_ascii_lowercase().starts_with(q),
+            Self::Suffix(q) => {
+                let lower = candidate.to_ascii_lowercase();
+                let stem_matches = std::path::Path::new(&lower)
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .is_some_and(|stem| stem.ends_with(q));
+                lower.ends_with(q) || stem_matches
+            }
+            Self::Fuzzy(q) => scorer
+                .fuzzy_score(q, &candidate.to_ascii_lowercase())
+                .is_some(),
+            Self::Regex(re) | Self::Glob(re) => re.is_match(candidate),
+        }
+    }
+
+    pub fn matches_any<'a>(
+        &self,
+        scorer: &mut QueryScorer,
+        candidates: impl IntoIterator<Item = &'a str>,
+    ) -> bool {
+        candidates
+            .into_iter()
+            .any(|candidate| self.is_match(scorer, candidate))
+    }
+
+    /// Best fuzzy score across the given candidates (typically name + path).
+    /// Higher is better. `None` when nothing matches. Only meaningful in Fuzzy
+    /// mode; other modes return `None`.
+    pub fn fuzzy_rank<'a>(
+        &self,
+        scorer: &mut QueryScorer,
+        candidates: impl IntoIterator<Item = &'a str>,
+    ) -> Option<u32> {
+        let Self::Fuzzy(q) = self else {
+            return None;
+        };
+        candidates
+            .into_iter()
+            .filter_map(|candidate| scorer.fuzzy_score(q, &candidate.to_ascii_lowercase()))
+            .max()
+    }
+
+    /// Char positions in `text` that participate in the match, for highlighting.
+    pub fn match_positions(&self, scorer: &mut QueryScorer, text: &str) -> Vec<usize> {
+        match self {
+            Self::Empty => Vec::new(),
+            Self::Contains(q) | Self::Exact(q) | Self::Prefix(q) => substring_positions(text, q),
+            Self::Suffix(q) => substring_positions(text, q),
+            Self::Fuzzy(q) => scorer.fuzzy_positions(q, &text.to_ascii_lowercase()),
+            Self::Regex(re) | Self::Glob(re) => regex_positions(re, text),
+        }
+    }
+}
+
+/// Char indices of the first occurrence of `needle_lower` within `text`
+/// (case-insensitive). ASCII-lowercasing preserves char alignment.
+fn substring_positions(text: &str, needle_lower: &str) -> Vec<usize> {
+    if needle_lower.is_empty() {
+        return Vec::new();
+    }
+    let lower = text.to_ascii_lowercase();
+    let Some(byte_pos) = lower.find(needle_lower) else {
+        return Vec::new();
+    };
+    let start_char = lower[..byte_pos].chars().count();
+    let len_chars = needle_lower.chars().count();
+    (start_char..start_char + len_chars).collect()
+}
+
+fn regex_positions(re: &Regex, text: &str) -> Vec<usize> {
+    let Some(m) = re.find(text) else {
+        return Vec::new();
+    };
+    let start_char = text[..m.start()].chars().count();
+    let end_char = text[..m.end()].chars().count();
+    (start_char..end_char).collect()
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
@@ -384,24 +541,6 @@ fn parse_size(value: &str) -> Result<u64> {
     };
 
     Ok((amount * multiplier) as u64)
-}
-
-fn fuzzy_match(needle: &str, candidate: &str) -> bool {
-    if needle.is_empty() {
-        return true;
-    }
-
-    let mut chars = needle.chars();
-    let mut current = chars.next();
-    for candidate_char in candidate.chars() {
-        if Some(candidate_char) == current {
-            current = chars.next();
-            if current.is_none() {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 fn glob_regex(pattern: &str) -> Result<Regex> {

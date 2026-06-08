@@ -30,13 +30,13 @@ impl Default for ScanOptions {
         Self {
             idle_timeout: Duration::from_secs(300),
             batch_size: 500_000,
-            writer_queue_batches: 32,
+            writer_queue_batches: 64,
             native_buffer_bytes: 16 * 1024 * 1024,
             native_workers: 8,
             native_output_batch_size: 4096,
             fresh_index: false,
             estimate_totals: false,
-            backend: ScanBackend::Dirent,
+            backend: ScanBackend::ParallelWalk,
         }
     }
 }
@@ -606,7 +606,7 @@ pub(crate) fn is_skip_name_bytes(name: &[u8]) -> bool {
     )
 }
 
-fn record_from_path(root: &str, path: &Path) -> io::Result<FileRecord> {
+pub(crate) fn record_from_path(root: &str, path: &Path) -> io::Result<FileRecord> {
     let name = path
         .file_name()
         .map(|value| value.to_string_lossy().to_string())
@@ -673,7 +673,7 @@ fn kind_for_extension(extension: Option<&str>) -> String {
     .to_string()
 }
 
-fn volume_for(path: &Path) -> String {
+pub(crate) fn volume_for(path: &Path) -> String {
     let mut parts = path.components();
     let first = parts.next();
     let second = parts.next();
