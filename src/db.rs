@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
@@ -8,7 +8,9 @@ use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::time::{Duration, Instant};
 
-use crate::query::{QueryMode, SearchFilters, SearchOptions, SortField};
+use crate::query::{
+    CompiledQuery, QueryMode, QueryScorer, SearchFilters, SearchOptions, SortField,
+};
 
 pub const LOCAL_INDEX_DIR: &str = ".locator";
 pub const INDEX_FILE_NAME: &str = "index.sqlite";
@@ -418,10 +420,11 @@ impl Database {
             "SELECT f.path, f.name, f.extension, f.kind, f.size_bytes, f.created_at, f.modified_at
              FROM files f",
         );
+        let trimmed = query.trim();
         let fts_query = sanitize_fts_query(query);
-        if !query.trim().is_empty() && fts_query.is_none() {
-            return Ok(Vec::new());
-        }
+        // Trigram needs >=3-char tokens. For shorter non-empty queries fall back
+        // to a name substring LIKE so single/double-char searches still work.
+        let short_like = fts_query.is_none() && !trimmed.is_empty();
         if fts_query.is_some() {
             sql.push_str(" JOIN files_fts ON files_fts.rowid = f.id");
         }
@@ -431,6 +434,9 @@ impl Database {
         if let Some(fts) = fts_query {
             sql.push_str(" AND files_fts MATCH ?");
             values.push(fts.into());
+        } else if short_like {
+            sql.push_str(" AND f.name_lower LIKE ?");
+            values.push(format!("%{}%", trimmed.to_lowercase()).into());
         }
         if let Some(kind) = &filters.kind {
             sql.push_str(" AND f.kind = ?");
@@ -508,26 +514,45 @@ impl Database {
         apply_sort_sql(&mut sql, options);
         values.push((candidate_limit(options) as i64).into());
 
+        let timing = SearchTiming::start();
+
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(values), search_result_from_row)?;
-        let mut results = self
-            .hydrate_search_results(
-                rows.collect::<rusqlite::Result<Vec<_>>>()
-                    .context("collect search results")?,
-            )?
+        let raw = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("collect search results")?;
+        let candidate_count = raw.len();
+        timing.lap("sql+collect");
+
+        // Filter/rank/sort on the metadata already stored in the index, then
+        // hydrate ONLY the rows we will return. Hydration does one
+        // `symlink_metadata` syscall per row, so hydrating the full candidate set
+        // (limit*20) before truncating was the real cost on large indexes.
+        let compiled = CompiledQuery::compile(options.mode, &options.query)?;
+        let mut scorer = QueryScorer::new();
+        let mut results = raw
             .into_iter()
             .filter(|result| {
-                candidate_matches(
-                    options.mode,
-                    &options.query,
-                    [result.name.as_str(), result.path.as_str()],
-                )
-                .unwrap_or(false)
+                compiled.matches_any(&mut scorer, [result.name.as_str(), result.path.as_str()])
             })
             .collect::<Vec<_>>();
+        let matched_count = results.len();
+        timing.lap("compile+filter");
 
-        sort_results(&mut results, options);
+        let frecency = if options.sort == SortField::Relevance {
+            let paths = results.iter().map(|r| r.path.as_str()).collect::<Vec<_>>();
+            self.frecency_scores(&paths)
+        } else {
+            HashMap::new()
+        };
+        timing.lap("frecency");
+
+        sort_results_compiled(&mut results, options, &compiled, &mut scorer, &frecency);
         results.truncate(options.limit);
+        timing.lap("sort");
+
+        let results = self.hydrate_search_results(results)?;
+        timing.finish(candidate_count, matched_count);
         Ok(results)
     }
 
@@ -621,6 +646,55 @@ impl Database {
         Ok(changed as u64)
     }
 
+    /// Record that a path was opened/revealed/copied, for frecency ranking.
+    pub fn record_access(&self, path: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO access(path, open_count, last_opened_at) VALUES (?1, 1, ?2)
+             ON CONFLICT(path) DO UPDATE SET
+                open_count = open_count + 1,
+                last_opened_at = ?2",
+            params![path, Utc::now().timestamp()],
+        )?;
+        Ok(())
+    }
+
+    /// Frecency weight per path (open count scaled by recency). Best-effort: any
+    /// failure (e.g. a connection without the `access` table) yields an empty
+    /// map so search never breaks.
+    fn frecency_scores(&self, paths: &[&str]) -> HashMap<String, u32> {
+        let now = Utc::now().timestamp();
+        let mut scores = HashMap::new();
+        let Ok(mut stmt) = self
+            .conn
+            .prepare("SELECT open_count, last_opened_at FROM access WHERE path = ?1")
+        else {
+            return scores;
+        };
+        for &path in paths {
+            let row = stmt.query_row(params![path], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?))
+            });
+            if let Ok((count, last_opened_at)) = row {
+                let weight = frecency_weight(count.max(0) as u32, last_opened_at, now);
+                if weight > 0 {
+                    scores.insert(path.to_string(), weight);
+                }
+            }
+        }
+        scores
+    }
+
+    /// Soft-delete a single path (and, if it is a directory, everything beneath
+    /// it). Used by the live filesystem watcher when a path is removed.
+    pub fn mark_path_deleted(&self, path: &str) -> Result<u64> {
+        let prefix = format!("{}/%", path.trim_end_matches('/'));
+        let changed = self.conn.execute(
+            "UPDATE files SET deleted = 1 WHERE path = ?1 OR path LIKE ?2",
+            params![path, prefix],
+        )?;
+        Ok(changed as u64)
+    }
+
     pub fn count_active(&self) -> Result<u64> {
         let count =
             self.conn
@@ -692,6 +766,11 @@ impl Database {
                 complete INTEGER NOT NULL,
                 started_at INTEGER NOT NULL,
                 completed_at INTEGER
+             );
+             CREATE TABLE IF NOT EXISTS access (
+                path TEXT PRIMARY KEY,
+                open_count INTEGER NOT NULL DEFAULT 0,
+                last_opened_at INTEGER
              );",
         )?;
         self.ensure_name_lower_column()?;
@@ -800,19 +879,30 @@ impl Database {
             )
             .optional()?;
 
+        // Recreate when the table is missing, lacks the content-table wiring,
+        // still uses the old word tokenizer, or its indexed columns no longer
+        // match the `index_paths` setting. The trigram tokenizer makes substring
+        // matching index-accelerated; indexing `path` as well is far more
+        // expensive to build, so it is opt-in.
+        let want_paths = fts_index_paths();
         let needs_recreate = create_sql
             .as_deref()
-            .map(|sql| !sql.contains("content='files'"))
+            .map(|sql| {
+                !sql.contains("content='files'")
+                    || !sql.contains("tokenize='trigram'")
+                    || fts_sql_has_path(sql) != want_paths
+            })
             .unwrap_or(true);
 
         if needs_recreate {
-            self.conn.execute_batch(
+            let columns = fts_columns(want_paths);
+            self.conn.execute_batch(&format!(
                 "DROP TABLE IF EXISTS files_fts;
                  CREATE VIRTUAL TABLE files_fts
-                 USING fts5(name, path, content='files', content_rowid='id', tokenize='unicode61');
-                 INSERT INTO files_fts(rowid, name, path)
-                 SELECT id, name, path FROM files WHERE deleted = 0;",
-            )?;
+                 USING fts5({columns}, content='files', content_rowid='id', tokenize='trigram');
+                 INSERT INTO files_fts(rowid, {columns})
+                 SELECT id, {columns} FROM files WHERE deleted = 0;",
+            ))?;
         }
 
         self.create_fts_triggers()?;
@@ -835,20 +925,50 @@ impl Database {
     }
 
     fn create_fts_triggers(&self) -> Result<()> {
-        self.conn.execute_batch(
-            "CREATE TRIGGER IF NOT EXISTS files_ai AFTER INSERT ON files BEGIN
-                INSERT INTO files_fts(rowid, name, path) VALUES (new.id, new.name, new.path);
+        // Triggers must reference exactly the columns the FTS table indexes. Only
+        // rebuild them when missing or when the column set changed (with
+        // `index_paths`) -- dropping them on every open would open a window where
+        // a concurrent writer's row never reaches the FTS index.
+        let want_paths = fts_index_paths();
+        let existing = self
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'files_ai'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(sql) = &existing {
+            if sql.contains("new.path") == want_paths {
+                return Ok(()); // triggers already match the desired columns
+            }
+        }
+        self.drop_fts_triggers()?;
+        let columns = fts_columns(want_paths);
+        let new_values = if want_paths {
+            "new.id, new.name, new.path"
+        } else {
+            "new.id, new.name"
+        };
+        let old_values = if want_paths {
+            "old.id, old.name, old.path"
+        } else {
+            "old.id, old.name"
+        };
+        self.conn.execute_batch(&format!(
+            "CREATE TRIGGER files_ai AFTER INSERT ON files BEGIN
+                INSERT INTO files_fts(rowid, {columns}) VALUES ({new_values});
              END;
-             CREATE TRIGGER IF NOT EXISTS files_ad AFTER DELETE ON files BEGIN
-                INSERT INTO files_fts(files_fts, rowid, name, path)
-                VALUES('delete', old.id, old.name, old.path);
+             CREATE TRIGGER files_ad AFTER DELETE ON files BEGIN
+                INSERT INTO files_fts(files_fts, rowid, {columns})
+                VALUES('delete', {old_values});
              END;
-             CREATE TRIGGER IF NOT EXISTS files_au AFTER UPDATE ON files BEGIN
-                INSERT INTO files_fts(files_fts, rowid, name, path)
-                VALUES('delete', old.id, old.name, old.path);
-                INSERT INTO files_fts(rowid, name, path) VALUES (new.id, new.name, new.path);
+             CREATE TRIGGER files_au AFTER UPDATE ON files BEGIN
+                INSERT INTO files_fts(files_fts, rowid, {columns})
+                VALUES('delete', {old_values});
+                INSERT INTO files_fts(rowid, {columns}) VALUES ({new_values});
              END;",
-        )?;
+        ))?;
         Ok(())
     }
 
@@ -1109,12 +1229,39 @@ fn should_fallback_to_app_support(error: &anyhow::Error) -> bool {
     })
 }
 
+/// Quote a string as a single FTS5 trigram substring token (internal double
+/// quotes doubled). Matches the substring anywhere in an indexed column.
+fn trigram_match(query: &str) -> String {
+    format!("\"{}\"", query.trim().to_lowercase().replace('"', "\"\""))
+}
+
+/// Whether the FTS index should cover full paths (opt-in via config) or just
+/// filenames (default, far cheaper to build).
+fn fts_index_paths() -> bool {
+    crate::config::Config::load().index_paths
+}
+
+/// FTS column list: `"name, path"` when paths are indexed, else `"name"`.
+fn fts_columns(index_paths: bool) -> &'static str {
+    if index_paths {
+        "name, path"
+    } else {
+        "name"
+    }
+}
+
+/// Whether an existing `files_fts` CREATE statement indexes the `path` column.
+fn fts_sql_has_path(create_sql: &str) -> bool {
+    create_sql.contains("(name, path")
+}
+
 fn sanitize_fts_query(query: &str) -> Option<String> {
+    // Trigram matching requires tokens of at least 3 chars; shorter fragments
+    // are dropped. Each alphanumeric run becomes a quoted substring, ANDed.
     let terms = query
         .split(|ch: char| !ch.is_alphanumeric())
-        .map(str::to_ascii_lowercase)
-        .filter(|term| !term.is_empty())
-        .map(|term| format!("{term}*"))
+        .filter(|term| term.chars().count() >= 3)
+        .map(trigram_match)
         .collect::<Vec<_>>();
 
     if terms.is_empty() {
@@ -1272,10 +1419,16 @@ fn apply_query_mode_sql(
 
     match options.mode {
         QueryMode::Contains => {
-            sql.push_str(" AND (f.name_lower LIKE ? OR LOWER(f.path) LIKE ?)");
-            let pattern = format!("%{query}%");
-            values.push(pattern.clone().into());
-            values.push(pattern.into());
+            // Trigram FTS needs >=3 chars; below that fall back to an indexed
+            // name-prefix scan (path substring matching is not worth a full scan
+            // for 1-2 char queries).
+            if query.chars().count() >= 3 {
+                sql.push_str(" AND f.id IN (SELECT rowid FROM files_fts WHERE files_fts MATCH ?)");
+                values.push(trigram_match(&query).into());
+            } else {
+                sql.push_str(" AND f.name_lower LIKE ?");
+                values.push(format!("%{query}%").into());
+            }
         }
         QueryMode::Exact => {
             sql.push_str(" AND (f.name_lower = ? OR LOWER(f.path) = ?)");
@@ -1333,25 +1486,102 @@ fn apply_sort_sql(sql: &mut String, options: &SearchOptions) {
 }
 
 fn candidate_limit(options: &SearchOptions) -> usize {
+    // Clamped (not just floored): these bound how many rows are pulled and
+    // ranked per search. Hydration now runs after truncation, so the cap mainly
+    // bounds in-memory filter/sort work; keep it generous but finite.
     match options.mode {
+        // Fuzzy/Regex/Glob filter in Rust, so they need a wider candidate pool.
         QueryMode::Fuzzy | QueryMode::Regex | QueryMode::Glob => {
-            options.limit.saturating_mul(100).max(5000)
+            options.limit.saturating_mul(100).clamp(5000, 20000)
         }
-        _ => options.limit.saturating_mul(20).max(200),
+        _ => options.limit.saturating_mul(20).clamp(200, 5000),
     }
 }
 
-pub(crate) fn candidate_matches<'a>(
-    mode: QueryMode,
-    query: &str,
-    candidates: impl IntoIterator<Item = &'a str>,
-) -> Result<bool> {
-    for candidate in candidates {
-        if mode.matches(query, candidate)? {
-            return Ok(true);
+/// Sort with an already-compiled query so Relevance can rank by nucleo score
+/// (Fuzzy) or tier (other modes) and blend in frecency. `frecency` maps a path
+/// to its recency-weighted open count; pass an empty map to disable the boost.
+/// Non-Relevance sort fields are honoured verbatim via [`sort_results`].
+pub(crate) fn sort_results_compiled(
+    results: &mut Vec<SearchResult>,
+    options: &SearchOptions,
+    compiled: &CompiledQuery,
+    scorer: &mut QueryScorer,
+    frecency: &HashMap<String, u32>,
+) {
+    if options.sort != SortField::Relevance {
+        sort_results(results, options);
+        return;
+    }
+
+    let mut scored = std::mem::take(results)
+        .into_iter()
+        .map(|result| {
+            let boost = frecency.get(&result.path).copied().unwrap_or(0);
+            // Fuzzy: blend nucleo score + frecency. Other modes: tier (lower is
+            // better) with frecency lifting ties.
+            let key = if options.mode == QueryMode::Fuzzy {
+                let base = compiled
+                    .fuzzy_rank(scorer, [result.name.as_str(), result.path.as_str()])
+                    .unwrap_or(0);
+                RelevanceKey::Fuzzy(base.saturating_add(boost))
+            } else {
+                RelevanceKey::Tier(
+                    relevance_score(&result, &options.query.to_ascii_lowercase()),
+                    boost,
+                )
+            };
+            (key, result)
+        })
+        .collect::<Vec<_>>();
+
+    scored.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| right.1.modified_at.cmp(&left.1.modified_at))
+            .then_with(|| {
+                left.1
+                    .name
+                    .to_ascii_lowercase()
+                    .cmp(&right.1.name.to_ascii_lowercase())
+            })
+            .then_with(|| left.1.path.cmp(&right.1.path))
+    });
+    *results = scored.into_iter().map(|(_, result)| result).collect();
+    if options.reverse {
+        results.reverse();
+    }
+}
+
+/// Ordering key for relevance sort. `Ord` is defined so that "better" sorts
+/// first (ascending): higher fuzzy score first, lower tier first, then higher
+/// frecency first within a tier.
+#[derive(PartialEq, Eq)]
+enum RelevanceKey {
+    Fuzzy(u32),
+    Tier(u8, u32),
+}
+
+impl Ord for RelevanceKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        match (self, other) {
+            // Higher blended score is better, so reverse the comparison.
+            (Self::Fuzzy(a), Self::Fuzzy(b)) => b.cmp(a),
+            // Lower tier is better; within a tier, higher frecency is better.
+            (Self::Tier(ta, fa), Self::Tier(tb, fb)) => ta.cmp(tb).then_with(|| fb.cmp(fa)),
+            // Mixed modes never compare in practice (a single search is one
+            // mode); define a stable fallback.
+            (Self::Fuzzy(_), Self::Tier(..)) => Ordering::Less,
+            (Self::Tier(..), Self::Fuzzy(_)) => Ordering::Greater,
         }
     }
-    Ok(false)
+}
+
+impl PartialOrd for RelevanceKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 pub(crate) fn sort_results(results: &mut [SearchResult], options: &SearchOptions) {
@@ -1412,6 +1642,76 @@ fn sort_by_key<T: Ord>(
     if reverse {
         results.reverse();
     }
+}
+
+/// Per-stage search timing, emitted to stderr only when `LCTR_TIMING` is set.
+/// Zero overhead (no `Instant::now`) when disabled.
+struct SearchTiming {
+    start: Option<std::time::Instant>,
+    last: std::cell::Cell<Option<std::time::Instant>>,
+}
+
+impl SearchTiming {
+    fn start() -> Self {
+        if std::env::var_os("LCTR_TIMING").is_some() {
+            let now = std::time::Instant::now();
+            Self {
+                start: Some(now),
+                last: std::cell::Cell::new(Some(now)),
+            }
+        } else {
+            Self {
+                start: None,
+                last: std::cell::Cell::new(None),
+            }
+        }
+    }
+
+    fn lap(&self, label: &str) {
+        if let Some(last) = self.last.get() {
+            let now = std::time::Instant::now();
+            eprintln!("[timing] {label:<16} {:>8.2} ms", elapsed_ms(last, now));
+            self.last.set(Some(now));
+        }
+    }
+
+    fn finish(&self, candidates: usize, matched: usize) {
+        if let Some(start) = self.start {
+            let now = std::time::Instant::now();
+            eprintln!(
+                "[timing] {:<16} {:>8.2} ms  (candidates={candidates}, matched={matched})",
+                "TOTAL",
+                elapsed_ms(start, now)
+            );
+        }
+    }
+}
+
+fn elapsed_ms(from: std::time::Instant, to: std::time::Instant) -> f64 {
+    to.duration_since(from).as_secs_f64() * 1000.0
+}
+
+fn frecency_weight(open_count: u32, last_opened_at: Option<i64>, now: i64) -> u32 {
+    if open_count == 0 {
+        return 0;
+    }
+    const DAY: i64 = 86_400;
+    let multiplier = match last_opened_at {
+        Some(ts) => {
+            let age = now - ts;
+            if age < DAY {
+                8
+            } else if age < 7 * DAY {
+                4
+            } else if age < 30 * DAY {
+                2
+            } else {
+                1
+            }
+        }
+        None => 1,
+    };
+    open_count.saturating_mul(multiplier)
 }
 
 fn relevance_score(result: &SearchResult, query: &str) -> u8 {

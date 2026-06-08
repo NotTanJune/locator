@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use jwalk::WalkDir;
 
-use crate::db::{candidate_matches, sort_results, SearchResult};
-use crate::query::{SearchFilters, SearchOptions};
+use crate::db::{sort_results, SearchResult};
+use crate::query::{CompiledQuery, QueryScorer, SearchFilters, SearchOptions};
 use crate::scanner::{is_skip_name, kind_for, system_time_to_utc};
 
 #[derive(Debug, Clone, Copy)]
@@ -82,6 +82,8 @@ pub fn search_live_streaming_with_options(
         .with_context(|| format!("resolve live search root {}", root.as_ref().display()))?;
     let mut results = Vec::with_capacity(options.limit.min(50));
     let mut last_partial = Instant::now();
+    let compiled = CompiledQuery::compile(options.mode, &options.query)?;
+    let mut scorer = QueryScorer::new();
 
     for entry in pruned_walk(&root) {
         if should_cancel() {
@@ -109,11 +111,7 @@ pub fn search_live_streaming_with_options(
         if !matches_filters(&result, &options.filters) {
             continue;
         }
-        if !candidate_matches(
-            options.mode,
-            &options.query,
-            [result.name.as_str(), result.path.as_str()],
-        )? {
+        if !compiled.matches_any(&mut scorer, [result.name.as_str(), result.path.as_str()]) {
             continue;
         }
         results.push(result);

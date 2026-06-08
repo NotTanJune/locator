@@ -73,9 +73,9 @@ fn default_scan_options_prioritize_fast_first_scan() {
     let options = ScanOptions::default();
 
     assert!(!options.estimate_totals);
-    assert_eq!(options.backend, locator::scanner::ScanBackend::Dirent);
+    assert_eq!(options.backend, locator::scanner::ScanBackend::ParallelWalk);
     assert_eq!(options.batch_size, 500_000);
-    assert_eq!(options.writer_queue_batches, 32);
+    assert_eq!(options.writer_queue_batches, 64);
     assert_eq!(options.native_buffer_bytes, 16 * 1024 * 1024);
     assert_eq!(options.native_workers, 8);
     assert_eq!(options.native_output_batch_size, 4096);

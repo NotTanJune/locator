@@ -13,23 +13,30 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Position};
+use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table, TableState};
-use ratatui::Terminal;
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
+use ratatui::{Frame, Terminal};
+use ratatui_image::picker::Picker;
+use ratatui_image::protocol::StatefulProtocol;
+use ratatui_image::StatefulImage;
 
+use crate::config::Config;
 use crate::db::{
-    candidate_matches, existing_index_for_working_dir, sort_results, Database, ScanCompletion,
-    SearchResult,
+    existing_index_for_working_dir, sort_results_compiled, Database, ScanCompletion, SearchResult,
 };
+use crate::live_index::LiveIndex;
 use crate::live_search::{
     search_live_streaming_with_options, search_live_with_options, LiveSearchStatus,
 };
 use crate::open::{copy_path, open_file, reveal_in_finder};
-use crate::query::{QueryMode, SearchFilters, SearchOptions, SortField};
+use crate::preview::{self, Preview};
+use crate::query::{
+    CompiledQuery, QueryMode, QueryScorer, SearchFilters, SearchOptions, SortField,
+};
 
-mod theme;
+pub mod theme;
 
 use theme::Theme;
 
@@ -57,6 +64,17 @@ impl SearchBackend {
             Self::Indexed { root, .. } | Self::Hybrid { root, .. } | Self::Live { root } => {
                 root.display().to_string()
             }
+        }
+    }
+
+    /// `(root, db_path)` for backends backed by a persistent index, so a live
+    /// filesystem watcher can keep that index current. `None` for `Live`.
+    fn watch_target(&self) -> Option<(PathBuf, PathBuf)> {
+        match self {
+            Self::Indexed { db_path, root } | Self::Hybrid { db_path, root } => {
+                Some((root.clone(), db_path.clone()))
+            }
+            Self::Live { .. } => None,
         }
     }
 }
@@ -140,13 +158,27 @@ fn run_loop(
     let mut search_state = SearchState::default();
     let backend_label = search_backend.label();
     let root_label = search_backend.root_label();
-    let mut theme = Theme::load();
+    let config = Config::load();
+    let mut theme = Theme::load_with_default(&config.theme);
     let mut mode = QueryMode::Contains;
     let mut sort = SortField::Relevance;
     let mut reverse = matches!(sort, SortField::Modified);
     let mut filters = SearchFilters::new();
     let mut input_mode = initial_input_mode();
-    let mut watch_enabled = false;
+    let watch_target = search_backend.watch_target();
+    let mut live_index = watch_target
+        .as_ref()
+        .and_then(|(root, db_path)| LiveIndex::spawn(root.clone(), db_path.clone()).ok());
+    let mut watch_enabled = live_index.is_some();
+    let mut live_generation = live_index.as_ref().map_or(0, LiveIndex::generation);
+    let mut picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+    let mut preview_state: Option<PreviewState> = None;
+    let mut preview_target: Option<String> = None;
+    let mut preview_pending_since = Instant::now();
+    let mut show_help = false;
+    // Env var overrides config; config is the persistent default.
+    let icons_enabled = icons_env_override().unwrap_or(config.icons);
+    let preview_enabled = config.preview;
     let mut search_worker = SearchWorker::spawn(search_backend)?;
     let mut loading_query: Option<String> = None;
     let mut last_edit = Instant::now();
@@ -233,10 +265,59 @@ fn run_loop(
             }
         }
 
+        // When the live watcher reports the index changed, re-run the current
+        // query so new/removed files surface without a keystroke.
+        if let Some(live) = live_index.as_ref() {
+            let current = live.generation();
+            if current != live_generation {
+                live_generation = current;
+                let query = input.as_str();
+                if should_show_results(query) {
+                    let options = tui_search_options(query)
+                        .with_mode(mode)
+                        .with_sort(sort)
+                        .with_reverse(reverse)
+                        .with_filters(filters.clone());
+                    if search_worker
+                        .submit(SearchRequest {
+                            options: options.clone(),
+                            live_backfill: false,
+                        })
+                        .is_ok()
+                    {
+                        search_state.mark_submitted(options, false);
+                    }
+                }
+            }
+        }
+
         if update_status.is_none() {
             if let Ok(Some(s)) = update_rx.try_recv() {
                 update_status = Some(s);
             }
+        }
+
+        // Debounced preview: only build once the selection has been still for
+        // PREVIEW_DEBOUNCE. This keeps fast arrow-key scrolling smooth -- images
+        // and PDFs you scroll past are never decoded, only the row you land on.
+        let preview_path = selected
+            .selected()
+            .and_then(|index| results.get(index))
+            .map(|result| result.path.clone());
+        if preview_path != preview_target {
+            preview_target = preview_path.clone();
+            preview_pending_since = Instant::now();
+        }
+        match &preview_target {
+            Some(path) => {
+                let cached = preview_state.as_ref().map(|state| state.path.as_str());
+                if cached != Some(path.as_str())
+                    && preview_pending_since.elapsed() >= PREVIEW_DEBOUNCE
+                {
+                    preview_state = Some(build_preview(&mut picker, path));
+                }
+            }
+            None => preview_state = None,
         }
 
         terminal.draw(|frame| {
@@ -255,7 +336,6 @@ fn run_loop(
                 theme,
                 status: status.as_str(),
             };
-            let controls_height = controls_panel_height(&top_args);
             let show_banner = update_status.is_some();
             let all_chunks = if show_banner {
                 Layout::default()
@@ -264,7 +344,7 @@ fn run_loop(
                         Constraint::Length(1),
                         Constraint::Length(top_chrome_height(&top_args)),
                         Constraint::Min(6),
-                        Constraint::Length(if has_detail { 3 } else { 0 }),
+                        Constraint::Length(if has_detail { 4 } else { 0 }),
                     ])
                     .split(frame.area())
             } else {
@@ -273,7 +353,7 @@ fn run_loop(
                     .constraints([
                         Constraint::Length(top_chrome_height(&top_args)),
                         Constraint::Min(6),
-                        Constraint::Length(if has_detail { 3 } else { 0 }),
+                        Constraint::Length(if has_detail { 4 } else { 0 }),
                     ])
                     .split(frame.area())
             };
@@ -292,18 +372,20 @@ fn run_loop(
                 }
             }
 
+            // Compact chrome: bordered search bar (focal) + one status line +
+            // one controls line. Full key help lives in the `?` overlay.
             let top_chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Length(3),
-                    Constraint::Length(3),
-                    Constraint::Length(controls_height),
+                    Constraint::Length(1),
+                    Constraint::Length(1),
                 ])
                 .split(chunks[0]);
 
-            let status_panel = Paragraph::new(top_status_line(&top_args)).block(
+            let search_panel = Paragraph::new(search_bar_line(&top_args)).block(
                 Block::default()
-                    .title("locator")
+                    .title("lctr search")
                     .title_style(
                         Style::default()
                             .fg(theme.accent)
@@ -313,39 +395,60 @@ fn run_loop(
                     .border_type(BorderType::Rounded)
                     .border_style(Style::default().fg(theme.accent)),
             );
-            frame.render_widget(status_panel, top_chunks[0]);
-
-            let search_panel = Paragraph::new(search_bar_line(&top_args)).block(
-                Block::default()
-                    .title("search")
-                    .title_style(Style::default().fg(theme.accent))
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(theme.accent)),
-            );
-            frame.render_widget(search_panel, top_chunks[1]);
-
-            let controls_panel = Paragraph::new(top_controls_lines(&top_args)).block(
-                Block::default()
-                    .title("controls")
-                    .title_style(Style::default().fg(theme.muted))
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(theme.muted)),
-            );
-            frame.render_widget(controls_panel, top_chunks[2]);
+            frame.render_widget(search_panel, top_chunks[0]);
             if input_mode {
                 frame.set_cursor_position(Position {
-                    x: top_chunks[1].x + 1 + input.cursor_column() as u16,
-                    y: top_chunks[1].y + 1,
+                    x: top_chunks[0].x + 1 + input.cursor_column() as u16,
+                    y: top_chunks[0].y + 1,
                 });
             }
 
+            frame.render_widget(Paragraph::new(top_status_line(&top_args)), top_chunks[1]);
+            frame.render_widget(Paragraph::new(top_controls_line(&top_args)), top_chunks[2]);
+
+            // Split the results region into table + preview when wide enough and
+            // a preview is available; otherwise the table takes the full width.
+            let (results_area, preview_area) = if preview_enabled
+                && preview_state.is_some()
+                && chunks[1].width >= PREVIEW_MIN_WIDTH
+            {
+                let parts = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+                    .split(chunks[1]);
+                (parts[0], Some(parts[1]))
+            } else {
+                (chunks[1], None)
+            };
+
             if search_state.should_render_results(query) {
+                let row_compiled = CompiledQuery::compile(mode, query).ok();
+                let mut row_scorer = QueryScorer::new();
                 let rows = results
                     .iter()
                     .enumerate()
-                    .map(|(index, result)| result_row(index, result, backend_label, mode, &theme))
+                    .map(|(index, result)| match row_compiled.as_ref() {
+                        Some(compiled) => result_row(
+                            index,
+                            result,
+                            backend_label,
+                            mode,
+                            &theme,
+                            compiled,
+                            &mut row_scorer,
+                            icons_enabled,
+                        ),
+                        None => result_row(
+                            index,
+                            result,
+                            backend_label,
+                            mode,
+                            &theme,
+                            &CompiledQuery::Empty,
+                            &mut row_scorer,
+                            icons_enabled,
+                        ),
+                    })
                     .collect::<Vec<_>>();
                 let table = Table::new(
                     rows,
@@ -388,7 +491,7 @@ fn run_loop(
                 )
                 .row_highlight_style(Style::default().bg(theme.selected_bg))
                 .highlight_symbol(">");
-                frame.render_stateful_widget(table, chunks[1], &mut selected);
+                frame.render_stateful_widget(table, results_area, &mut selected);
             } else if !query.is_empty() {
                 let hint = Paragraph::new(if should_show_results(query) {
                     match backend_label {
@@ -410,12 +513,19 @@ fn run_loop(
                         .border_type(BorderType::Rounded)
                         .border_style(Style::default().fg(theme.muted)),
                 );
-                frame.render_widget(hint, chunks[1]);
+                frame.render_widget(hint, results_area);
+            }
+
+            if let Some(area) = preview_area {
+                if let Some(state) = preview_state.as_mut() {
+                    render_preview(frame, area, state, &theme);
+                }
             }
 
             if has_detail {
-                let detail = Paragraph::new(selected_detail(&selected, &results))
+                let detail = Paragraph::new(selected_detail(&selected, &results, &theme))
                     .style(Style::default().fg(theme.muted))
+                    .wrap(Wrap { trim: false })
                     .block(
                         Block::default()
                             .borders(Borders::TOP)
@@ -423,11 +533,20 @@ fn run_loop(
                     );
                 frame.render_widget(detail, chunks[2]);
             }
+
+            if show_help {
+                render_help_overlay(frame, &theme);
+            }
         })?;
 
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
                 if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                // The help overlay is modal: any key dismisses it.
+                if show_help {
+                    show_help = false;
                     continue;
                 }
                 match key.code {
@@ -454,120 +573,136 @@ fn run_loop(
                         normalize_selection(&mut selected, results.len());
                         status = edit_status(backend_label);
                     }
-                    KeyCode::Char(ch) => {
-                        match ch {
-                            'r' if !input_mode || key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                if let Some(path) = selected_path(&selected, &results) {
-                                    reveal_in_finder(Path::new(path))?;
-                                    status = format!("revealed {path}");
-                                }
+                    KeyCode::Char(ch) => match ch {
+                        'r' if !input_mode || key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            if let Some(path) = selected_path(&selected, &results) {
+                                reveal_in_finder(Path::new(path))?;
+                                record_access_if_indexed(&watch_target, path);
+                                status = format!("revealed {path}");
                             }
-                            'y' if !input_mode || key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                if let Some(path) = selected_path(&selected, &results) {
-                                    copy_path(Path::new(path))?;
-                                    status = format!("copied {path}");
-                                }
-                            }
-                            'o' if !input_mode => {
-                                if let Some(path) = selected_path(&selected, &results) {
-                                    open_file(Path::new(path))?;
-                                    status = format!("opened {path}");
-                                }
-                            }
-                            'j' if !input_mode => move_selection(&mut selected, results.len(), 1),
-                            'k' if !input_mode => move_selection(&mut selected, results.len(), -1),
-                            'g' if !input_mode => select_first(&mut selected, results.len()),
-                            'G' if !input_mode => select_last(&mut selected, results.len()),
-                            'm' if !input_mode => {
-                                mode = mode.next();
-                                results = apply_local_result_options(
-                                    &all_results,
-                                    &tui_search_options(input.as_str())
-                                        .with_mode(mode)
-                                        .with_sort(sort)
-                                        .with_reverse(reverse)
-                                        .with_filters(filters.clone()),
-                                );
-                                normalize_selection(&mut selected, results.len());
-                                search_state.mark_dirty();
-                                last_edit = Instant::now();
-                                status = format!("mode: {}", mode.label());
-                            }
-                            'f' if !input_mode => {
-                                filters = cycle_kind_filter(filters);
-                                results = apply_local_result_options(
-                                    &all_results,
-                                    &tui_search_options(input.as_str())
-                                        .with_mode(mode)
-                                        .with_sort(sort)
-                                        .with_reverse(reverse)
-                                        .with_filters(filters.clone()),
-                                );
-                                normalize_selection(&mut selected, results.len());
-                                search_state.mark_dirty();
-                                last_edit = Instant::now();
-                                status = "type filter changed".to_string();
-                            }
-                            's' if !input_mode => {
-                                sort = sort.next();
-                                results = apply_local_result_options(
-                                    &all_results,
-                                    &tui_search_options(input.as_str())
-                                        .with_mode(mode)
-                                        .with_sort(sort)
-                                        .with_reverse(reverse)
-                                        .with_filters(filters.clone()),
-                                );
-                                normalize_selection(&mut selected, results.len());
-                                status = format!("sort: {}", sort.label());
-                            }
-                            'S' if !input_mode => {
-                                reverse = toggle_sort_order(reverse);
-                                results = apply_local_result_options(
-                                    &all_results,
-                                    &tui_search_options(input.as_str())
-                                        .with_mode(mode)
-                                        .with_sort(sort)
-                                        .with_reverse(reverse)
-                                        .with_filters(filters.clone()),
-                                );
-                                normalize_selection(&mut selected, results.len());
-                                status = format!("sort order: {}", sort_label(sort, reverse));
-                            }
-                            't' if !input_mode => {
-                                theme = theme.cycle();
-                                if let Err(error) = theme.persist() {
-                                    status = error.to_string();
-                                } else {
-                                    status = format!("theme: {}", theme.name.label());
-                                }
-                            }
-                            'w' if !input_mode => {
-                                watch_enabled = !watch_enabled;
-                                status = if watch_enabled {
-                                    "watch visible: refresh indicators enabled".to_string()
-                                } else {
-                                    "watch off".to_string()
-                                };
-                            }
-                            '?' if !input_mode => {
-                                status = "/ search, Enter confirm or open, m mode, f type, s sort, t theme".to_string();
-                            }
-                            _ if input_mode => {
-                                input.insert(ch);
-                                search_state.mark_dirty();
-                                last_edit = Instant::now();
-                                indexed_input_exit_deadline = None;
-                                if backend_label == "live" {
-                                    all_results.clear();
-                                    results.clear();
-                                }
-                                normalize_selection(&mut selected, results.len());
-                                status = edit_status(backend_label);
-                            }
-                            _ => {}
                         }
-                    }
+                        'y' if !input_mode || key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            if let Some(path) = selected_path(&selected, &results) {
+                                copy_path(Path::new(path))?;
+                                record_access_if_indexed(&watch_target, path);
+                                status = format!("copied {path}");
+                            }
+                        }
+                        'o' if !input_mode => {
+                            if let Some(path) = selected_path(&selected, &results) {
+                                open_file(Path::new(path))?;
+                                record_access_if_indexed(&watch_target, path);
+                                status = format!("opened {path}");
+                            }
+                        }
+                        'j' if !input_mode => move_selection(&mut selected, results.len(), 1),
+                        'k' if !input_mode => move_selection(&mut selected, results.len(), -1),
+                        'g' if !input_mode => select_first(&mut selected, results.len()),
+                        'G' if !input_mode => select_last(&mut selected, results.len()),
+                        'm' if !input_mode => {
+                            mode = mode.next();
+                            results = apply_local_result_options(
+                                &all_results,
+                                &tui_search_options(input.as_str())
+                                    .with_mode(mode)
+                                    .with_sort(sort)
+                                    .with_reverse(reverse)
+                                    .with_filters(filters.clone()),
+                            );
+                            normalize_selection(&mut selected, results.len());
+                            search_state.mark_dirty();
+                            last_edit = Instant::now();
+                            status = format!("mode: {}", mode.label());
+                        }
+                        'f' if !input_mode => {
+                            filters = cycle_kind_filter(filters);
+                            results = apply_local_result_options(
+                                &all_results,
+                                &tui_search_options(input.as_str())
+                                    .with_mode(mode)
+                                    .with_sort(sort)
+                                    .with_reverse(reverse)
+                                    .with_filters(filters.clone()),
+                            );
+                            normalize_selection(&mut selected, results.len());
+                            search_state.mark_dirty();
+                            last_edit = Instant::now();
+                            status = "type filter changed".to_string();
+                        }
+                        's' if !input_mode => {
+                            sort = sort.next();
+                            results = apply_local_result_options(
+                                &all_results,
+                                &tui_search_options(input.as_str())
+                                    .with_mode(mode)
+                                    .with_sort(sort)
+                                    .with_reverse(reverse)
+                                    .with_filters(filters.clone()),
+                            );
+                            normalize_selection(&mut selected, results.len());
+                            status = format!("sort: {}", sort.label());
+                        }
+                        'S' if !input_mode => {
+                            reverse = toggle_sort_order(reverse);
+                            results = apply_local_result_options(
+                                &all_results,
+                                &tui_search_options(input.as_str())
+                                    .with_mode(mode)
+                                    .with_sort(sort)
+                                    .with_reverse(reverse)
+                                    .with_filters(filters.clone()),
+                            );
+                            normalize_selection(&mut selected, results.len());
+                            status = format!("sort order: {}", sort_label(sort, reverse));
+                        }
+                        't' if !input_mode => {
+                            theme = theme.cycle();
+                            if let Err(error) = theme.persist() {
+                                status = error.to_string();
+                            } else {
+                                status = format!("theme: {}", theme.name.label());
+                            }
+                        }
+                        'w' if !input_mode => {
+                            if live_index.is_some() {
+                                live_index = None;
+                                watch_enabled = false;
+                                status = "live watch off".to_string();
+                            } else if let Some((root, db_path)) = watch_target.as_ref() {
+                                match LiveIndex::spawn(root.clone(), db_path.clone()).ok() {
+                                    Some(live) => {
+                                        live_generation = live.generation();
+                                        live_index = Some(live);
+                                        watch_enabled = true;
+                                        status = "live watch on: index updates as files change"
+                                            .to_string();
+                                    }
+                                    None => {
+                                        status =
+                                            "live watch unavailable for this index".to_string();
+                                    }
+                                }
+                            } else {
+                                status = "live watch not available in live search mode".to_string();
+                            }
+                        }
+                        '?' if !input_mode => {
+                            show_help = true;
+                        }
+                        _ if input_mode => {
+                            input.insert(ch);
+                            search_state.mark_dirty();
+                            last_edit = Instant::now();
+                            indexed_input_exit_deadline = None;
+                            if backend_label == "live" {
+                                all_results.clear();
+                                results.clear();
+                            }
+                            normalize_selection(&mut selected, results.len());
+                            status = edit_status(backend_label);
+                        }
+                        _ => {}
+                    },
                     KeyCode::Left if input_mode => input.move_left(),
                     KeyCode::Right if input_mode => input.move_right(),
                     KeyCode::Down => move_selection(&mut selected, results.len(), 1),
@@ -618,6 +753,7 @@ fn run_loop(
                             EnterAction::OpenSelection => {
                                 if let Some(path) = selected_path(&selected, &results) {
                                     open_file(Path::new(path))?;
+                                    record_access_if_indexed(&watch_target, path);
                                     status = format!("opened {path}");
                                 }
                             }
@@ -1012,23 +1148,277 @@ impl SearchState {
     }
 }
 
+/// Minimum results-area width before the preview pane is shown; below this the
+/// table takes the full width (responsive layout).
+const PREVIEW_MIN_WIDTH: u16 = 100;
+/// Cap on lines read into a text/PDF preview.
+const PREVIEW_MAX_LINES: usize = 300;
+/// How long the selection must hold still before its preview is built, so fast
+/// scrolling doesn't decode every file (esp. images) it passes over.
+const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(120);
+
+enum PreviewRender {
+    Lines(Vec<Line<'static>>),
+    Image(Box<StatefulProtocol>),
+}
+
+/// Cached preview for the currently-selected path, so decode/highlight runs only
+/// when the selection changes rather than every render tick.
+struct PreviewState {
+    path: String,
+    meta: Vec<Line<'static>>,
+    render: PreviewRender,
+}
+
+fn build_preview(picker: &mut Picker, path: &str) -> PreviewState {
+    match preview::preview_for(Path::new(path), PREVIEW_MAX_LINES) {
+        Preview::Text(lines) | Preview::Info(lines) => PreviewState {
+            path: path.to_string(),
+            meta: Vec::new(),
+            render: PreviewRender::Lines(lines),
+        },
+        Preview::Image { image, meta } => {
+            let protocol = picker.new_resize_protocol(*image);
+            PreviewState {
+                path: path.to_string(),
+                meta,
+                render: PreviewRender::Image(Box::new(protocol)),
+            }
+        }
+    }
+}
+
+fn render_preview(frame: &mut Frame, area: Rect, state: &mut PreviewState, theme: &Theme) {
+    let block = Block::default()
+        .title("preview")
+        .title_style(Style::default().fg(theme.accent))
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.muted));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    match &mut state.render {
+        PreviewRender::Lines(lines) => {
+            let paragraph = Paragraph::new(lines.clone()).style(Style::default().fg(theme.text));
+            frame.render_widget(paragraph, inner);
+        }
+        PreviewRender::Image(protocol) => {
+            let image_area = if !state.meta.is_empty() && inner.height > 2 {
+                let meta_area = Rect { height: 1, ..inner };
+                frame.render_widget(
+                    Paragraph::new(state.meta.clone()).style(Style::default().fg(theme.muted)),
+                    meta_area,
+                );
+                Rect {
+                    y: inner.y + 1,
+                    height: inner.height - 1,
+                    ..inner
+                }
+            } else {
+                inner
+            };
+            frame.render_stateful_widget(StatefulImage::new(), image_area, protocol.as_mut());
+        }
+    }
+}
+
+/// Centered rectangle covering `percent_x` × `percent_y` of `area`, for modals.
+fn popup_area(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1])[1]
+}
+
+fn render_help_overlay(frame: &mut Frame, theme: &Theme) {
+    let area = popup_area(frame.area(), 60, 70);
+    frame.render_widget(ratatui::widgets::Clear, area);
+
+    let heading = |text: &'static str| {
+        Line::from(Span::styled(
+            text,
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ))
+    };
+    let entry = |keys: &'static str, desc: &'static str| {
+        Line::from(vec![
+            Span::styled(format!("  {keys:<14}"), Style::default().fg(theme.ok)),
+            Span::styled(desc.to_string(), Style::default().fg(theme.text)),
+        ])
+    };
+
+    let lines = vec![
+        heading("Navigation"),
+        entry("/", "enter search input"),
+        entry("Esc", "leave input / quit"),
+        entry("j / k, ↑ / ↓", "move selection"),
+        entry("g / G", "first / last result"),
+        entry("PgUp / PgDn", "page up / down"),
+        entry("Enter", "confirm search or open"),
+        Line::from(""),
+        heading("File actions"),
+        entry("o", "open file"),
+        entry("r", "reveal in Finder"),
+        entry("y", "copy path"),
+        Line::from(""),
+        heading("Filters & sort"),
+        entry("m", "cycle match mode"),
+        entry("f", "cycle type filter"),
+        entry("s / S", "sort field / direction"),
+        Line::from(""),
+        heading("View"),
+        entry("t", "cycle theme"),
+        entry("w", "toggle live watch"),
+        entry("?", "toggle this help"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "  press any key to close",
+            Style::default().fg(theme.muted),
+        )),
+    ];
+
+    let help = Paragraph::new(lines).block(
+        Block::default()
+            .title("help")
+            .title_style(
+                Style::default()
+                    .fg(theme.accent)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(theme.accent)),
+    );
+    frame.render_widget(help, area);
+}
+
+/// `LCTR_ICONS` override for Nerd Font icons: `Some(true/false)` when set,
+/// `None` when unset (so config provides the default).
+fn icons_env_override() -> Option<bool> {
+    std::env::var("LCTR_ICONS")
+        .ok()
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+}
+
+/// Nerd Font glyph for a file kind / extension. Returns an empty string when the
+/// kind is unknown so callers can prepend unconditionally.
+fn icon_for(kind: &str, extension: Option<&str>) -> &'static str {
+    match kind {
+        "folder" => "\u{f07b}",
+        "pdf" => "\u{f1c1}",
+        "image" => "\u{f1c5}",
+        "video" => "\u{f1c8}",
+        "audio" => "\u{f1c7}",
+        "archive" => "\u{f1c6}",
+        "text" => match extension {
+            Some("rs") => "\u{e7a8}",
+            Some("py") => "\u{e606}",
+            Some("js" | "ts" | "jsx" | "tsx") => "\u{e74e}",
+            Some("md") => "\u{f48a}",
+            Some("json" | "toml" | "yaml" | "yml") => "\u{e60b}",
+            _ => "\u{f15c}",
+        },
+        _ => "\u{f15b}",
+    }
+}
+
+/// Record a frecency access against the backing index, if one exists. Opening
+/// the DB per action is cheap and these actions are rare. Errors are ignored:
+/// frecency is a best-effort ranking hint, never a hard dependency.
+fn record_access_if_indexed(watch_target: &Option<(PathBuf, PathBuf)>, path: &str) {
+    if let Some((_, db_path)) = watch_target {
+        if let Ok(db) = Database::open(db_path) {
+            let _ = db.record_access(path);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn result_row<'a>(
     index: usize,
     result: &'a SearchResult,
     source: &'static str,
     mode: QueryMode,
     theme: &Theme,
+    compiled: &CompiledQuery,
+    scorer: &mut QueryScorer,
+    icons: bool,
 ) -> Row<'a> {
+    let base_name = Style::default().fg(theme.text);
+    let base_path = Style::default().fg(theme.muted);
+    let matched = Style::default()
+        .fg(theme.accent)
+        .add_modifier(Modifier::BOLD);
+    let name_positions = compiled.match_positions(scorer, &result.name);
+    let path_positions = compiled.match_positions(scorer, &result.path);
+    let mut name_line = highlight_line(&result.name, &name_positions, base_name, matched);
+    if icons {
+        let icon = icon_for(&result.kind, result.extension.as_deref());
+        name_line.spans.insert(
+            0,
+            Span::styled(format!("{icon} "), Style::default().fg(theme.accent)),
+        );
+    }
     Row::new([
         Cell::from(if index == 0 { "*" } else { "" }),
-        Cell::from(result.name.clone()).style(Style::default().fg(theme.text)),
+        Cell::from(name_line),
         Cell::from(result.kind.clone()).style(Style::default().fg(theme.accent)),
         Cell::from(format_size(result.size_bytes)).style(Style::default().fg(theme.warn)),
         Cell::from(format_date(result.modified_at)).style(Style::default().fg(theme.ok)),
         Cell::from(source).style(Style::default().fg(source_color(source, theme))),
         Cell::from(mode.label()).style(Style::default().fg(theme.muted)),
-        Cell::from(result.path.clone()).style(Style::default().fg(theme.muted)),
+        Cell::from(highlight_line(
+            &result.path,
+            &path_positions,
+            base_path,
+            matched,
+        )),
     ])
+}
+
+/// Build a line where the char positions in `positions` (sorted ascending) use
+/// `matched` styling and the rest use `base`, coalescing adjacent runs.
+fn highlight_line(text: &str, positions: &[usize], base: Style, matched: Style) -> Line<'static> {
+    if positions.is_empty() {
+        return Line::from(Span::styled(text.to_string(), base));
+    }
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut buf = String::new();
+    let mut buf_matched = false;
+    for (i, ch) in text.chars().enumerate() {
+        let is_matched = positions.binary_search(&i).is_ok();
+        if buf.is_empty() {
+            buf_matched = is_matched;
+        } else if is_matched != buf_matched {
+            let style = if buf_matched { matched } else { base };
+            spans.push(Span::styled(std::mem::take(&mut buf), style));
+            buf_matched = is_matched;
+        }
+        buf.push(ch);
+    }
+    if !buf.is_empty() {
+        let style = if buf_matched { matched } else { base };
+        spans.push(Span::styled(buf, style));
+    }
+    Line::from(spans)
 }
 
 struct TopPanelArgs<'a> {
@@ -1097,68 +1487,41 @@ fn search_bar_line(args: &TopPanelArgs<'_>) -> Line<'static> {
     }
 }
 
-fn top_controls_lines(args: &TopPanelArgs<'_>) -> Vec<Line<'static>> {
-    vec![
-        Line::from(vec![
-            Span::styled("nav ", Style::default().fg(args.theme.muted)),
-            control_segment("/", "search", &args.theme),
+/// One compact status line of the live mode/sort/filter/theme state, plus a
+/// pointer to the `?` overlay for the full key reference.
+fn top_controls_line(args: &TopPanelArgs<'_>) -> Line<'static> {
+    let field = |label: &str, value: String| -> Vec<Span<'static>> {
+        vec![
+            Span::styled(format!("{label}:"), Style::default().fg(args.theme.muted)),
+            Span::styled(value, Style::default().fg(args.theme.accent)),
             Span::raw("  "),
-            control_segment("Esc", "normal", &args.theme),
-            Span::raw("  "),
-            control_segment("j/k", "move", &args.theme),
-            Span::raw("  "),
-            control_segment("Enter", "confirm/open", &args.theme),
-        ]),
-        Line::from(vec![
-            Span::styled("file ", Style::default().fg(args.theme.muted)),
-            control_segment("o", "open", &args.theme),
-            Span::raw("  "),
-            control_segment("r", "reveal", &args.theme),
-            Span::raw("  "),
-            control_segment("y", "copy", &args.theme),
-        ]),
-        Line::from(vec![
-            Span::styled("filters ", Style::default().fg(args.theme.muted)),
-            control_segment("m", args.mode.label(), &args.theme),
-            Span::raw("  "),
-            control_segment("f", &filter_label(args.filters), &args.theme),
-            Span::raw("  "),
-            Span::styled(
-                format!(
-                    "ext:{} size:{} date:{}",
-                    ext_filter_label(args.filters),
-                    size_filter_label(args.filters),
-                    date_filter_label(args.filters)
-                ),
-                Style::default().fg(args.theme.muted),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("sort ", Style::default().fg(args.theme.muted)),
-            control_segment("s", &sort_label(args.sort, args.reverse), &args.theme),
-            Span::raw("  "),
-            control_segment("S", sort_order_label(args.reverse), &args.theme),
-            Span::raw("  "),
-            control_segment("t", args.theme.name.label(), &args.theme),
-            Span::raw("  "),
-            control_segment("?", "help", &args.theme),
-        ]),
-    ]
+        ]
+    };
+    let mut spans = Vec::new();
+    spans.extend(field("mode", args.mode.label().to_string()));
+    spans.extend(field("sort", sort_label(args.sort, args.reverse)));
+    spans.extend(field("type", filter_label(args.filters)));
+    spans.push(Span::styled(
+        format!(
+            "ext:{} size:{} date:{}",
+            ext_filter_label(args.filters),
+            size_filter_label(args.filters),
+            date_filter_label(args.filters)
+        ),
+        Style::default().fg(args.theme.muted),
+    ));
+    spans.push(Span::raw("  "));
+    spans.extend(field("theme", args.theme.name.label().to_string()));
+    spans.push(Span::styled(
+        "?:help",
+        Style::default().fg(args.theme.muted),
+    ));
+    Line::from(spans)
 }
 
-fn controls_panel_height(args: &TopPanelArgs<'_>) -> u16 {
-    top_controls_lines(args).len() as u16 + 2
-}
-
-fn top_chrome_height(args: &TopPanelArgs<'_>) -> u16 {
-    3 + 3 + controls_panel_height(args)
-}
-
-fn control_segment(key: &str, label: &str, theme: &Theme) -> Span<'static> {
-    Span::styled(
-        format!("[{key} {label}]"),
-        Style::default().fg(theme.accent),
-    )
+fn top_chrome_height(_args: &TopPanelArgs<'_>) -> u16 {
+    // bordered search bar (3) + status line (1) + controls line (1)
+    5
 }
 
 fn toggle_sort_order(reverse: bool) -> bool {
@@ -1275,41 +1638,54 @@ fn selected_path<'a>(
         .map(|result| result.path.as_str())
 }
 
-fn selected_detail(state: &TableState, results: &[SearchResult]) -> String {
-    state
-        .selected()
-        .and_then(|index| results.get(index))
-        .map(|result| {
-            format!(
-                "{}  created {}  modified {}  {} bytes  {}",
+fn selected_detail(state: &TableState, results: &[SearchResult], theme: &Theme) -> Text<'static> {
+    match state.selected().and_then(|index| results.get(index)) {
+        Some(result) => {
+            let meta = Line::from(format!(
+                "{}  created {}  modified {}  {} bytes",
                 result.kind,
                 format_date(result.created_at),
                 format_date(result.modified_at),
                 result.size_bytes,
-                result.path
-            )
-        })
-        .unwrap_or_else(|| "No selection".to_string())
+            ));
+            // Path on its own line so the wrapping Paragraph can show all of it
+            // even when the list is narrowed by the preview pane.
+            let path = Line::from(vec![
+                Span::styled("path ", Style::default().fg(theme.muted)),
+                Span::styled(result.path.clone(), Style::default().fg(theme.text)),
+            ]);
+            Text::from(vec![meta, path])
+        }
+        None => Text::from("No selection"),
+    }
 }
 
 fn apply_local_result_options(
     results: &[SearchResult],
     options: &SearchOptions,
 ) -> Vec<SearchResult> {
+    let Ok(compiled) = CompiledQuery::compile(options.mode, &options.query) else {
+        return Vec::new();
+    };
+    let mut scorer = QueryScorer::new();
     let mut visible = results
         .iter()
         .filter(|result| local_filter_matches(result, &options.filters))
         .filter(|result| {
-            candidate_matches(
-                options.mode,
-                &options.query,
-                [result.name.as_str(), result.path.as_str()],
-            )
-            .unwrap_or(false)
+            compiled.matches_any(&mut scorer, [result.name.as_str(), result.path.as_str()])
         })
         .cloned()
         .collect::<Vec<_>>();
-    sort_results(&mut visible, options);
+    // Frecency ordering is applied by the indexed search itself; the local
+    // re-sort here only reacts to UI-only filter/sort toggles on already-ranked
+    // results, so it passes an empty boost map.
+    sort_results_compiled(
+        &mut visible,
+        options,
+        &compiled,
+        &mut scorer,
+        &std::collections::HashMap::new(),
+    );
     visible.truncate(options.limit);
     visible
 }
@@ -1405,10 +1781,10 @@ mod tests {
     use crate::query::{FileKind, SearchFilters, SearchOptions, SortField};
     use crate::tui::theme::Theme;
     use crate::tui::{
-        apply_local_result_options, controls_panel_height, enter_action, format_result_summary,
+        apply_local_result_options, enter_action, format_result_summary,
         indexed_response_exit_deadline, initial_input_mode, input_mode_after_indexed_grace,
         input_mode_after_submit, search_backend_for_directory, search_bar_line, search_hybrid,
-        should_show_results, sort_label, toggle_sort_order, top_chrome_height, top_controls_lines,
+        should_show_results, sort_label, toggle_sort_order, top_chrome_height, top_controls_line,
         top_status_line, tui_search_options, EnterAction, SearchBackend, SearchInput,
         SearchRequest, SearchState, SearchWorker, TopPanelArgs, INDEXED_INPUT_GRACE,
         TUI_RESULT_LIMIT,
@@ -1481,26 +1857,20 @@ mod tests {
         };
         let status = line_text(&top_status_line(&args));
         let search = line_text(&search_bar_line(&args));
-        let controls = top_controls_lines(&args)
-            .iter()
-            .map(line_text)
-            .collect::<Vec<_>>()
-            .join("\n");
+        let controls = line_text(&top_controls_line(&args));
 
         assert!(status.contains("root /tmp"));
         assert!(status.contains("ready"));
         assert_eq!(search, "archive");
-        assert!(!search.contains("[/ search]"));
-        assert!(!search.contains("[m contains]"));
-        assert!(controls.contains("[/ search]"));
-        assert!(controls.contains("file [o open]"));
-        assert!(controls.contains("filters [m contains]"));
-        assert!(controls.contains("sort [s relevance asc]"));
-        assert!(controls.contains("[S asc]"));
+        assert!(!search.contains("mode:contains"));
+        assert!(controls.contains("mode:contains"));
+        assert!(controls.contains("sort:relevance asc"));
+        assert!(controls.contains("type:"));
+        assert!(controls.contains("?:help"));
     }
 
     #[test]
-    fn controls_panel_height_fits_all_control_rows() {
+    fn top_chrome_is_compact_fixed_height() {
         let theme = Theme::from_name(crate::tui::theme::ThemeName::Default);
         let args = TopPanelArgs {
             query: "archive",
@@ -1516,14 +1886,8 @@ mod tests {
             status: "ready",
         };
 
-        assert_eq!(
-            controls_panel_height(&args),
-            top_controls_lines(&args).len() as u16 + 2
-        );
-        assert_eq!(
-            top_chrome_height(&args),
-            3 + 3 + controls_panel_height(&args)
-        );
+        // bordered search bar (3) + status line (1) + controls line (1)
+        assert_eq!(top_chrome_height(&args), 5);
     }
 
     #[test]

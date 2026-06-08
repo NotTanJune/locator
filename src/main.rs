@@ -35,11 +35,14 @@ enum Commands {
     Scan {
         #[arg(default_value_os_t = current_dir())]
         root: PathBuf,
-        #[arg(long, value_enum, default_value_t = ScanBackend::Dirent)]
-        backend: ScanBackend,
+        // ParallelWalk benchmarks fastest on large trees (jwalk's parallel
+        // walker); Native/Dirent are available via --backend for comparison.
+        // Unset: use the configured default (`lctr config set backend ...`).
+        #[arg(long, value_enum)]
+        backend: Option<ScanBackend>,
         #[arg(long, default_value_t = 500_000)]
         batch_size: usize,
-        #[arg(long, default_value_t = 32)]
+        #[arg(long, default_value_t = 64)]
         writer_queue_batches: usize,
         #[arg(long, default_value_t = 16)]
         native_buffer_mb: usize,
@@ -96,6 +99,25 @@ enum Commands {
         root: PathBuf,
     },
     Vacuum,
+    /// View or change persistent settings (icons, theme, backend, preview)
+    Config {
+        #[command(subcommand)]
+        action: Option<ConfigCommand>,
+    },
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum ConfigCommand {
+    /// Print all settings as plain text (for scripts)
+    List,
+    /// Print a single setting's value
+    Get { key: String },
+    /// Change a setting and save it
+    Set { key: String, value: String },
+    /// Print the config file path
+    Path,
+    /// Reset all settings to defaults
+    Reset,
 }
 
 #[derive(Debug, Args)]
@@ -176,7 +198,7 @@ fn main() -> Result<()> {
             let show_eta = eta && !no_eta;
             let live_color = io::stderr().is_terminal();
             let options = ScanOptions {
-                backend,
+                backend: backend.unwrap_or_else(config_default_backend),
                 batch_size,
                 writer_queue_batches,
                 native_buffer_bytes: native_buffer_mb.saturating_mul(1024 * 1024),
@@ -302,8 +324,53 @@ fn main() -> Result<()> {
             db.vacuum()?;
             println!("vacuum complete");
         }
+        Commands::Config { action } => handle_config(action)?,
     }
 
+    Ok(())
+}
+
+fn config_default_backend() -> ScanBackend {
+    match locator::config::Config::load().backend.as_str() {
+        "native" => ScanBackend::Native,
+        "dirent" => ScanBackend::Dirent,
+        "auto" => ScanBackend::Auto,
+        _ => ScanBackend::ParallelWalk,
+    }
+}
+
+fn handle_config(action: Option<ConfigCommand>) -> Result<()> {
+    use locator::config::Config;
+    match action {
+        None => {
+            // No subcommand: open the interactive settings editor.
+            locator::config_ui::run()?;
+        }
+        Some(ConfigCommand::List) => {
+            let config = Config::load();
+            println!("# {}", Config::path()?.display());
+            for (key, value) in config.entries() {
+                println!("{key} = {value}");
+            }
+        }
+        Some(ConfigCommand::Get { key }) => {
+            println!("{}", Config::load().get(&key)?);
+        }
+        Some(ConfigCommand::Set { key, value }) => {
+            let mut config = Config::load();
+            config.set(&key, &value)?;
+            config.save()?;
+            println!("set {key} = {}", config.get(&key)?);
+        }
+        Some(ConfigCommand::Path) => {
+            println!("{}", Config::path()?.display());
+        }
+        Some(ConfigCommand::Reset) => {
+            let config = Config::default();
+            config.save()?;
+            println!("config reset to defaults");
+        }
+    }
     Ok(())
 }
 
