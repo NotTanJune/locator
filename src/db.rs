@@ -1251,8 +1251,6 @@ fn should_fallback_to_app_support(error: &anyhow::Error) -> bool {
     })
 }
 
-/// Quote a string as a single FTS5 trigram substring token (internal double
-/// quotes doubled). Matches the substring anywhere in an indexed column.
 /// Build an FTS5 MATCH expression for a substring query against a
 /// detail=none trigram table. Phrase queries are not allowed under
 /// detail=none, so emit every 3-char window as its own single-token term,

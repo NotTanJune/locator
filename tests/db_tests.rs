@@ -841,6 +841,23 @@ fn fts_upgrades_from_detail_full_on_open() {
     // Reopen via Database::open -- should detect missing detail=none and rebuild.
     let db = Database::open(&db_path).expect("db reopens");
 
+    // Prove the rebuild actually fired: the recreated table's schema must
+    // carry detail=none (the old shape we planted above did not).
+    {
+        let conn = rusqlite::Connection::open(&db_path).expect("raw conn for schema check");
+        let create_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='files_fts'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("files_fts schema");
+        assert!(
+            create_sql.contains("detail=none"),
+            "files_fts was not rebuilt to detail=none; schema: {create_sql}"
+        );
+    }
+
     let results = db
         .search_with_options(&SearchOptions::new("hello").with_mode(QueryMode::Contains))
         .expect("search after upgrade");
