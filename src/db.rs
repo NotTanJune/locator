@@ -425,6 +425,7 @@ impl Database {
         // Trigram needs >=3-char tokens. For shorter non-empty queries fall back
         // to a name substring LIKE so single/double-char searches still work.
         let short_like = fts_query.is_none() && !trimmed.is_empty();
+        let used_fts = fts_query.is_some();
         if fts_query.is_some() {
             sql.push_str(" JOIN files_fts ON files_fts.rowid = f.id");
         }
@@ -489,10 +490,29 @@ impl Database {
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(rusqlite::params_from_iter(values), search_result_from_row)?;
 
-        let mut results = self.hydrate_search_results(
-            rows.collect::<rusqlite::Result<Vec<_>>>()
-                .context("collect search results")?,
-        )?;
+        let mut rows: Vec<_> = rows
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("collect search results")?;
+
+        // Under detail=none the trigram AND query can produce false positives
+        // (all trigrams present but non-contiguous). Post-filter to retain only
+        // rows where every alphanumeric run from the query appears as a substring.
+        if used_fts {
+            let needle = trimmed.to_lowercase();
+            let runs: Vec<String> = needle
+                .split(|ch: char| !ch.is_alphanumeric())
+                .filter(|t| t.chars().count() >= 3)
+                .map(str::to_string)
+                .collect();
+            rows.retain(|r| {
+                let name = r.name.to_lowercase();
+                let path = r.path.to_lowercase();
+                runs.iter()
+                    .all(|run| name.contains(run) || path.contains(run))
+            });
+        }
+
+        let mut results = self.hydrate_search_results(rows)?;
         results.truncate(limit);
         Ok(results)
     }
@@ -890,6 +910,7 @@ impl Database {
             .map(|sql| {
                 !sql.contains("content='files'")
                     || !sql.contains("tokenize='trigram'")
+                    || !sql.contains("detail=none")
                     || fts_sql_has_path(sql) != want_paths
             })
             .unwrap_or(true);
@@ -899,7 +920,8 @@ impl Database {
             self.conn.execute_batch(&format!(
                 "DROP TABLE IF EXISTS files_fts;
                  CREATE VIRTUAL TABLE files_fts
-                 USING fts5({columns}, content='files', content_rowid='id', tokenize='trigram');
+                 USING fts5({columns}, content='files', content_rowid='id',
+                            tokenize='trigram', detail=none, columnsize=0);
                  INSERT INTO files_fts(rowid, {columns})
                  SELECT id, {columns} FROM files WHERE deleted = 0;",
             ))?;
@@ -1231,8 +1253,21 @@ fn should_fallback_to_app_support(error: &anyhow::Error) -> bool {
 
 /// Quote a string as a single FTS5 trigram substring token (internal double
 /// quotes doubled). Matches the substring anywhere in an indexed column.
+/// Build an FTS5 MATCH expression for a substring query against a
+/// detail=none trigram table. Phrase queries are not allowed under
+/// detail=none, so emit every 3-char window as its own single-token term,
+/// AND-ed. False positives (all trigrams present but not contiguous) are
+/// removed by the Rust-side post-filter.
 fn trigram_match(query: &str) -> String {
-    format!("\"{}\"", query.trim().to_lowercase().replace('"', "\"\""))
+    let folded = query.trim().to_lowercase();
+    let chars: Vec<char> = folded.chars().collect();
+    let mut terms = Vec::new();
+    for window in chars.windows(3) {
+        let tri: String = window.iter().collect();
+        terms.push(format!("\"{}\"", tri.replace('"', "\"\"")));
+    }
+    debug_assert!(!terms.is_empty());
+    terms.join(" AND ")
 }
 
 /// Whether the FTS index should cover full paths (opt-in via config) or just

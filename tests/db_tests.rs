@@ -744,3 +744,107 @@ fn fts_rebuilds_when_index_paths_toggles() {
         None => std::env::remove_var("LCTR_CONFIG_DIR"),
     }
 }
+
+#[test]
+fn fts_detail_none_rejects_non_contiguous_trigram_false_positive() {
+    // "abczzzbcdzzzcde.txt" contains all trigrams of "abcd" (abc, bcd) but
+    // non-contiguously. "abcde.txt" contains "abcd" as a contiguous substring.
+    // The Rust post-filter must eliminate the false positive.
+    let db = Database::open_in_memory().expect("db opens");
+    db.upsert_file(&record(
+        "/tmp/abczzzbcdzzzcde.txt",
+        "abczzzbcdzzzcde.txt",
+        Some("txt"),
+        100,
+        2024,
+    ))
+    .expect("insert false positive");
+    db.upsert_file(&record(
+        "/tmp/abcde.txt",
+        "abcde.txt",
+        Some("txt"),
+        100,
+        2024,
+    ))
+    .expect("insert true positive");
+
+    let results = db
+        .search_with_options(&SearchOptions::new("abcd").with_mode(QueryMode::Contains))
+        .expect("search works");
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].name, "abcde.txt");
+}
+
+#[test]
+fn legacy_search_filters_fts_false_positives() {
+    // Same fixture as above but through the legacy pub fn search path.
+    let db = Database::open_in_memory().expect("db opens");
+    db.upsert_file(&record(
+        "/tmp/abczzzbcdzzzcde.txt",
+        "abczzzbcdzzzcde.txt",
+        Some("txt"),
+        100,
+        2024,
+    ))
+    .expect("insert false positive");
+    db.upsert_file(&record(
+        "/tmp/abcde.txt",
+        "abcde.txt",
+        Some("txt"),
+        100,
+        2024,
+    ))
+    .expect("insert true positive");
+
+    let results = db
+        .search("abcd", &SearchFilters::new(), 10)
+        .expect("search works");
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].name, "abcde.txt");
+}
+
+#[test]
+fn fts_upgrades_from_detail_full_on_open() {
+    // Create a DB file, then use a raw rusqlite connection to drop files_fts
+    // and recreate it with the OLD detail=full shape (no detail=none).
+    // Repopulate, close, reopen via Database::open, and assert a Contains
+    // search still works -- proving the auto-rebuild on open fired.
+    let dir = tempdir().expect("temp dir");
+    let db_path = dir.path().join("upgrade_test.sqlite");
+
+    {
+        let db = Database::open(&db_path).expect("db opens");
+        db.upsert_file(&record(
+            "/tmp/hello-world.rs",
+            "hello-world.rs",
+            Some("rs"),
+            100,
+            2024,
+        ))
+        .expect("insert file");
+    }
+
+    // Degrade the FTS table back to detail=full to simulate an old index.
+    {
+        let conn = rusqlite::Connection::open(&db_path).expect("raw conn opens");
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS files_fts;
+             CREATE VIRTUAL TABLE files_fts
+             USING fts5(name, content='files', content_rowid='id', tokenize='trigram');
+             INSERT INTO files_fts(rowid, name) SELECT id, name FROM files;",
+        )
+        .expect("recreate old-shape fts");
+    }
+
+    // Reopen via Database::open -- should detect missing detail=none and rebuild.
+    let db = Database::open(&db_path).expect("db reopens");
+
+    let results = db
+        .search_with_options(&SearchOptions::new("hello").with_mode(QueryMode::Contains))
+        .expect("search after upgrade");
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].name, "hello-world.rs");
+}
