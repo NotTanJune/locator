@@ -779,7 +779,6 @@ impl Database {
              CREATE INDEX IF NOT EXISTS idx_files_created ON files(created_at);
              CREATE INDEX IF NOT EXISTS idx_files_modified ON files(modified_at);
              CREATE INDEX IF NOT EXISTS idx_files_root ON files(root);
-             CREATE INDEX IF NOT EXISTS idx_files_deleted ON files(deleted);
              CREATE TABLE IF NOT EXISTS scan_roots (
                 root TEXT PRIMARY KEY,
                 scan_token INTEGER NOT NULL,
@@ -791,7 +790,8 @@ impl Database {
                 path TEXT PRIMARY KEY,
                 open_count INTEGER NOT NULL DEFAULT 0,
                 last_opened_at INTEGER
-             );",
+             );
+             DROP INDEX IF EXISTS idx_files_deleted;",
         )?;
         self.ensure_name_lower_column()?;
         self.create_bulk_indexes()?;
@@ -801,7 +801,8 @@ impl Database {
 
     fn configure_fast_staging_connection(&self) -> Result<()> {
         self.conn.execute_batch(
-            "PRAGMA journal_mode = OFF;
+            "PRAGMA page_size = 8192;
+             PRAGMA journal_mode = OFF;
              PRAGMA synchronous = OFF;
              PRAGMA temp_store = MEMORY;
              PRAGMA cache_size = -400000;",
@@ -844,7 +845,6 @@ impl Database {
              CREATE INDEX IF NOT EXISTS idx_files_kind ON files(kind);
              CREATE INDEX IF NOT EXISTS idx_files_extension ON files(extension);
              CREATE INDEX IF NOT EXISTS idx_files_root ON files(root);
-             CREATE INDEX IF NOT EXISTS idx_files_deleted ON files(deleted);
              CREATE INDEX IF NOT EXISTS idx_files_deleted_name_lower ON files(deleted, name_lower);",
         )?;
         Ok(())
@@ -882,7 +882,6 @@ impl Database {
              CREATE INDEX IF NOT EXISTS idx_files_created ON files(created_at);
              CREATE INDEX IF NOT EXISTS idx_files_modified ON files(modified_at);
              CREATE INDEX IF NOT EXISTS idx_files_root ON files(root);
-             CREATE INDEX IF NOT EXISTS idx_files_deleted ON files(deleted);
              CREATE INDEX IF NOT EXISTS idx_files_name_lower ON files(name_lower);
              CREATE INDEX IF NOT EXISTS idx_files_deleted_name_lower ON files(deleted, name_lower);",
         )?;
@@ -922,6 +921,7 @@ impl Database {
                  CREATE VIRTUAL TABLE files_fts
                  USING fts5({columns}, content='files', content_rowid='id',
                             tokenize='trigram', detail=none, columnsize=0);
+                 INSERT INTO files_fts(files_fts, rank) VALUES('pgsz', 8050);
                  INSERT INTO files_fts(rowid, {columns})
                  SELECT id, {columns} FROM files WHERE deleted = 0;",
             ))?;
