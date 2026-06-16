@@ -1887,7 +1887,9 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::db::{local_db_path_for_root, Database, FileRecord, SearchResult};
-    use crate::query::{CompiledQuery, FileKind, QueryMode, SearchFilters, SearchOptions, SortField};
+    use crate::query::{
+        CompiledQuery, FileKind, QueryMode, SearchFilters, SearchOptions, SortField,
+    };
     use crate::tui::theme::Theme;
     use crate::tui::{
         apply_local_result_options, cache_stale, enter_action, format_result_summary,

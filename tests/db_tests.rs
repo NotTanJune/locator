@@ -723,7 +723,10 @@ fn fts_rebuilds_when_index_paths_toggles() {
     let mut cfg = Config::default();
     cfg.set("index_paths", "true").expect("set index_paths");
     cfg.save().expect("save config");
-    assert!(Config::load().index_paths, "config should have index_paths=true");
+    assert!(
+        Config::load().index_paths,
+        "config should have index_paths=true"
+    );
 
     // Reopening runs migrate() → recreate_fts_if_needed() which detects the
     // column mismatch and rebuilds with name+path.
@@ -750,6 +753,9 @@ fn fts_detail_none_rejects_non_contiguous_trigram_false_positive() {
     // "abczzzbcdzzzcde.txt" contains all trigrams of "abcd" (abc, bcd) but
     // non-contiguously. "abcde.txt" contains "abcd" as a contiguous substring.
     // The Rust post-filter must eliminate the false positive.
+    // Lock: a sibling test mutates LCTR_CONFIG_DIR (index_paths) globally; the
+    // shared lock serializes against it so the FTS schema stays stable here.
+    let _lock = LCTR_ENV_LOCK.lock().unwrap();
     let db = Database::open_in_memory().expect("db opens");
     db.upsert_file(&record(
         "/tmp/abczzzbcdzzzcde.txt",
@@ -779,6 +785,7 @@ fn fts_detail_none_rejects_non_contiguous_trigram_false_positive() {
 #[test]
 fn legacy_search_filters_fts_false_positives() {
     // Same fixture as above but through the legacy pub fn search path.
+    let _lock = LCTR_ENV_LOCK.lock().unwrap();
     let db = Database::open_in_memory().expect("db opens");
     db.upsert_file(&record(
         "/tmp/abczzzbcdzzzcde.txt",
@@ -811,6 +818,7 @@ fn fts_upgrades_from_detail_full_on_open() {
     // and recreate it with the OLD detail=full shape (no detail=none).
     // Repopulate, close, reopen via Database::open, and assert a Contains
     // search still works -- proving the auto-rebuild on open fired.
+    let _lock = LCTR_ENV_LOCK.lock().unwrap();
     let dir = tempdir().expect("temp dir");
     let db_path = dir.path().join("upgrade_test.sqlite");
 
