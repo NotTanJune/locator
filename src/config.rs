@@ -29,7 +29,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            icons: false,
+            icons: true,
             theme: "default".to_string(),
             backend: "parallel".to_string(),
             preview: true,

@@ -209,6 +209,7 @@ fn run_loop(
     let mut last_edit = Instant::now();
     let update_rx = crate::update_check::check_async(update_check_disabled);
     let mut update_status: Option<crate::update_check::UpdateStatus> = None;
+    let mut spinner_frame: usize = 0;
 
     loop {
         while let Some(response) = search_worker.try_recv() {
@@ -333,7 +334,14 @@ fn run_loop(
             row_cache = rebuild_row_cache(&results, input.as_str(), mode, results_stamp);
         }
 
+        spinner_frame = spinner_frame.wrapping_add(1);
         terminal.draw(|frame| {
+            // Fill the entire terminal area with the theme background.
+            frame.render_widget(
+                Block::default().style(Style::default().bg(theme.bg)),
+                frame.area(),
+            );
+
             let query = input.as_str();
             let has_detail = frame.area().height >= 20;
             let top_args = TopPanelArgs {
@@ -386,16 +394,44 @@ fn run_loop(
                 }
             }
 
-            // Compact chrome: bordered search bar (focal) + one status line +
-            // one controls line. Full key help lives in the `?` overlay.
+            // Compact chrome: 1-row header band + bordered search bar (focal) +
+            // one status line + one controls line.
+            // Full key help lives in the `?` overlay.
             let top_chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
+                    Constraint::Length(1),
                     Constraint::Length(3),
                     Constraint::Length(1),
                     Constraint::Length(1),
                 ])
                 .split(chunks[0]);
+
+            // Header band: wordmark left, root + backend right.
+            let (wordmark, right_label) = header_segments(&root_label, backend_label);
+            let band_width = top_chunks[0].width as usize;
+            let right_len = right_label.len();
+            let left_len = wordmark.len() + 2; // " lctr " padding
+            let padding = if band_width > left_len + right_len + 2 {
+                " ".repeat(band_width - left_len - right_len)
+            } else {
+                " ".to_string()
+            };
+            let band_line = Line::from(vec![
+                Span::styled(
+                    format!(" {wordmark} "),
+                    Style::default()
+                        .fg(theme.accent)
+                        .bg(theme.panel_bg)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(padding, Style::default().bg(theme.panel_bg).fg(theme.muted)),
+                Span::styled(
+                    right_label,
+                    Style::default().fg(theme.muted).bg(theme.panel_bg),
+                ),
+            ]);
+            frame.render_widget(Paragraph::new(band_line), top_chunks[0]);
 
             let search_panel = Paragraph::new(search_bar_line(&top_args)).block(
                 Block::default()
@@ -407,16 +443,17 @@ fn run_loop(
                     )
                     .borders(Borders::ALL)
                     .border_type(BorderType::Rounded)
-                    .border_style(Style::default().fg(theme.accent)),
+                    .border_style(Style::default().fg(theme.accent))
+                    .style(Style::default().bg(theme.panel_bg)),
             );
-            frame.render_widget(search_panel, top_chunks[0]);
+            frame.render_widget(search_panel, top_chunks[1]);
             frame.set_cursor_position(Position {
-                x: top_chunks[0].x + 1 + input.cursor_column() as u16,
-                y: top_chunks[0].y + 1,
+                x: top_chunks[1].x + 1 + input.cursor_column() as u16,
+                y: top_chunks[1].y + 1,
             });
 
-            frame.render_widget(Paragraph::new(top_status_line(&top_args)), top_chunks[1]);
-            frame.render_widget(Paragraph::new(top_controls_line(&top_args)), top_chunks[2]);
+            frame.render_widget(Paragraph::new(top_status_line(&top_args)), top_chunks[2]);
+            frame.render_widget(Paragraph::new(top_controls_line(&top_args)), top_chunks[3]);
 
             // Split the results region into table + preview when wide enough and
             // a preview is available; otherwise the table takes the full width.
@@ -448,17 +485,8 @@ fn run_loop(
                             kind: String::new(),
                         })
                     })))
-                    .enumerate()
-                    .map(|(index, (result, row_data))| {
-                        result_row(
-                            index,
-                            result,
-                            backend_label,
-                            mode,
-                            &theme,
-                            row_data,
-                            icons_enabled,
-                        )
+                    .map(|(result, row_data)| {
+                        result_row(result, backend_label, mode, &theme, row_data, icons_enabled)
                     })
                     .collect::<Vec<_>>();
                 let table = Table::new(
@@ -491,17 +519,22 @@ fn run_loop(
                     Block::default()
                         .title(match &loading_query {
                             Some(active) if active == query => {
-                                format!("searching {active}...")
+                                format!("{} searching {active}", spinner_glyph(spinner_frame))
                             }
                             _ => format!("results ({})", results.len()),
                         })
                         .title_style(Style::default().fg(theme.ok).add_modifier(Modifier::BOLD))
                         .borders(Borders::ALL)
                         .border_type(BorderType::Rounded)
-                        .border_style(Style::default().fg(theme.muted)),
+                        .border_style(Style::default().fg(theme.accent))
+                        .style(Style::default().bg(theme.panel_bg)),
                 )
-                .row_highlight_style(Style::default().bg(theme.selected_bg))
-                .highlight_symbol(">");
+                .row_highlight_style(
+                    Style::default()
+                        .bg(theme.selected_bg)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .highlight_symbol("\u{258c} ");
                 frame.render_stateful_widget(table, results_area, &mut selected);
             } else if !query.is_empty() {
                 let hint = Paragraph::new(if should_show_results(query) {
@@ -520,7 +553,8 @@ fn run_loop(
                         .title_style(Style::default().fg(theme.ok))
                         .borders(Borders::ALL)
                         .border_type(BorderType::Rounded)
-                        .border_style(Style::default().fg(theme.muted)),
+                        .border_style(Style::default().fg(theme.muted))
+                        .style(Style::default().bg(theme.panel_bg)),
                 );
                 frame.render_widget(hint, results_area);
             } else {
@@ -530,7 +564,7 @@ fn run_loop(
                     .collect::<Vec<_>>();
                 let card = Paragraph::new(card_lines).block(
                     Block::default()
-                        .title("lctr")
+                        .title(" lctr ")
                         .title_style(
                             Style::default()
                                 .fg(theme.accent)
@@ -538,7 +572,8 @@ fn run_loop(
                         )
                         .borders(Borders::ALL)
                         .border_type(BorderType::Rounded)
-                        .border_style(Style::default().fg(theme.muted)),
+                        .border_style(Style::default().fg(theme.accent))
+                        .style(Style::default().bg(theme.panel_bg)),
                 );
                 frame.render_widget(card, results_area);
             }
@@ -552,7 +587,7 @@ fn run_loop(
             if has_detail {
                 let hint_line = Line::from(Span::styled(
                     footer_hint(),
-                    Style::default().fg(theme.muted),
+                    Style::default().fg(theme.muted).bg(theme.bg),
                 ));
                 let mut detail_lines = vec![hint_line];
                 let detail_text = selected_detail(&selected, &results, &theme);
@@ -1152,6 +1187,13 @@ const PREVIEW_MAX_LINES: usize = 300;
 /// scrolling doesn't decode every file (esp. images) it passes over.
 const PREVIEW_DEBOUNCE: Duration = Duration::from_millis(120);
 
+/// Braille spinner frames for the results title while a search is in progress.
+const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+pub(crate) fn spinner_glyph(frame: usize) -> &'static str {
+    SPINNER_FRAMES[frame % SPINNER_FRAMES.len()]
+}
+
 enum PreviewRender {
     Lines(Vec<Line<'static>>),
     Image(Box<StatefulProtocol>),
@@ -1288,7 +1330,7 @@ fn render_help_overlay(frame: &mut Frame, theme: &Theme) {
 
     let help = Paragraph::new(lines).block(
         Block::default()
-            .title("help")
+            .title(" help ")
             .title_style(
                 Style::default()
                     .fg(theme.accent)
@@ -1296,7 +1338,8 @@ fn render_help_overlay(frame: &mut Frame, theme: &Theme) {
             )
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.accent)),
+            .border_style(Style::default().fg(theme.accent))
+            .style(Style::default().bg(theme.panel_bg)),
     );
     frame.render_widget(help, area);
 }
@@ -1413,7 +1456,6 @@ fn record_access_if_indexed(watch_target: &Option<(PathBuf, PathBuf)>, path: &st
 }
 
 fn result_row<'a>(
-    index: usize,
     result: &'a SearchResult,
     source: &'static str,
     mode: QueryMode,
@@ -1435,7 +1477,7 @@ fn result_row<'a>(
         );
     }
     Row::new([
-        Cell::from(if index == 0 { "*" } else { "" }),
+        Cell::from(""),
         Cell::from(name_line),
         Cell::from(row.kind.clone()).style(Style::default().fg(theme.accent)),
         Cell::from(row.size_text.clone()).style(Style::default().fg(theme.warn)),
@@ -1578,8 +1620,17 @@ fn top_controls_line(args: &TopPanelArgs<'_>) -> Line<'static> {
 }
 
 fn top_chrome_height(_args: &TopPanelArgs<'_>) -> u16 {
-    // bordered search bar (3) + status line (1) + controls line (1)
-    5
+    // header band (1) + bordered search bar (3) + status line (1) + controls line (1)
+    6
+}
+
+/// Returns the left wordmark and right root/backend label for the header band.
+/// Extracted so it can be unit-tested without rendering.
+pub(crate) fn header_segments(root_label: &str, backend_label: &str) -> (String, String) {
+    (
+        "lctr".to_string(),
+        format!("{root_label} \u{b7} {backend_label}"),
+    )
 }
 
 fn toggle_sort_order(reverse: bool) -> bool {
@@ -1814,7 +1865,7 @@ fn render_action_menu(frame: &mut Frame, theme: &Theme) {
 
     let menu = Paragraph::new(lines).block(
         Block::default()
-            .title("actions")
+            .title(" actions ")
             .title_style(
                 Style::default()
                     .fg(theme.accent)
@@ -1822,7 +1873,8 @@ fn render_action_menu(frame: &mut Frame, theme: &Theme) {
             )
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(theme.accent)),
+            .border_style(Style::default().fg(theme.accent))
+            .style(Style::default().bg(theme.panel_bg)),
     );
     frame.render_widget(menu, area);
 }
@@ -1899,11 +1951,11 @@ mod tests {
     use crate::tui::theme::Theme;
     use crate::tui::{
         action_menu_entries, apply_local_result_options, cache_stale, empty_state_lines,
-        footer_hint, format_result_summary, rebuild_row_cache, search_backend_for_directory,
-        search_bar_line, search_hybrid, should_show_results, sort_label, toggle_sort_order,
-        top_chrome_height, top_controls_line, top_status_line, tui_search_options, RowCache,
-        SearchBackend, SearchInput, SearchRequest, SearchState, SearchWorker, TopPanelArgs,
-        TUI_RESULT_LIMIT,
+        footer_hint, format_result_summary, header_segments, rebuild_row_cache,
+        search_backend_for_directory, search_bar_line, search_hybrid, should_show_results,
+        sort_label, spinner_glyph, toggle_sort_order, top_chrome_height, top_controls_line,
+        top_status_line, tui_search_options, RowCache, SearchBackend, SearchInput, SearchRequest,
+        SearchState, SearchWorker, TopPanelArgs, TUI_RESULT_LIMIT,
     };
     use ratatui::text::Line;
     use std::thread;
@@ -2003,8 +2055,8 @@ mod tests {
             status: "ready",
         };
 
-        // bordered search bar (3) + status line (1) + controls line (1)
-        assert_eq!(top_chrome_height(&args), 5);
+        // header band (1) + bordered search bar (3) + status line (1) + controls line (1)
+        assert_eq!(top_chrome_height(&args), 6);
     }
 
     #[test]
@@ -2294,6 +2346,20 @@ mod tests {
         assert_eq!(cache.rows[0].path_positions, expected_path);
         assert!(!cache.rows[0].size_text.is_empty());
         assert!(!cache.rows[0].kind.is_empty());
+    }
+
+    #[test]
+    fn spinner_glyph_cycles() {
+        assert_ne!(spinner_glyph(0), spinner_glyph(1));
+        assert_eq!(spinner_glyph(10), spinner_glyph(0));
+    }
+
+    #[test]
+    fn header_segments_includes_backend() {
+        let (wordmark, right) = header_segments("/tmp", "indexed");
+        assert_eq!(wordmark, "lctr");
+        assert!(right.contains("indexed"));
+        assert!(right.contains("/tmp"));
     }
 
     #[test]

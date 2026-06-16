@@ -63,6 +63,8 @@ pub struct Theme {
     pub text: Color,
     pub muted: Color,
     pub selected_bg: Color,
+    pub bg: Color,
+    pub panel_bg: Color,
 }
 
 impl Theme {
@@ -85,7 +87,9 @@ impl Theme {
                 stale: Color::Rgb(211, 116, 97),
                 text: Color::Rgb(211, 222, 224),
                 muted: Color::Rgb(132, 151, 158),
-                selected_bg: Color::Rgb(34, 54, 58),
+                selected_bg: Color::Rgb(44, 70, 74),
+                bg: Color::Rgb(18, 24, 26),
+                panel_bg: Color::Rgb(24, 32, 34),
             },
             ThemeName::Catppuccin => Self {
                 name,
@@ -95,7 +99,9 @@ impl Theme {
                 stale: Color::Rgb(243, 139, 168),
                 text: Color::Rgb(205, 214, 244),
                 muted: Color::Rgb(147, 153, 178),
-                selected_bg: Color::Rgb(49, 50, 68),
+                selected_bg: Color::Rgb(65, 66, 90),
+                bg: Color::Rgb(30, 30, 46),
+                panel_bg: Color::Rgb(24, 24, 37),
             },
             ThemeName::TokyoNight => Self {
                 name,
@@ -105,7 +111,9 @@ impl Theme {
                 stale: Color::Rgb(247, 118, 142),
                 text: Color::Rgb(192, 202, 245),
                 muted: Color::Rgb(108, 120, 162),
-                selected_bg: Color::Rgb(40, 52, 87),
+                selected_bg: Color::Rgb(52, 66, 110),
+                bg: Color::Rgb(26, 27, 38),
+                panel_bg: Color::Rgb(31, 32, 48),
             },
             ThemeName::Gruvbox => Self {
                 name,
@@ -115,7 +123,9 @@ impl Theme {
                 stale: Color::Rgb(251, 73, 52),
                 text: Color::Rgb(235, 219, 178),
                 muted: Color::Rgb(168, 153, 132),
-                selected_bg: Color::Rgb(60, 56, 54),
+                selected_bg: Color::Rgb(80, 73, 69),
+                bg: Color::Rgb(29, 32, 33),
+                panel_bg: Color::Rgb(40, 40, 40),
             },
             ThemeName::Nord => Self {
                 name,
@@ -125,7 +135,9 @@ impl Theme {
                 stale: Color::Rgb(191, 97, 106),
                 text: Color::Rgb(236, 239, 244),
                 muted: Color::Rgb(122, 134, 160),
-                selected_bg: Color::Rgb(59, 66, 82),
+                selected_bg: Color::Rgb(75, 84, 104),
+                bg: Color::Rgb(46, 52, 64),
+                panel_bg: Color::Rgb(59, 66, 82),
             },
             ThemeName::Ocean => Self {
                 name,
@@ -135,7 +147,9 @@ impl Theme {
                 stale: Color::Rgb(236, 112, 99),
                 text: Color::Rgb(225, 232, 236),
                 muted: Color::Rgb(145, 164, 174),
-                selected_bg: Color::Rgb(28, 48, 68),
+                selected_bg: Color::Rgb(40, 68, 98),
+                bg: Color::Rgb(16, 28, 40),
+                panel_bg: Color::Rgb(22, 38, 54),
             },
             ThemeName::Mono => Self {
                 name,
@@ -146,6 +160,8 @@ impl Theme {
                 text: Color::White,
                 muted: Color::DarkGray,
                 selected_bg: Color::DarkGray,
+                bg: Color::Black,
+                panel_bg: Color::Black,
             },
         }
     }
@@ -168,4 +184,31 @@ impl Theme {
 fn theme_file() -> Result<PathBuf> {
     let base = dirs::config_dir().context("locate config directory")?;
     Ok(base.join("locator").join("theme"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_themes_define_distinct_bg() {
+        let all = [
+            ThemeName::Default,
+            ThemeName::Catppuccin,
+            ThemeName::TokyoNight,
+            ThemeName::Gruvbox,
+            ThemeName::Nord,
+            ThemeName::Ocean,
+            ThemeName::Mono,
+        ];
+        for name in all {
+            let theme = Theme::from_name(name);
+            // bg must be set (non-default Reset) and distinct from text
+            assert_ne!(
+                theme.bg, theme.text,
+                "theme {:?}: bg should differ from text",
+                name
+            );
+        }
+    }
 }
