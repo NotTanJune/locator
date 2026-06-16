@@ -8,7 +8,7 @@ use std::sync::{
 use std::thread;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use locator::db::{
@@ -104,6 +104,12 @@ enum Commands {
         #[command(subcommand)]
         action: Option<ConfigCommand>,
     },
+    /// Generate shell completions for bash, zsh, fish, powershell, or elvish
+    Completions {
+        /// Shell to generate completions for
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -118,6 +124,18 @@ enum ConfigCommand {
     Path,
     /// Reset all settings to defaults
     Reset,
+}
+
+/// Output format for `lctr find`. Default `tsv` preserves the existing format.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+enum OutputFormat {
+    /// Tab-separated: kind, path, size (default, backward-compatible)
+    #[default]
+    Tsv,
+    /// Pretty-printed JSON array
+    Json,
+    /// One JSON object per line (streaming/jq-friendly)
+    Jsonl,
 }
 
 #[derive(Debug, Args)]
@@ -149,6 +167,8 @@ struct FindArgs {
     name: Option<String>,
     #[arg(long, default_value_t = 50)]
     limit: usize,
+    #[arg(long, value_enum, default_value_t = OutputFormat::Tsv)]
+    output: OutputFormat,
 }
 
 fn main() -> Result<()> {
@@ -285,11 +305,23 @@ fn main() -> Result<()> {
             let db = Database::open_default_for_search()?;
             let options = build_search_options(&args)?;
             let results = db.search_with_options(&options)?;
-            for result in results {
-                println!(
-                    "{}\t{}\t{} bytes",
-                    result.kind, result.path, result.size_bytes
-                );
+            match args.output {
+                OutputFormat::Tsv => {
+                    for result in &results {
+                        println!(
+                            "{}\t{}\t{} bytes",
+                            result.kind, result.path, result.size_bytes
+                        );
+                    }
+                }
+                OutputFormat::Json => {
+                    println!("{}", serde_json::to_string_pretty(&results)?);
+                }
+                OutputFormat::Jsonl => {
+                    for result in &results {
+                        println!("{}", serde_json::to_string(result)?);
+                    }
+                }
             }
         }
         Commands::Watch { root } => {
@@ -325,6 +357,12 @@ fn main() -> Result<()> {
             println!("vacuum complete");
         }
         Commands::Config { action } => handle_config(action)?,
+        Commands::Completions { shell } => {
+            use clap::CommandFactory;
+            let mut cmd = Cli::command();
+            let name = cmd.get_name().to_string();
+            clap_complete::generate(shell, &mut cmd, name, &mut io::stdout());
+        }
     }
 
     Ok(())
@@ -378,8 +416,16 @@ fn copy_finished_index(source: &Path, target: &Path) -> Result<()> {
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)?;
     }
+    // Copy into the target's directory first so the final install is a
+    // same-filesystem rename, which is atomic. The staging DB may live on a
+    // different volume, so a direct rename(source, target) could fail (EXDEV).
+    let tmp = target.with_extension("sqlite.tmp");
+    let _ = fs::remove_file(&tmp);
+    fs::copy(source, &tmp).with_context(|| format!("copy staged index to {}", tmp.display()))?;
+    // Remove stale -wal/-shm sidecars of the old index before installing the
+    // new file; a fresh DB next to old sidecars can confuse SQLite recovery.
     delete_index_files(target)?;
-    fs::copy(source, target)?;
+    fs::rename(&tmp, target).with_context(|| format!("install index at {}", target.display()))?;
     delete_index_files(source)?;
     Ok(())
 }

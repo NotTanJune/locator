@@ -29,7 +29,7 @@ pub struct FileRecord {
     pub modified_at: Option<DateTime<Utc>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct SearchResult {
     pub path: String,
     pub name: String,

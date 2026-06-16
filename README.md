@@ -74,7 +74,7 @@ irm https://raw.githubusercontent.com/NotTanJune/locator/main/install.ps1 | iex
 |---|---|---|
 | `lctr scan [ROOT]` | Build or refresh a metadata index. | `lctr scan /Volumes/MyDrive` |
 | `lctr search [ROOT]` | Open the interactive search UI. | `lctr search ~/Documents` |
-| `lctr find <QUERY> [FILTERS]` | Run scriptable one-shot search. | `lctr find invoice --type pdf --modified-after 2024-01-01` |
+| `lctr find <QUERY> [FILTERS]` | Run scriptable one-shot search. Supports `--output tsv\|json\|jsonl`. | `lctr find invoice --type pdf --output jsonl \| jq -r .path` |
 | `lctr status` | Show index status for current or target root. | `lctr status` |
 | `lctr delete-index [ROOT]` | Delete the local index. | `lctr delete-index /Volumes/MyDrive` |
 | `lctr setup-shell [OPTIONS]` | Enable scan auto-cd shell integration. | `lctr setup-shell --shell zsh` |
@@ -158,6 +158,21 @@ Invoke-Expression (& lctr shell-init powershell)
 ```
 
 With shell integration installed, `lctr scan ~/Documents` scans `~/Documents`, stores the index in `~/Documents/.locator/index.sqlite`, and moves your current shell into `~/Documents` after a successful scan. Plain `lctr scan ~/Documents` cannot change the parent shell directory without this integration.
+
+### Shell Completions
+
+Generate tab-completion scripts for your shell and install them once:
+
+```sh
+# zsh
+lctr completions zsh > "${fpath[1]}/_lctr"
+
+# bash
+lctr completions bash > /usr/local/etc/bash_completion.d/lctr
+
+# fish
+lctr completions fish > ~/.config/fish/completions/lctr.fish
+```
 
 ### Index Management
 

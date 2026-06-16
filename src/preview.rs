@@ -17,6 +17,10 @@ use syntect::util::LinesWithEndings;
 /// Maximum bytes read for text/binary sniffing and PDF size guarding.
 const MAX_PREVIEW_BYTES: u64 = 2 * 1024 * 1024;
 
+/// Images are decoded in full before downscaling, so cap the file size we are
+/// willing to decode. Larger than the text cap because real photos are big.
+const MAX_IMAGE_PREVIEW_BYTES: u64 = 50 * 1024 * 1024;
+
 /// What a preview resolved to. Text/Info carry ready-to-render lines; Image
 /// carries a decoded image the TUI turns into a terminal graphics protocol.
 pub enum Preview {
@@ -67,7 +71,7 @@ pub fn preview_for(path: &Path, max_lines: usize) -> Preview {
         return image_preview(path, &metadata);
     }
     if extension == "pdf" {
-        return pdf_preview(path, max_lines);
+        return pdf_preview(path, &metadata, max_lines);
     }
 
     text_or_binary_preview(path, &extension, max_lines)
@@ -103,6 +107,12 @@ fn directory_preview(path: &Path, max_lines: usize) -> Preview {
 }
 
 fn image_preview(path: &Path, metadata: &std::fs::Metadata) -> Preview {
+    if metadata.len() > MAX_IMAGE_PREVIEW_BYTES {
+        return Preview::Info(info_lines(&format!(
+            "image too large to preview ({})",
+            human_size(metadata.len())
+        )));
+    }
     match image::ImageReader::open(path)
         .ok()
         .and_then(|reader| reader.with_guessed_format().ok())
@@ -125,7 +135,13 @@ fn image_preview(path: &Path, metadata: &std::fs::Metadata) -> Preview {
     }
 }
 
-fn pdf_preview(path: &Path, max_lines: usize) -> Preview {
+fn pdf_preview(path: &Path, metadata: &std::fs::Metadata, max_lines: usize) -> Preview {
+    if metadata.len() > MAX_PREVIEW_BYTES {
+        return Preview::Info(info_lines(&format!(
+            "pdf too large to preview ({})",
+            human_size(metadata.len())
+        )));
+    }
     match pdf_extract::extract_text(path) {
         Ok(text) => {
             let mut lines = vec![Line::from(Span::styled(

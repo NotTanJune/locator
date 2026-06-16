@@ -2,11 +2,10 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use jwalk::WalkDir;
 
 use crate::db::{sort_results, SearchResult};
 use crate::query::{CompiledQuery, QueryScorer, SearchFilters, SearchOptions};
-use crate::scanner::{is_skip_name, kind_for, system_time_to_utc};
+use crate::scanner::{kind_for, pruned_walk, system_time_to_utc};
 
 #[derive(Debug, Clone, Copy)]
 pub struct LiveSearchOptions {
@@ -132,28 +131,6 @@ pub fn search_live_streaming_with_options(
     sort_results(&mut results, options);
     on_partial(&results);
     Ok(LiveSearchStatus::Complete)
-}
-
-fn pruned_walk(root: &Path) -> impl Iterator<Item = jwalk::Result<jwalk::DirEntry<((), ())>>> {
-    WalkDir::new(root)
-        .follow_links(false)
-        .skip_hidden(false)
-        .process_read_dir(|_depth, _path, _state, children| {
-            children.iter_mut().for_each(|child| {
-                if let Ok(entry) = child {
-                    if is_skip_name(&entry.file_name.to_string_lossy()) {
-                        entry.read_children_path = None;
-                    }
-                }
-            });
-            children.retain(|child| {
-                child
-                    .as_ref()
-                    .map(|entry| !is_skip_name(&entry.file_name.to_string_lossy()))
-                    .unwrap_or(true)
-            });
-        })
-        .into_iter()
 }
 
 fn result_from_path(path: PathBuf, name: String) -> Option<SearchResult> {

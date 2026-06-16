@@ -18,8 +18,9 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0"
 arboard = "3.4"
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 clap = { version = "4.5", features = ["derive"] }
+clap_complete = "4.5"
 crossterm = "0.29"
 dirs = "6.0"
 humansize = "2.1"
@@ -35,12 +36,13 @@ ratatui-image = { version = "11", default-features = false, features = ["crosste
 regex = "1.12"
 rusqlite = { version = "0.39", features = ["bundled", "chrono"] }
 serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0"
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
 tempfile = "3.13"
 toml = "1.1.2"
 ureq = "2.10"
-walkdir = "2.5"
 
 [dev-dependencies]
 assert_cmd = "2.0"
 predicates = "3.1"
+serde_json = "1.0"

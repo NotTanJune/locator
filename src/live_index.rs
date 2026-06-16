@@ -26,6 +26,7 @@ const DEBOUNCE: Duration = Duration::from_millis(400);
 /// Handle to a running watcher. Dropping it stops the watcher thread.
 pub struct LiveIndex {
     generation: Arc<AtomicU64>,
+    write_errors: Arc<AtomicU64>,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
 }
@@ -36,8 +37,10 @@ impl LiveIndex {
     /// the same rows.
     pub fn spawn(root: PathBuf, db_path: PathBuf) -> Result<Self> {
         let generation = Arc::new(AtomicU64::new(0));
+        let write_errors = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
         let thread_generation = Arc::clone(&generation);
+        let thread_write_errors = Arc::clone(&write_errors);
         let thread_stop = Arc::clone(&stop);
 
         // Probe that we can open the index for writing before spawning, so
@@ -60,12 +63,20 @@ impl LiveIndex {
             .spawn(move || {
                 // Keep the watcher alive for the duration of the thread.
                 let _watcher = watcher;
-                watch_loop(&rx, &db, &root_string, &thread_stop, &thread_generation);
+                watch_loop(
+                    &rx,
+                    &db,
+                    &root_string,
+                    &thread_stop,
+                    &thread_generation,
+                    &thread_write_errors,
+                );
             })
             .context("spawn live-index thread")?;
 
         Ok(Self {
             generation,
+            write_errors,
             stop,
             handle: Some(handle),
         })
@@ -75,6 +86,12 @@ impl LiveIndex {
     /// compares it against the last value it saw to decide whether to refresh.
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Relaxed)
+    }
+
+    /// Number of filesystem changes that failed to apply to the index (e.g.
+    /// disk full, lock contention). Non-zero means search results may be stale.
+    pub fn write_errors(&self) -> u64 {
+        self.write_errors.load(Ordering::Relaxed)
     }
 }
 
@@ -93,6 +110,7 @@ fn watch_loop(
     root: &str,
     stop: &AtomicBool,
     generation: &AtomicU64,
+    write_errors: &AtomicU64,
 ) {
     while !stop.load(Ordering::Relaxed) {
         let first = match rx.recv_timeout(DEBOUNCE) {
@@ -113,8 +131,12 @@ fn watch_loop(
 
         let mut changed = false;
         for path in paths {
-            if apply_path(db, root, &path) {
-                changed = true;
+            match apply_path(db, root, &path) {
+                Applied::Changed => changed = true,
+                Applied::Unchanged => {}
+                Applied::Failed => {
+                    write_errors.fetch_add(1, Ordering::Relaxed);
+                }
             }
         }
         if changed {
@@ -131,23 +153,35 @@ fn collect_paths(event: notify::Result<notify::Event>, out: &mut HashSet<PathBuf
     }
 }
 
-/// Returns true if the index was modified for this path.
-fn apply_path(db: &Database, root: &str, path: &Path) -> bool {
+/// Outcome of applying one filesystem change to the index. `Failed` means the
+/// database write itself errored (disk full, lock contention) — distinct from
+/// "nothing to do", so the watcher can surface persistent write trouble.
+enum Applied {
+    Changed,
+    Unchanged,
+    Failed,
+}
+
+fn apply_path(db: &Database, root: &str, path: &Path) -> Applied {
     if path_is_pruned(path) {
-        return false;
+        return Applied::Unchanged;
     }
 
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => match record_for(root, path, &metadata) {
-            Some(record) => db.upsert_file(&record).is_ok(),
-            None => false,
+            Some(record) => match db.upsert_file(&record) {
+                Ok(()) => Applied::Changed,
+                Err(_) => Applied::Failed,
+            },
+            None => Applied::Unchanged,
         },
         // Missing on disk: a delete or rename-away. Soft-delete it (and anything
         // beneath, if it was a directory).
-        Err(_) => db
-            .mark_path_deleted(&path.to_string_lossy())
-            .map(|count| count > 0)
-            .unwrap_or(false),
+        Err(_) => match db.mark_path_deleted(&path.to_string_lossy()) {
+            Ok(count) if count > 0 => Applied::Changed,
+            Ok(_) => Applied::Unchanged,
+            Err(_) => Applied::Failed,
+        },
     }
 }
 
@@ -179,4 +213,43 @@ fn record_for(root: &str, path: &Path, metadata: &std::fs::Metadata) -> Option<F
         created_at: metadata.created().ok().and_then(system_time_to_utc),
         modified_at: metadata.modified().ok().and_then(system_time_to_utc),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+    use tempfile::tempdir;
+
+    /// Verify that `apply_path` returns `Applied::Failed` when the database
+    /// write fails. Strategy: open a valid `Database`, then concurrently drop
+    /// the `files` table via a second raw connection. SQLite will return
+    /// SQLITE_SCHEMA on the first statement the original connection tries to
+    /// prepare after the schema change, causing `upsert_file` to return `Err`.
+    #[test]
+    fn apply_path_returns_failed_on_bad_db() {
+        let dir = tempdir().expect("temp dir");
+        let db_path = dir.path().join("index.sqlite");
+        let root = dir.path().to_string_lossy().to_string();
+
+        // Open the DB through the normal path (creates schema).
+        let db = Database::open(&db_path).expect("open db");
+
+        // Drop the files table via a parallel raw connection so the existing
+        // `db` handle sees SQLITE_SCHEMA on its next write.
+        {
+            let conn = Connection::open(&db_path).expect("raw connection");
+            conn.execute_batch("DROP TABLE IF EXISTS files; DROP TABLE IF EXISTS files_fts;")
+                .expect("drop tables");
+        }
+
+        let target = dir.path().join("new_file.txt");
+        std::fs::write(&target, b"hello").expect("create target");
+
+        let result = apply_path(&db, &root, &target);
+        assert!(
+            matches!(result, Applied::Failed),
+            "expected Failed after files table dropped"
+        );
+    }
 }

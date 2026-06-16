@@ -374,6 +374,7 @@ dependencies = [
  "iana-time-zone",
  "js-sys",
  "num-traits",
+ "serde",
  "wasm-bindgen",
  "windows-link",
 ]
@@ -408,6 +409,15 @@ dependencies = [
  "anstyle",
  "clap_lex",
  "strsim",
+]
+
+[[package]]
+name = "clap_complete"
+version = "4.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e0a7a9bfdb35811f9e59832f0f05975114d2251b415fb534108e6f34060fd772"
+dependencies = [
+ "clap",
 ]
 
 [[package]]
@@ -1580,6 +1590,7 @@ dependencies = [
  "assert_cmd",
  "chrono",
  "clap",
+ "clap_complete",
  "crossterm",
  "dirs",
  "humansize",
@@ -1596,11 +1607,11 @@ dependencies = [
  "regex",
  "rusqlite",
  "serde",
+ "serde_json",
  "syntect",
  "tempfile",
  "toml",
  "ureq",
- "walkdir",
 ]
 
 [[package]]

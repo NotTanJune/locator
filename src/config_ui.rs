@@ -7,10 +7,6 @@ use std::io;
 
 use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use crossterm::execute;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -20,21 +16,14 @@ use ratatui::{Frame, Terminal};
 
 use crate::config::{key_choices, key_description, key_label, Config, KEYS};
 use crate::tui::theme::{Theme, ThemeName};
+use crate::tui::TerminalGuard;
 
 /// Launch the settings TUI. Loads config, edits in place, saves on request.
 pub fn run() -> Result<()> {
-    enable_raw_mode().context("enable raw mode")?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen).context("enter alternate screen")?;
-    let backend = CrosstermBackend::new(stdout);
+    let _guard = TerminalGuard::enter_default_cursor().context("enter terminal")?;
+    let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).context("create terminal")?;
-
-    let result = run_loop(&mut terminal);
-
-    disable_raw_mode().ok();
-    execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
-    terminal.show_cursor().ok();
-    result
+    run_loop(&mut terminal)
 }
 
 fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {

@@ -1,4 +1,5 @@
 use chrono::{TimeZone, Utc};
+use locator::config::Config;
 use locator::db::{
     db_path_for_working_dir, default_db_path, existing_db_path_for_working_dir,
     fallback_db_path_for_root, local_db_path_for_root, Database, FileRecord, ScanCompletion,
@@ -190,6 +191,7 @@ fn option_search_uses_contains_mode_for_infix_filename_matches() {
 
 #[test]
 fn marks_missing_root_records_deleted() {
+    let _lock = LCTR_ENV_LOCK.lock().unwrap();
     let db = Database::open_in_memory().expect("db opens");
     db.upsert_file(&record("/tmp/old.pdf", "old.pdf", Some("pdf"), 10, 2024))
         .expect("insert");
@@ -241,6 +243,7 @@ fn stores_large_sizes_as_sqlite_safe_values() {
 
 #[test]
 fn light_bulk_upsert_writes_searchable_name_path_rows() {
+    let _lock = LCTR_ENV_LOCK.lock().unwrap();
     let db = Database::open_in_memory().expect("db opens");
     let records = vec![
         record("/tmp/a.pdf", "a.pdf", Some("pdf"), 42, 2024),
@@ -264,6 +267,7 @@ fn light_bulk_upsert_writes_searchable_name_path_rows() {
 
 #[test]
 fn light_bulk_insert_writes_searchable_name_path_rows() {
+    let _lock = LCTR_ENV_LOCK.lock().unwrap();
     let db = Database::open_in_memory().expect("db opens");
     let records = vec![
         record("/tmp/a.pdf", "a.pdf", Some("pdf"), 42, 2024),
@@ -382,6 +386,7 @@ fn sqlite_index_exists(db_path: &std::path::Path, name: &str) -> bool {
 
 #[test]
 fn mark_missing_handles_large_seen_path_lists() {
+    let _lock = LCTR_ENV_LOCK.lock().unwrap();
     let db = Database::open_in_memory().expect("db opens");
     let seen_paths = (0..40_000)
         .map(|index| format!("/tmp/file-{index}.txt"))
@@ -452,6 +457,7 @@ fn punctuation_only_search_returns_empty_without_fts_error() {
 
 #[test]
 fn interactive_search_prioritizes_filename_matches() {
+    let _lock = LCTR_ENV_LOCK.lock().unwrap();
     let db = Database::open_in_memory().expect("db opens");
     db.upsert_files(&[
         record("/tmp/archive/report", "notes.txt", Some("txt"), 10, 2024),
@@ -644,4 +650,97 @@ fn fallback_db_path_for_root_is_stable_and_root_specific() {
     assert_eq!(first, repeated);
     assert_ne!(first, second);
     assert!(first.ends_with("index.sqlite"));
+}
+
+#[test]
+fn fts_rebuilds_when_index_paths_toggles() {
+    let _lock = LCTR_ENV_LOCK.lock().unwrap();
+
+    // Use LCTR_CONFIG_DIR to redirect Config::path() to a temp directory.
+    // This is much narrower than redirecting HOME (which would affect dirs::
+    // config_dir() and break other concurrent tests that don't hold this lock).
+    let config_dir = tempdir().expect("config dir");
+    let prev_cfg = std::env::var_os("LCTR_CONFIG_DIR");
+    std::env::set_var("LCTR_CONFIG_DIR", config_dir.path());
+
+    // Sanity: default index_paths should be false (no config file yet).
+    assert!(
+        !Config::load().index_paths,
+        "expected index_paths=false by default"
+    );
+    // Sanity: Config::path() resolves under our temp dir.
+    let cfg_path = Config::path().expect("config path");
+    assert!(
+        cfg_path.starts_with(config_dir.path()),
+        "config path {:?} should be under {:?}",
+        cfg_path,
+        config_dir.path()
+    );
+
+    let db_dir = tempdir().expect("db dir");
+    let db_path = db_dir.path().join("index.sqlite");
+
+    // ── Phase 1: open DB with index_paths = false (default) ───────────────
+    let db = Database::open(&db_path).expect("open db");
+
+    // Insert a record where the marker string appears in the PATH but NOT in
+    // the filename.
+    let marker_dir = db_dir.path().join("zqxdistinct");
+    std::fs::create_dir_all(&marker_dir).expect("create marker dir");
+    let marker_file = marker_dir.join("report.txt");
+    std::fs::write(&marker_file, b"content").expect("write marker file");
+
+    let record = locator::db::FileRecord {
+        path: marker_file.to_string_lossy().to_string(),
+        name: "report.txt".to_string(),
+        parent: marker_dir.to_string_lossy().to_string(),
+        extension: Some("txt".to_string()),
+        root: db_dir.path().to_string_lossy().to_string(),
+        volume: "local".to_string(),
+        kind: "text".to_string(),
+        size_bytes: 7,
+        created_at: None,
+        modified_at: None,
+    };
+    db.upsert_file(&record).expect("upsert record");
+    drop(db);
+
+    // Search for the marker — must NOT be found (FTS indexes name only, and
+    // "zqxdistinct" does not appear in "report.txt").
+    let db = Database::open(&db_path).expect("reopen db phase 1");
+    let results = db
+        .search_with_options(&SearchOptions::new("zqxdistinct").with_limit(10))
+        .expect("search phase 1");
+    assert!(
+        results.is_empty(),
+        "premise failed: zqxdistinct found without index_paths ({} result(s)); \
+         FTS may already cover paths — test oracle needs review",
+        results.len()
+    );
+    drop(db);
+
+    // ── Phase 2: flip index_paths = true, reopen ──────────────────────────
+    let mut cfg = Config::default();
+    cfg.set("index_paths", "true").expect("set index_paths");
+    cfg.save().expect("save config");
+    assert!(Config::load().index_paths, "config should have index_paths=true");
+
+    // Reopening runs migrate() → recreate_fts_if_needed() which detects the
+    // column mismatch and rebuilds with name+path.
+    let db = Database::open(&db_path).expect("reopen db phase 2");
+    let results = db
+        .search_with_options(&SearchOptions::new("zqxdistinct").with_limit(10))
+        .expect("search phase 2");
+    assert_eq!(
+        results.len(),
+        1,
+        "expected 1 result after FTS rebuild with index_paths=true; got {}",
+        results.len()
+    );
+
+    // ── Cleanup (restore before lock releases) ────────────────────────────
+    match prev_cfg {
+        Some(v) => std::env::set_var("LCTR_CONFIG_DIR", v),
+        None => std::env::remove_var("LCTR_CONFIG_DIR"),
+    }
 }

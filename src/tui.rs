@@ -124,25 +124,49 @@ pub fn run(db: &Database, db_path: PathBuf) -> Result<()> {
     )
 }
 
+/// Restores the terminal (raw mode off, default cursor, main screen) when
+/// dropped, so panics and early returns inside the TUI cannot leave the
+/// user's terminal in raw mode on the alternate screen.
+pub(crate) struct TerminalGuard;
+
+impl TerminalGuard {
+    pub(crate) fn enter() -> Result<Self> {
+        enable_raw_mode()?;
+        execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            SetCursorStyle::BlinkingBar,
+            Show
+        )?;
+        Ok(Self)
+    }
+
+    /// Like [`TerminalGuard::enter`] but leaves the cursor style untouched,
+    /// for UIs that never show a text cursor (e.g. the config editor).
+    pub(crate) fn enter_default_cursor() -> Result<Self> {
+        enable_raw_mode()?;
+        execute!(io::stdout(), EnterAlternateScreen)?;
+        Ok(Self)
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            io::stdout(),
+            SetCursorStyle::DefaultUserShape,
+            LeaveAlternateScreen,
+            Show
+        );
+    }
+}
+
 pub fn run_with_backend(search_backend: SearchBackend, update_check_disabled: bool) -> Result<()> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        SetCursorStyle::BlinkingBar,
-        Show
-    )?;
-    let backend = CrosstermBackend::new(stdout);
+    let _guard = TerminalGuard::enter()?;
+    let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
-    let result = run_loop(&mut terminal, search_backend, update_check_disabled);
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        SetCursorStyle::DefaultUserShape,
-        LeaveAlternateScreen
-    )?;
-    result
+    run_loop(&mut terminal, search_backend, update_check_disabled)
 }
 
 fn run_loop(
@@ -153,6 +177,8 @@ fn run_loop(
     let mut input = SearchInput::default();
     let mut all_results = Vec::new();
     let mut results = Vec::new();
+    let mut results_stamp: u64 = 0;
+    let mut row_cache = RowCache::empty();
     let mut selected = TableState::default();
     let mut status = String::from("Press / to search. Shortcut keys are active in normal mode.");
     let mut search_state = SearchState::default();
@@ -201,6 +227,7 @@ fn run_loop(
                                 .with_reverse(reverse)
                                 .with_filters(filters.clone()),
                         );
+                        results_stamp = results_stamp.wrapping_add(1);
                         normalize_selection(&mut selected, results.len());
                         if response.complete {
                             indexed_input_exit_deadline = indexed_response_exit_deadline(
@@ -320,6 +347,13 @@ fn run_loop(
             None => preview_state = None,
         }
 
+        // Rebuild the per-row highlight/format cache when query, mode, or
+        // results changed. This avoids re-running the matcher and format! on
+        // every draw tick (which fires on every event, not just result changes).
+        if cache_stale(&row_cache, input.as_str(), mode, results_stamp) {
+            row_cache = rebuild_row_cache(&results, input.as_str(), mode, results_stamp);
+        }
+
         terminal.draw(|frame| {
             let query = input.as_str();
             let has_detail = frame.area().height >= 20;
@@ -329,6 +363,7 @@ fn run_loop(
                 backend_label,
                 result_count: results.len(),
                 watch_enabled,
+                watch_errors: live_index.as_ref().map_or(0, LiveIndex::write_errors),
                 mode,
                 sort,
                 reverse,
@@ -422,32 +457,31 @@ fn run_loop(
             };
 
             if search_state.should_render_results(query) {
-                let row_compiled = CompiledQuery::compile(mode, query).ok();
-                let mut row_scorer = QueryScorer::new();
                 let rows = results
                     .iter()
+                    .zip(row_cache.rows.iter().chain(std::iter::repeat_with(|| {
+                        // Safety net: cache should always be large enough; use
+                        // a static empty RowData if somehow out of sync.
+                        static EMPTY: std::sync::OnceLock<RowData> = std::sync::OnceLock::new();
+                        EMPTY.get_or_init(|| RowData {
+                            name_positions: Vec::new(),
+                            path_positions: Vec::new(),
+                            size_text: String::new(),
+                            date_text: String::new(),
+                            kind: String::new(),
+                        })
+                    })))
                     .enumerate()
-                    .map(|(index, result)| match row_compiled.as_ref() {
-                        Some(compiled) => result_row(
+                    .map(|(index, (result, row_data))| {
+                        result_row(
                             index,
                             result,
                             backend_label,
                             mode,
                             &theme,
-                            compiled,
-                            &mut row_scorer,
+                            row_data,
                             icons_enabled,
-                        ),
-                        None => result_row(
-                            index,
-                            result,
-                            backend_label,
-                            mode,
-                            &theme,
-                            &CompiledQuery::Empty,
-                            &mut row_scorer,
-                            icons_enabled,
-                        ),
+                        )
                     })
                     .collect::<Vec<_>>();
                 let table = Table::new(
@@ -609,6 +643,7 @@ fn run_loop(
                                     .with_reverse(reverse)
                                     .with_filters(filters.clone()),
                             );
+                            results_stamp = results_stamp.wrapping_add(1);
                             normalize_selection(&mut selected, results.len());
                             search_state.mark_dirty();
                             last_edit = Instant::now();
@@ -624,6 +659,7 @@ fn run_loop(
                                     .with_reverse(reverse)
                                     .with_filters(filters.clone()),
                             );
+                            results_stamp = results_stamp.wrapping_add(1);
                             normalize_selection(&mut selected, results.len());
                             search_state.mark_dirty();
                             last_edit = Instant::now();
@@ -639,6 +675,7 @@ fn run_loop(
                                     .with_reverse(reverse)
                                     .with_filters(filters.clone()),
                             );
+                            results_stamp = results_stamp.wrapping_add(1);
                             normalize_selection(&mut selected, results.len());
                             status = format!("sort: {}", sort.label());
                         }
@@ -652,6 +689,7 @@ fn run_loop(
                                     .with_reverse(reverse)
                                     .with_filters(filters.clone()),
                             );
+                            results_stamp = results_stamp.wrapping_add(1);
                             normalize_selection(&mut selected, results.len());
                             status = format!("sort order: {}", sort_label(sort, reverse));
                         }
@@ -1342,6 +1380,76 @@ fn icon_for(kind: &str, extension: Option<&str>) -> &'static str {
 
 /// Record a frecency access against the backing index, if one exists. Opening
 /// the DB per action is cheap and these actions are rare. Errors are ignored:
+/// Per-result display data computed once per query/mode/results change.
+/// Storing highlight positions and pre-formatted strings avoids re-running
+/// the matcher and `format!` calls inside every TUI draw call.
+struct RowData {
+    name_positions: Vec<usize>,
+    path_positions: Vec<usize>,
+    size_text: String,
+    date_text: String,
+    kind: String,
+}
+
+/// Cache for `result_row` inputs. Rebuilt only when (query, mode, results) change.
+struct RowCache {
+    query: String,
+    mode: QueryMode,
+    results_stamp: u64,
+    rows: Vec<RowData>,
+}
+
+impl RowCache {
+    fn empty() -> Self {
+        Self {
+            query: String::new(),
+            mode: QueryMode::Contains,
+            results_stamp: u64::MAX,
+            rows: Vec::new(),
+        }
+    }
+}
+
+fn cache_stale(cache: &RowCache, query: &str, mode: QueryMode, stamp: u64) -> bool {
+    cache.query != query || cache.mode != mode || cache.results_stamp != stamp
+}
+
+fn rebuild_row_cache(
+    results: &[SearchResult],
+    query: &str,
+    mode: QueryMode,
+    stamp: u64,
+) -> RowCache {
+    let compiled = CompiledQuery::compile(mode, query).ok();
+    let mut scorer = QueryScorer::new();
+    let rows = results
+        .iter()
+        .map(|result| {
+            let (name_positions, path_positions) = if let Some(ref c) = compiled {
+                (
+                    c.match_positions(&mut scorer, &result.name),
+                    c.match_positions(&mut scorer, &result.path),
+                )
+            } else {
+                (Vec::new(), Vec::new())
+            };
+            RowData {
+                name_positions,
+                path_positions,
+                size_text: format_size(result.size_bytes),
+                date_text: format_date(result.modified_at),
+                kind: result.kind.clone(),
+            }
+        })
+        .collect();
+    RowCache {
+        query: query.to_string(),
+        mode,
+        results_stamp: stamp,
+        rows,
+    }
+}
+
 /// frecency is a best-effort ranking hint, never a hard dependency.
 fn record_access_if_indexed(watch_target: &Option<(PathBuf, PathBuf)>, path: &str) {
     if let Some((_, db_path)) = watch_target {
@@ -1351,15 +1459,13 @@ fn record_access_if_indexed(watch_target: &Option<(PathBuf, PathBuf)>, path: &st
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn result_row<'a>(
     index: usize,
     result: &'a SearchResult,
     source: &'static str,
     mode: QueryMode,
     theme: &Theme,
-    compiled: &CompiledQuery,
-    scorer: &mut QueryScorer,
+    row: &RowData,
     icons: bool,
 ) -> Row<'a> {
     let base_name = Style::default().fg(theme.text);
@@ -1367,9 +1473,7 @@ fn result_row<'a>(
     let matched = Style::default()
         .fg(theme.accent)
         .add_modifier(Modifier::BOLD);
-    let name_positions = compiled.match_positions(scorer, &result.name);
-    let path_positions = compiled.match_positions(scorer, &result.path);
-    let mut name_line = highlight_line(&result.name, &name_positions, base_name, matched);
+    let mut name_line = highlight_line(&result.name, &row.name_positions, base_name, matched);
     if icons {
         let icon = icon_for(&result.kind, result.extension.as_deref());
         name_line.spans.insert(
@@ -1380,14 +1484,14 @@ fn result_row<'a>(
     Row::new([
         Cell::from(if index == 0 { "*" } else { "" }),
         Cell::from(name_line),
-        Cell::from(result.kind.clone()).style(Style::default().fg(theme.accent)),
-        Cell::from(format_size(result.size_bytes)).style(Style::default().fg(theme.warn)),
-        Cell::from(format_date(result.modified_at)).style(Style::default().fg(theme.ok)),
+        Cell::from(row.kind.clone()).style(Style::default().fg(theme.accent)),
+        Cell::from(row.size_text.clone()).style(Style::default().fg(theme.warn)),
+        Cell::from(row.date_text.clone()).style(Style::default().fg(theme.ok)),
         Cell::from(source).style(Style::default().fg(source_color(source, theme))),
         Cell::from(mode.label()).style(Style::default().fg(theme.muted)),
         Cell::from(highlight_line(
             &result.path,
-            &path_positions,
+            &row.path_positions,
             base_path,
             matched,
         )),
@@ -1427,6 +1531,7 @@ struct TopPanelArgs<'a> {
     backend_label: &'static str,
     result_count: usize,
     watch_enabled: bool,
+    watch_errors: u64,
     mode: QueryMode,
     sort: SortField,
     reverse: bool,
@@ -1454,12 +1559,16 @@ fn top_status_line(args: &TopPanelArgs<'_>) -> Line<'static> {
         ),
         Span::raw("  "),
         Span::styled(
-            if args.watch_enabled {
-                "watch on"
+            if args.watch_errors > 0 {
+                format!("watch: {} write errors", args.watch_errors)
+            } else if args.watch_enabled {
+                "watch on".to_string()
             } else {
-                "watch off"
+                "watch off".to_string()
             },
-            Style::default().fg(if args.watch_enabled {
+            Style::default().fg(if args.watch_errors > 0 {
+                args.theme.warn
+            } else if args.watch_enabled {
                 args.theme.ok
             } else {
                 args.theme.muted
@@ -1778,16 +1887,16 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::db::{local_db_path_for_root, Database, FileRecord, SearchResult};
-    use crate::query::{FileKind, SearchFilters, SearchOptions, SortField};
+    use crate::query::{CompiledQuery, FileKind, QueryMode, SearchFilters, SearchOptions, SortField};
     use crate::tui::theme::Theme;
     use crate::tui::{
-        apply_local_result_options, enter_action, format_result_summary,
+        apply_local_result_options, cache_stale, enter_action, format_result_summary,
         indexed_response_exit_deadline, initial_input_mode, input_mode_after_indexed_grace,
-        input_mode_after_submit, search_backend_for_directory, search_bar_line, search_hybrid,
-        should_show_results, sort_label, toggle_sort_order, top_chrome_height, top_controls_line,
-        top_status_line, tui_search_options, EnterAction, SearchBackend, SearchInput,
-        SearchRequest, SearchState, SearchWorker, TopPanelArgs, INDEXED_INPUT_GRACE,
-        TUI_RESULT_LIMIT,
+        input_mode_after_submit, rebuild_row_cache, search_backend_for_directory, search_bar_line,
+        search_hybrid, should_show_results, sort_label, toggle_sort_order, top_chrome_height,
+        top_controls_line, top_status_line, tui_search_options, EnterAction, RowCache,
+        SearchBackend, SearchInput, SearchRequest, SearchState, SearchWorker, TopPanelArgs,
+        INDEXED_INPUT_GRACE, TUI_RESULT_LIMIT,
     };
     use ratatui::text::Line;
     use std::thread;
@@ -1848,6 +1957,7 @@ mod tests {
             backend_label: "indexed",
             result_count: 50,
             watch_enabled: false,
+            watch_errors: 0,
             mode: crate::query::QueryMode::Contains,
             sort: SortField::Relevance,
             reverse: false,
@@ -1878,6 +1988,7 @@ mod tests {
             backend_label: "indexed",
             result_count: 50,
             watch_enabled: false,
+            watch_errors: 0,
             mode: crate::query::QueryMode::Contains,
             sort: SortField::Relevance,
             reverse: false,
@@ -2189,5 +2300,48 @@ mod tests {
             .to_string();
 
         assert!(results.iter().any(|result| result.path == live_path));
+    }
+
+    #[test]
+    fn cache_stale_detects_query_mode_and_stamp_changes() {
+        let cache = RowCache {
+            query: "foo".to_string(),
+            mode: QueryMode::Contains,
+            results_stamp: 1,
+            rows: Vec::new(),
+        };
+        assert!(!cache_stale(&cache, "foo", QueryMode::Contains, 1));
+        assert!(cache_stale(&cache, "bar", QueryMode::Contains, 1));
+        assert!(cache_stale(&cache, "foo", QueryMode::Fuzzy, 1));
+        assert!(cache_stale(&cache, "foo", QueryMode::Contains, 2));
+    }
+
+    #[test]
+    fn rebuild_row_cache_positions_match_direct_match_positions() {
+        use crate::query::QueryScorer;
+
+        let query = "report";
+        let mode = QueryMode::Contains;
+        let result = SearchResult {
+            path: "/tmp/reports/report.pdf".to_string(),
+            name: "report.pdf".to_string(),
+            extension: Some("pdf".to_string()),
+            kind: "pdf".to_string(),
+            size_bytes: 1024,
+            created_at: None,
+            modified_at: None,
+        };
+        let cache = rebuild_row_cache(std::slice::from_ref(&result), query, mode, 0);
+        assert_eq!(cache.rows.len(), 1);
+
+        let compiled = CompiledQuery::compile(mode, query).unwrap();
+        let mut scorer = QueryScorer::new();
+        let expected_name = compiled.match_positions(&mut scorer, &result.name);
+        let expected_path = compiled.match_positions(&mut scorer, &result.path);
+
+        assert_eq!(cache.rows[0].name_positions, expected_name);
+        assert_eq!(cache.rows[0].path_positions, expected_path);
+        assert!(!cache.rows[0].size_text.is_empty());
+        assert!(!cache.rows[0].kind.is_empty());
     }
 }

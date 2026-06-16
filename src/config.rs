@@ -51,6 +51,9 @@ pub const KEYS: [&str; 6] = [
 
 impl Config {
     pub fn path() -> Result<PathBuf> {
+        if let Some(dir) = std::env::var_os("LCTR_CONFIG_DIR") {
+            return Ok(PathBuf::from(dir).join("config.toml"));
+        }
         let base = dirs::config_dir().context("locate config directory")?;
         Ok(base.join("locator").join("config.toml"))
     }

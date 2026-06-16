@@ -525,7 +525,10 @@ fn discover_totals(
     Ok(totals)
 }
 
-fn pruned_walk(root: &Path) -> impl Iterator<Item = jwalk::Result<jwalk::DirEntry<((), ())>>> {
+/// Directory walk with the standard skip rules applied (noise directories
+/// pruned, hidden files included, symlinks not followed). Shared by the
+/// indexed scanner and live search so both traverse identically.
+pub fn pruned_walk(root: &Path) -> impl Iterator<Item = jwalk::Result<jwalk::DirEntry<((), ())>>> {
     WalkDir::new(root)
         .follow_links(false)
         .skip_hidden(false)
