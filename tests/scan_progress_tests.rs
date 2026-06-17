@@ -158,7 +158,7 @@ fn scan_completion_dashboard_contains_summary_bars_and_commands() {
 
     let frame = render_scan_summary(&summary);
 
-    assert!(frame.contains("locator"));
+    assert!(frame.contains("lctr"));
     assert!(frame.contains("scan complete"));
     assert!(frame.contains("42 files indexed"));
     assert!(frame.contains("4.2 files/s"));

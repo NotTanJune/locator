@@ -18,7 +18,7 @@ const MAX_DASHBOARD_WIDTH: u16 = 148;
 const LIVE_HEIGHT: u16 = 28;
 const SUMMARY_HEIGHT: u16 = 32;
 const SUMMARY_DETAIL_HEIGHT: u16 = 44;
-const TITLE: &str = " locator ";
+const TITLE: &str = " lctr ";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScanAnimation {
@@ -414,7 +414,7 @@ fn render_scan_flow(area: Rect, buffer: &mut Buffer, stats: &ScanStats) {
         Line::from(vec![
             Span::styled("finish ", style_muted()),
             Span::raw(format_seconds(finalize)),
-            Span::styled(" after the fast file walk; this is where locator builds reusable filename and sort indexes", style_muted()),
+            Span::styled(" after the fast file walk; this is where lctr builds reusable filename and sort indexes", style_muted()),
         ]),
     ];
 
@@ -440,7 +440,7 @@ fn render_header(area: Rect, buffer: &mut Buffer, phase: &str, root: &str, backe
             Span::raw(backend.to_string()),
         ]),
     ])
-    .block(panel(" locator "))
+    .block(panel(" lctr "))
     .style(style_text())
     .wrap(Wrap { trim: true })
     .render(area, buffer);
