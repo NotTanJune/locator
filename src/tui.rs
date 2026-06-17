@@ -7,10 +7,14 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use crossterm::cursor::{SetCursorStyle, Show};
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
+    LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
@@ -132,7 +136,11 @@ pub fn run(db: &Database, db_path: PathBuf) -> Result<()> {
 /// Restores the terminal (raw mode off, default cursor, main screen) when
 /// dropped, so panics and early returns inside the TUI cannot leave the
 /// user's terminal in raw mode on the alternate screen.
-pub(crate) struct TerminalGuard;
+pub(crate) struct TerminalGuard {
+    /// Whether we pushed kitty keyboard-enhancement flags; only pop on drop if
+    /// we actually pushed, so we never disturb a terminal that lacked support.
+    keyboard_enhanced: bool,
+}
 
 impl TerminalGuard {
     pub(crate) fn enter() -> Result<Self> {
@@ -143,7 +151,8 @@ impl TerminalGuard {
             SetCursorStyle::BlinkingBar,
             Show
         )?;
-        Ok(Self)
+        let keyboard_enhanced = enable_keyboard_enhancement();
+        Ok(Self { keyboard_enhanced })
     }
 
     /// Like [`TerminalGuard::enter`] but leaves the cursor style untouched,
@@ -151,12 +160,16 @@ impl TerminalGuard {
     pub(crate) fn enter_default_cursor() -> Result<Self> {
         enable_raw_mode()?;
         execute!(io::stdout(), EnterAlternateScreen)?;
-        Ok(Self)
+        let keyboard_enhanced = enable_keyboard_enhancement();
+        Ok(Self { keyboard_enhanced })
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
+        if self.keyboard_enhanced {
+            let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+        }
         let _ = disable_raw_mode();
         let _ = execute!(
             io::stdout(),
@@ -165,6 +178,21 @@ impl Drop for TerminalGuard {
             Show
         );
     }
+}
+
+/// Turn on the kitty keyboard protocol's escape-code disambiguation when the
+/// terminal supports it. This makes a lone `Esc` register on the first press
+/// instead of being held back by the parser as the possible prefix of an arrow
+/// or function-key sequence. Returns whether the flags were pushed so the guard
+/// knows to pop them on teardown. No-op (and harmless) on terminals lacking
+/// support.
+fn enable_keyboard_enhancement() -> bool {
+    matches!(supports_keyboard_enhancement(), Ok(true))
+        && execute!(
+            io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        )
+        .is_ok()
 }
 
 pub fn run_with_backend(search_backend: SearchBackend, update_check_disabled: bool) -> Result<()> {
