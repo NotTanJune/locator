@@ -192,21 +192,35 @@ LCTR_DATA_DIR=/tmp/locator-data lctr scan /tmp/files
 
 ### Search UI Keys
 
+The TUI has two focuses: **Search** (default) and **Results**. The footer shows the live keys for the current focus.
+
+**Search focus** (active on open — type freely):
+
 ```text
-/      focus search
-Esc    normal mode
-Enter  confirm search or run live search
-j/k    move selection
+type   filter results
+Tab/↓  move focus to results list
+Enter  open top result
+Esc    clear query, or quit if query is empty
+F1/?   show help overlay
+```
+
+**Results focus** (single-key actions):
+
+```text
+j/↓    move down
+k/↑    move up
 g/G    first or last result
+o/↵    open file
+r      reveal in Finder
+y      copy path
 m      cycle query mode
 f      cycle type filter
 s      cycle sort field
 S      toggle sort order
 t      cycle theme
-o      open file
-r      reveal file
-y      copy path
-?      show help text
+w      toggle live index watcher
+?/F1   show help overlay
+//Tab/Esc  return to search focus
 ```
 
 </details>
