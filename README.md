@@ -247,7 +247,7 @@ w      toggle live index watcher
 
 This project is licensed under GPL-3.0-only. See [LICENSE](LICENSE).
 
-## ⭐️ Star History
+## ⭐ Star History
 
 <a href="https://www.star-history.com/?repos=NotTanJune%2Flocator&type=date&legend=top-left">
  <picture>
