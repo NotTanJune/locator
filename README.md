@@ -251,8 +251,8 @@ This project is licensed under GPL-3.0-only. See [LICENSE](LICENSE).
 
 <a href="https://www.star-history.com/?repos=NotTanJune%2Flocator&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=NotTanJune/locator&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=NotTanJune/locator&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=NotTanJune/locator&type=date&legend=top-left" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=NotTanJune/locator&type=date&theme=dark&legend=top-left&sealed_token=5Wxea2ncwLpU_bbiguzVIA7yNPvcj44AGCo227ioCzjSyytwTUw-5yRwqQxJ7jQ7KaW-ywv54x7WcCk_pIj2R9BKyYPtQbq-0U6ATRWJMyOwXHWk6CAHaMqhQGVLG7-jGZS7w-KOQnO7C8mkz3WEGeawMizwXhU7McX1eiYNeLl0j5Ry1T4-ls8EnBMH" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=NotTanJune/locator&type=date&legend=top-left&sealed_token=5Wxea2ncwLpU_bbiguzVIA7yNPvcj44AGCo227ioCzjSyytwTUw-5yRwqQxJ7jQ7KaW-ywv54x7WcCk_pIj2R9BKyYPtQbq-0U6ATRWJMyOwXHWk6CAHaMqhQGVLG7-jGZS7w-KOQnO7C8mkz3WEGeawMizwXhU7McX1eiYNeLl0j5Ry1T4-ls8EnBMH" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=NotTanJune/locator&type=date&legend=top-left&sealed_token=5Wxea2ncwLpU_bbiguzVIA7yNPvcj44AGCo227ioCzjSyytwTUw-5yRwqQxJ7jQ7KaW-ywv54x7WcCk_pIj2R9BKyYPtQbq-0U6ATRWJMyOwXHWk6CAHaMqhQGVLG7-jGZS7w-KOQnO7C8mkz3WEGeawMizwXhU7McX1eiYNeLl0j5Ry1T4-ls8EnBMH" />
  </picture>
 </a>
