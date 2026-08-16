@@ -63,9 +63,25 @@ jobs:
         with:
           path: artifacts
           merge-multiple: true
+      - name: Prepare release notes
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          heading="# lctr v$version"
+
+          awk -v heading="$heading" '
+            $0 == heading { found = 1; print; next }
+            found && $0 ~ /^# lctr v[0-9]/ { exit }
+            found { print }
+          ' release-notes.md > release-notes-current.md
+
+          if ! grep -Fxq "$heading" release-notes-current.md; then
+            echo "No release notes found for $GITHUB_REF_NAME." >&2
+            exit 1
+          fi
       - uses: softprops/action-gh-release@v2
         with:
-          body_path: release-notes.md
+          body_path: release-notes-current.md
           files: artifacts/*
 
   update-manifests:
