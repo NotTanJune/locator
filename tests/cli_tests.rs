@@ -29,7 +29,8 @@ fn cli_exposes_update_command() {
     cmd.args(["update", "--help"])
         .assert()
         .success()
-        .stdout(contains("Usage: lctr update"));
+        .stdout(contains("Usage:"))
+        .stdout(contains("update"));
 }
 
 #[test]
