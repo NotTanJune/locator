@@ -1,3 +1,14 @@
+# lctr v0.3.1
+
+A maintenance release for reliable updates and clearer project documentation.
+
+## Fixes
+
+- Added the `lctr update` subcommand.
+- Cargo-installed binaries now use the repository-backed update path instead of the unavailable crates.io install command.
+- Updated the CLI help and update banner to expose the working update command.
+- Removed lctr from its own comparison table.
+
 # lctr v0.3.0
 
 A large quality release: new interaction model, visual redesign, FTS build speedup, shell completions, scriptable JSON output, and a set of P1 reliability fixes.
