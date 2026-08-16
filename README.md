@@ -247,12 +247,12 @@ w      toggle live index watcher
 
 This project is licensed under GPL-3.0-only. See [LICENSE](LICENSE).
 
-## ⭐️ Star History
+## ⭐ Star History
 
 <a href="https://www.star-history.com/?repos=NotTanJune%2Flocator&type=date&legend=top-left">
  <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=NotTanJune/locator&type=date&theme=dark&legend=top-left" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=NotTanJune/locator&type=date&legend=top-left" />
-   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=NotTanJune/locator&type=date&legend=top-left" />
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=NotTanJune/locator&type=date&theme=dark&legend=top-left&sealed_token=01Jp1MxHcHXbPuebZjyYzK5v8HvN4AZ7oA2l-dfSlxiup291NhoPiFgNieKB4-H0ZFTAsg2PchALwF7askfG5vciLX_5JmOctRVoSCGonvn3JbLmNKVihkzJ4jtbYKNxvInKJKJGlCZAYkyhwR4Nm58F3Pq6LXYjKYMimfNBLtLNOQ_JHGp77mRXSSsN" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=NotTanJune/locator&type=date&legend=top-left&sealed_token=01Jp1MxHcHXbPuebZjyYzK5v8HvN4AZ7oA2l-dfSlxiup291NhoPiFgNieKB4-H0ZFTAsg2PchALwF7askfG5vciLX_5JmOctRVoSCGonvn3JbLmNKVihkzJ4jtbYKNxvInKJKJGlCZAYkyhwR4Nm58F3Pq6LXYjKYMimfNBLtLNOQ_JHGp77mRXSSsN" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=NotTanJune/locator&type=date&legend=top-left&sealed_token=01Jp1MxHcHXbPuebZjyYzK5v8HvN4AZ7oA2l-dfSlxiup291NhoPiFgNieKB4-H0ZFTAsg2PchALwF7askfG5vciLX_5JmOctRVoSCGonvn3JbLmNKVihkzJ4jtbYKNxvInKJKJGlCZAYkyhwR4Nm58F3Pq6LXYjKYMimfNBLtLNOQ_JHGp77mRXSSsN" />
  </picture>
 </a>
