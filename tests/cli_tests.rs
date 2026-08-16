@@ -24,6 +24,15 @@ fn cli_prints_version() {
 }
 
 #[test]
+fn cli_exposes_update_command() {
+    let mut cmd = Command::cargo_bin("lctr").expect("binary exists");
+    cmd.args(["update", "--help"])
+        .assert()
+        .success()
+        .stdout(contains("Usage: lctr update"));
+}
+
+#[test]
 fn cli_scans_and_finds_file_with_temp_database() {
     let root = tempdir().expect("root");
     let app = tempdir().expect("app support");

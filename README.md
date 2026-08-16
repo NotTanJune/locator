@@ -76,6 +76,7 @@ irm https://raw.githubusercontent.com/NotTanJune/locator/main/install.ps1 | iex
 | `lctr search [ROOT]` | Open the interactive search UI. | `lctr search ~/Documents` |
 | `lctr find <QUERY> [FILTERS]` | Run scriptable one-shot search. Supports `--output tsv\|json\|jsonl`. | `lctr find invoice --type pdf --output jsonl \| jq -r .path` |
 | `lctr status` | Show index status for current or target root. | `lctr status` |
+| `lctr update` | Update lctr using the package manager used for its installation. | `lctr update` |
 | `lctr delete-index [ROOT]` | Delete the local index. | `lctr delete-index /Volumes/MyDrive` |
 | `lctr setup-shell [OPTIONS]` | Enable scan auto-cd shell integration. | `lctr setup-shell --shell zsh` |
 
@@ -231,7 +232,6 @@ w      toggle live index watcher
 
 | Tool | Focus | Interface | Index model | Content search | Platform | How `lctr` differs |
 |---|---|---|---|---|---|---|
-| `lctr` | Local metadata search | CLI + TUI | SQLite metadata index | No | macOS, Linux, Windows via Scoop or PowerShell | Terminal-first, local `.locator` indexes, hybrid indexed/live search, no daemon |
 | [sist2](https://github.com/sist2app/sist2) | Full file system indexing with media extraction | Web UI + CLI | SQLite or Elasticsearch search index | Yes, including OCR and archives | Docker on Windows, Linux, and macOS; executable path is Linux/WSL focused | `lctr` is lighter, terminal-native, and metadata-only |
 | [Cardinal](https://github.com/cardisoft/cardinal) | Fast macOS file search app | Native GUI | App-managed search index | Yes | macOS | `lctr` is CLI/TUI first and built for repeatable terminal workflows |
 | [fuz](https://github.com/Magnushhoie/fuz) | Fuzzy text, file, and folder search | Terminal fuzzy UI | Live toolchain over `fzf`, `rg`, and `bat` | Yes for text workflows | Shell environments with required tools | `lctr` persists a metadata index for fast repeated filename/path searches |

@@ -79,6 +79,7 @@ enum Commands {
         no: bool,
     },
     Status,
+    Update,
     Search {
         #[arg(default_value_os_t = std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))]
         root: PathBuf,
@@ -291,6 +292,9 @@ fn main() -> Result<()> {
         Commands::Status => {
             let db = Database::open_default_for_search()?;
             println!("{} indexed files", db.count_active()?);
+        }
+        Commands::Update => {
+            locator::update_check::run_update()?;
         }
         Commands::Search {
             root,

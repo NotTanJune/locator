@@ -1,8 +1,13 @@
+use anyhow::{bail, Context, Result};
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const REPOSITORY: &str = "NotTanJune/locator";
+const REPOSITORY_URL: &str = "https://github.com/NotTanJune/locator";
 
 pub struct UpdateStatus {
     pub latest: String,
@@ -99,6 +104,32 @@ fn extract_tag_name(body: &str) -> Option<String> {
     Some(tag)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallSource {
+    Homebrew,
+    Cargo,
+    WindowsPackageManager,
+    Unsupported,
+}
+
+fn detect_install_source(exe_path: &str, homebrew_prefix: &str, windows: bool) -> InstallSource {
+    if exe_path.contains("/Cellar/")
+        || (!homebrew_prefix.is_empty() && exe_path.starts_with(homebrew_prefix))
+    {
+        return InstallSource::Homebrew;
+    }
+
+    if exe_path.contains("/.cargo/bin") {
+        return InstallSource::Cargo;
+    }
+
+    if windows {
+        return InstallSource::WindowsPackageManager;
+    }
+
+    InstallSource::Unsupported
+}
+
 fn semver_gt(latest: &str, current: &str) -> bool {
     let parse = |s: &str| -> Vec<u64> {
         s.split('.')
@@ -125,29 +156,65 @@ fn semver_gt(latest: &str, current: &str) -> bool {
     false
 }
 
+fn detect_update_cmd_for(exe_path: &str, homebrew_prefix: &str, windows: bool) -> String {
+    match detect_install_source(exe_path, homebrew_prefix, windows) {
+        InstallSource::Homebrew => "brew upgrade lctr".to_string(),
+        InstallSource::Cargo => "lctr update".to_string(),
+        InstallSource::WindowsPackageManager => "winget upgrade NotTanJune.locator".to_string(),
+        InstallSource::Unsupported => {
+            "see https://github.com/NotTanJune/locator/releases".to_string()
+        }
+    }
+}
+
 fn detect_update_cmd() -> String {
     let exe_path = std::env::current_exe()
         .ok()
         .and_then(|p| p.to_str().map(str::to_owned))
         .unwrap_or_default();
-
     let homebrew_prefix = std::env::var("HOMEBREW_PREFIX").unwrap_or_default();
 
-    if exe_path.contains("/Cellar/")
-        || (!homebrew_prefix.is_empty() && exe_path.starts_with(&homebrew_prefix))
-    {
-        return "brew upgrade lctr".to_string();
+    detect_update_cmd_for(&exe_path, &homebrew_prefix, cfg!(windows))
+}
+
+fn run_update_command(program: &str, args: &[&str]) -> Result<()> {
+    let status = Command::new(program)
+        .args(args)
+        .status()
+        .with_context(|| format!("run `{program} {}`", args.join(" ")))?;
+
+    if !status.success() {
+        bail!(
+            "`{program} {}` failed with status {}",
+            args.join(" "),
+            status
+        );
     }
 
-    if exe_path.contains("/.cargo/bin") {
-        return "cargo install --force locator".to_string();
-    }
+    Ok(())
+}
 
-    if cfg!(windows) {
-        return "winget upgrade NotTanJune.locator".to_string();
-    }
+pub fn run_update() -> Result<()> {
+    let exe_path = std::env::current_exe().context("determine the installed lctr executable")?;
+    let exe_path = exe_path.to_string_lossy();
+    let homebrew_prefix = std::env::var("HOMEBREW_PREFIX").unwrap_or_default();
+    let source = detect_install_source(&exe_path, &homebrew_prefix, cfg!(windows));
 
-    "see https://github.com/NotTanJune/locator/releases".to_string()
+    println!("Updating lctr...");
+    match source {
+        InstallSource::Homebrew => run_update_command("brew", &["upgrade", "lctr"]),
+        InstallSource::Cargo => run_update_command(
+            "cargo",
+            &["install", "--git", REPOSITORY_URL, "--force", "--locked"],
+        ),
+        InstallSource::WindowsPackageManager => {
+            run_update_command("winget", &["upgrade", REPOSITORY])
+        }
+        InstallSource::Unsupported => bail!(
+            "automatic updates are unavailable for this installation; reinstall from {}",
+            REPOSITORY_URL
+        ),
+    }
 }
 
 fn now_unix() -> u64 {
@@ -245,5 +312,13 @@ mod tests {
     fn test_extract_tag_name_missing() {
         let json = r#"{"name": "no release"}"#;
         assert_eq!(extract_tag_name(json), None);
+    }
+
+    #[test]
+    fn cargo_install_update_uses_lctr_subcommand() {
+        assert_eq!(
+            detect_update_cmd_for("/Users/test/.cargo/bin/lctr", "", false),
+            "lctr update"
+        );
     }
 }

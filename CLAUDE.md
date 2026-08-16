@@ -32,7 +32,7 @@ Releases are tag-triggered. The tag must match `version` in `Cargo.toml` exactly
 
 The binary is `lctr` (`src/main.rs`); the library crate is `locator` (`src/lib.rs`). All subcommands are defined with clap derive in `main.rs` (the `Commands` enum) and dispatch into library functions.
 
-Subcommands: `scan <root>` (build index), `search` (interactive TUI), `find` (non-interactive query, scriptable output), `watch <root>` (poll-refresh the index every 5s via `src/watch.rs`), `status`, `roots` / `remove-root` (manage indexed roots), `delete-index`, `vacuum`, `shell-init` / `setup-shell` (install the `lctr`-cd shell wrapper).
+Subcommands: `scan <root>` (build index), `search` (interactive TUI), `find` (non-interactive query, scriptable output), `watch <root>` (poll-refresh the index every 5s via `src/watch.rs`), `status`, `update` (update through the detected installation method), `roots` / `remove-root` (manage indexed roots), `delete-index`, `vacuum`, `shell-init` / `setup-shell` (install the `lctr`-cd shell wrapper).
 
 ### Index storage
 
@@ -91,7 +91,7 @@ Built with `ratatui` + `crossterm`. Layout: vertical split into top chrome (stat
 
 ### Update check
 
-`src/update_check.rs` — non-blocking, cached GitHub release check. Hits `api.github.com/repos/NotTanJune/locator/releases/latest` via `ureq` (2s timeout) at most once per 24h. Cache at `dirs::config_dir()/locator/update_check`. Opt out: `--no-update-check` flag (persists a marker file) or `LCTR_NO_UPDATE_CHECK=1` env var.
+`src/update_check.rs` — non-blocking, cached GitHub release check. Hits `api.github.com/repos/NotTanJune/locator/releases/latest` via `ureq` (2s timeout) at most once per 24h. Cache at `dirs::config_dir()/locator/update_check`. Opt out: `--no-update-check` flag (persists a marker file) or `LCTR_NO_UPDATE_CHECK=1` env var. `lctr update` delegates to Homebrew, the repository-backed Cargo install, or WinGet based on the executable path.
 
 ### Key env vars
 
