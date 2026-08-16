@@ -1,3 +1,13 @@
+# lctr v0.3.2
+
+A maintenance release that makes self-updates fast without local Rust rebuilds.
+
+## Fixes
+
+- Cargo-installed binaries now download the matching prebuilt GitHub release archive instead of compiling the Rust dependency graph.
+- `lctr update` skips the download when the installed version is already current.
+- Added platform-aware executable replacement for macOS, Linux, and Windows release assets.
+
 # lctr v0.3.1
 
 A maintenance release for reliable updates and clearer project documentation.

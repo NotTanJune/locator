@@ -76,11 +76,13 @@ irm https://raw.githubusercontent.com/NotTanJune/locator/main/install.ps1 | iex
 | `lctr search [ROOT]` | Open the interactive search UI. | `lctr search ~/Documents` |
 | `lctr find <QUERY> [FILTERS]` | Run scriptable one-shot search. Supports `--output tsv\|json\|jsonl`. | `lctr find invoice --type pdf --output jsonl \| jq -r .path` |
 | `lctr status` | Show index status for current or target root. | `lctr status` |
-| `lctr update` | Update lctr using the package manager used for its installation. | `lctr update` |
+| `lctr update` | Update lctr from a prebuilt release or the package manager used for its installation. | `lctr update` |
 | `lctr delete-index [ROOT]` | Delete the local index. | `lctr delete-index /Volumes/MyDrive` |
 | `lctr setup-shell [OPTIONS]` | Enable scan auto-cd shell integration. | `lctr setup-shell --shell zsh` |
 
 If no index exists, `lctr search` uses live filesystem search. If an interrupted scan left an incomplete index, `lctr search` uses hybrid search: indexed results first, then live search for paths missing from the partial index.
+
+Cargo-installed binaries download the matching prebuilt GitHub release archive when `lctr update` runs, so updates do not rebuild the Rust dependency graph locally. Homebrew and WinGet installations continue to update through their package managers.
 
 ## Privacy
 
