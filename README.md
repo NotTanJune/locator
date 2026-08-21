@@ -228,6 +228,18 @@ w      toggle live index watcher
 
 </details>
 
+## Troubleshooting
+
+### Record search input on macOS
+
+Use this diagnostic recorder when search input or scrolling behaves unexpectedly:
+
+```sh
+scripts/record-search-input.sh /path/to/search/root
+```
+
+Reproduce one normal slow scroll, then one fast wheel flick. Exit with `Ctrl-C`, inspect both files under `target/lctr-input-recordings/`, and share both logs with the report. The files can contain sensitive search text and terminal output, so inspect them before sharing.
+
 ## 📊 Comparison
 
 `lctr` is for people who want local file search from the terminal: a fast metadata index, a dense keyboard-first TUI, and a scriptable `find` command. It intentionally does not index file contents in v1.

@@ -1,3 +1,13 @@
+# lctr v0.3.3
+
+## Fixes
+
+- Finder reveals from one search TUI session now reuse one lctr-owned Finder window, raise it, select the requested item, and close only that window when the session exits.
+- Finder automation failures during reveal now remain visible in the TUI status line instead of terminating the search session.
+- TUI navigation rate-limits repeated same-direction scroll events to one row per ratchet and bounds queued-event draining to prevent skipped rows and runaway scrolling.
+- Fragmented terminal arrow escape sequences are normalized so scroll bytes are not inserted into the search field as literal text.
+- Added an opt-in macOS input recorder that pairs a raw terminal recording with decoded Crossterm JSONL events for scroll and search-input diagnosis.
+
 # lctr v0.3.2
 
 A maintenance release that makes self-updates fast without local Rust rebuilds.

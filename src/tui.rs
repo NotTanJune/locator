@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -8,7 +9,7 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use crossterm::cursor::{SetCursorStyle, Show};
 use crossterm::event::{
-    self, Event, KeyCode, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
@@ -34,22 +35,265 @@ use crate::live_index::LiveIndex;
 use crate::live_search::{
     search_live_streaming_with_options, search_live_with_options, LiveSearchStatus,
 };
-use crate::open::{copy_path, open_file, reveal_in_finder};
+use crate::open::{copy_path, open_file, FinderRevealSession};
 use crate::preview::{self, Preview};
 use crate::query::{
     CompiledQuery, QueryMode, QueryScorer, SearchFilters, SearchOptions, SortField,
 };
 
+mod input_trace;
 pub mod theme;
 
 use theme::Theme;
 
 const TUI_RESULT_LIMIT: usize = 1000;
+const NAVIGATION_BURST_WINDOW: Duration = Duration::from_millis(50);
+const FRAGMENTED_ESCAPE_WINDOW: Duration = Duration::from_millis(50);
+const INPUT_DRAIN_LIMIT: usize = 4096;
+const INPUT_DRAIN_BUDGET: Duration = Duration::from_millis(5);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Focus {
     Search,
     Results,
+}
+
+#[derive(Default)]
+struct NavigationBurst {
+    last: Option<(KeyCode, Instant)>,
+}
+
+impl NavigationBurst {
+    fn reset(&mut self) {
+        self.last = None;
+    }
+
+    fn accepts(&mut self, code: KeyCode, now: Instant) -> bool {
+        if let Some((last_code, last_at)) = self.last {
+            if last_code == code && now.duration_since(last_at) < NAVIGATION_BURST_WINDOW {
+                self.last = Some((code, now));
+                return false;
+            }
+        }
+
+        self.last = Some((code, now));
+        true
+    }
+}
+
+enum PendingEscape {
+    Escape {
+        key: KeyEvent,
+        at: Instant,
+    },
+    Prefix {
+        escape: KeyEvent,
+        prefix: KeyEvent,
+        at: Instant,
+    },
+}
+
+#[derive(Default)]
+struct InputNormalizer {
+    pending: Option<PendingEscape>,
+    ready: VecDeque<Event>,
+}
+
+impl InputNormalizer {
+    fn push(&mut self, event: Event, now: Instant) {
+        match event {
+            Event::Key(key) if key.kind == KeyEventKind::Press => self.push_key(key, now),
+            event => {
+                self.flush_pending();
+                self.ready.push_back(event);
+            }
+        }
+    }
+
+    fn push_key(&mut self, key: KeyEvent, now: Instant) {
+        if let Some(pending) = self.pending.take() {
+            if now.saturating_duration_since(pending_at(&pending)) < FRAGMENTED_ESCAPE_WINDOW {
+                match pending {
+                    PendingEscape::Escape { key: escape, .. }
+                        if is_fragment_char(key, '[') || is_fragment_char(key, 'O') =>
+                    {
+                        self.pending = Some(PendingEscape::Prefix {
+                            escape,
+                            prefix: key,
+                            at: now,
+                        });
+                        return;
+                    }
+                    PendingEscape::Prefix { escape, prefix, .. } => {
+                        if let Some(code) = fragmented_arrow_code(key) {
+                            self.ready
+                                .push_back(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+                            return;
+                        }
+                        self.ready.push_back(Event::Key(escape));
+                        self.ready.push_back(Event::Key(prefix));
+                    }
+                    PendingEscape::Escape { key: escape, .. } => {
+                        self.ready.push_back(Event::Key(escape));
+                    }
+                }
+            } else {
+                self.push_pending(pending);
+            }
+        }
+
+        if key.code == KeyCode::Esc && key.modifiers == KeyModifiers::NONE {
+            self.pending = Some(PendingEscape::Escape { key, at: now });
+        } else {
+            self.ready.push_back(Event::Key(key));
+        }
+    }
+
+    fn push_pending(&mut self, pending: PendingEscape) {
+        match pending {
+            PendingEscape::Escape { key, .. } => self.ready.push_back(Event::Key(key)),
+            PendingEscape::Prefix { escape, prefix, .. } => {
+                self.ready.push_back(Event::Key(escape));
+                self.ready.push_back(Event::Key(prefix));
+            }
+        }
+    }
+
+    fn flush_pending(&mut self) {
+        if let Some(pending) = self.pending.take() {
+            self.push_pending(pending);
+        }
+    }
+
+    fn flush_expired(&mut self, now: Instant) {
+        let expired = self.pending.as_ref().is_some_and(|pending| {
+            now.saturating_duration_since(pending_at(pending)) >= FRAGMENTED_ESCAPE_WINDOW
+        });
+        if expired {
+            self.flush_pending();
+        }
+    }
+
+    fn poll_timeout(&self, fallback: Duration, now: Instant) -> Duration {
+        self.pending.as_ref().map_or(fallback, |pending| {
+            fallback.min(
+                FRAGMENTED_ESCAPE_WINDOW
+                    .saturating_sub(now.saturating_duration_since(pending_at(pending))),
+            )
+        })
+    }
+
+    fn pop_ready(&mut self) -> Option<Event> {
+        self.ready.pop_front()
+    }
+
+    fn has_ready(&self) -> bool {
+        !self.ready.is_empty()
+    }
+
+    fn discard_ready_navigation(&mut self, code: KeyCode) {
+        while self.ready.front().is_some_and(|event| {
+            matches!(event, Event::Key(key) if key.kind == KeyEventKind::Press && key.code == code)
+        }) {
+            self.ready.pop_front();
+        }
+    }
+}
+
+fn pending_at(pending: &PendingEscape) -> Instant {
+    match pending {
+        PendingEscape::Escape { at, .. } | PendingEscape::Prefix { at, .. } => *at,
+    }
+}
+
+fn is_fragment_char(key: KeyEvent, expected: char) -> bool {
+    key.code == KeyCode::Char(expected)
+        && matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT)
+}
+
+fn fragmented_arrow_code(key: KeyEvent) -> Option<KeyCode> {
+    if !matches!(key.modifiers, KeyModifiers::NONE | KeyModifiers::SHIFT) {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char('A') => Some(KeyCode::Up),
+        KeyCode::Char('B') => Some(KeyCode::Down),
+        KeyCode::Char('C') => Some(KeyCode::Right),
+        KeyCode::Char('D') => Some(KeyCode::Left),
+        KeyCode::Char('H') => Some(KeyCode::Home),
+        KeyCode::Char('F') => Some(KeyCode::End),
+        _ => None,
+    }
+}
+
+fn read_normalized_input(
+    normalizer: &mut InputNormalizer,
+    input_trace: &mut input_trace::InputTrace,
+    focus: Focus,
+    input: &SearchInput,
+    selected: &TableState,
+) -> Result<Option<Event>> {
+    let now = Instant::now();
+    normalizer.flush_expired(now);
+    if let Some(event) = normalizer.pop_ready() {
+        return Ok(Some(event));
+    }
+
+    let timeout = normalizer.poll_timeout(Duration::from_millis(100), now);
+    if !event::poll(timeout)? {
+        return Ok(None);
+    }
+
+    let raw_event = event::read()?;
+    input_trace.record(
+        &raw_event,
+        focus,
+        input.as_str(),
+        input.cursor_column(),
+        selected.selected(),
+    )?;
+    let now = Instant::now();
+    normalizer.push(raw_event, now);
+    normalizer.flush_expired(now);
+    Ok(normalizer.pop_ready())
+}
+
+fn drain_same_direction_input(
+    normalizer: &mut InputNormalizer,
+    input_trace: &mut input_trace::InputTrace,
+    focus: Focus,
+    input: &SearchInput,
+    selected: &TableState,
+    code: KeyCode,
+) -> Result<()> {
+    normalizer.discard_ready_navigation(code);
+    if normalizer.has_ready() {
+        return Ok(());
+    }
+
+    let started = Instant::now();
+    for _ in 0..INPUT_DRAIN_LIMIT {
+        if started.elapsed() >= INPUT_DRAIN_BUDGET || !event::poll(Duration::ZERO)? {
+            break;
+        }
+
+        let raw_event = event::read()?;
+        input_trace.record(
+            &raw_event,
+            focus,
+            input.as_str(),
+            input.cursor_column(),
+            selected.selected(),
+        )?;
+        let now = Instant::now();
+        normalizer.push(raw_event, now);
+        normalizer.flush_expired(now);
+        normalizer.discard_ready_navigation(code);
+        if normalizer.has_ready() {
+            break;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -244,6 +488,10 @@ fn run_loop(
     let update_rx = crate::update_check::check_async(update_check_disabled);
     let mut update_status: Option<crate::update_check::UpdateStatus> = None;
     let mut spinner_frame: usize = 0;
+    let mut finder_reveal = FinderRevealSession::new();
+    let mut input_trace = input_trace::InputTrace::from_env()?;
+    let mut input_normalizer = InputNormalizer::default();
+    let mut navigation_burst = NavigationBurst::default();
 
     loop {
         while let Some(response) = search_worker.try_recv() {
@@ -660,259 +908,304 @@ fn run_loop(
             }
         })?;
 
-        if event::poll(Duration::from_millis(100))? {
-            if let Event::Key(key) = event::read()? {
-                if key.kind != KeyEventKind::Press {
-                    continue;
+        let Some(event) = read_normalized_input(
+            &mut input_normalizer,
+            &mut input_trace,
+            focus,
+            &input,
+            &selected,
+        )?
+        else {
+            continue;
+        };
+        if let Event::Key(key) = event {
+            if key.kind != KeyEventKind::Press {
+                continue;
+            }
+            // Help overlay is modal: any key dismisses it.
+            if show_help {
+                show_help = false;
+                continue;
+            }
+            // Ctrl-C always quits regardless of focus.
+            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                break;
+            }
+            let navigation_code =
+                matches!(key.code, KeyCode::Up | KeyCode::Down).then_some(key.code);
+            let is_vertical_navigation = navigation_code.is_some();
+            if focus != Focus::Results || !is_vertical_navigation {
+                navigation_burst.reset();
+            } else if !navigation_burst.accepts(key.code, Instant::now()) {
+                if let Some(code) = navigation_code {
+                    drain_same_direction_input(
+                        &mut input_normalizer,
+                        &mut input_trace,
+                        focus,
+                        &input,
+                        &selected,
+                        code,
+                    )?;
                 }
-                // Help overlay is modal: any key dismisses it.
-                if show_help {
-                    show_help = false;
-                    continue;
-                }
-                // Ctrl-C always quits regardless of focus.
-                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                    break;
-                }
-                match focus {
-                    Focus::Search => match key.code {
-                        KeyCode::Esc => {
-                            if !input.as_str().is_empty() {
-                                input = SearchInput::default();
-                                search_state.mark_dirty();
-                                if backend_label == "live" {
-                                    all_results.clear();
-                                    results.clear();
-                                }
-                                normalize_selection(&mut selected, results.len());
-                                status = "cleared".to_string();
-                            } else {
-                                break;
-                            }
-                        }
-                        KeyCode::Backspace if input.backspace() => {
+                continue;
+            }
+            match focus {
+                Focus::Search => match key.code {
+                    KeyCode::Esc => {
+                        if !input.as_str().is_empty() {
+                            input = SearchInput::default();
                             search_state.mark_dirty();
-                            last_edit = Instant::now();
                             if backend_label == "live" {
                                 all_results.clear();
                                 results.clear();
                             }
                             normalize_selection(&mut selected, results.len());
-                            status = edit_status(backend_label);
+                            status = "cleared".to_string();
+                        } else {
+                            break;
                         }
-                        KeyCode::Char(ch) => {
-                            input.insert(ch);
-                            search_state.mark_dirty();
-                            last_edit = Instant::now();
-                            if backend_label == "live" {
-                                all_results.clear();
-                                results.clear();
-                            }
-                            normalize_selection(&mut selected, results.len());
-                            status = edit_status(backend_label);
+                    }
+                    KeyCode::Backspace if input.backspace() => {
+                        search_state.mark_dirty();
+                        last_edit = Instant::now();
+                        if backend_label == "live" {
+                            all_results.clear();
+                            results.clear();
                         }
-                        KeyCode::Left => input.move_left(),
-                        KeyCode::Right => input.move_right(),
-                        KeyCode::Tab | KeyCode::Down if !results.is_empty() => {
-                            focus = Focus::Results;
-                            normalize_selection(&mut selected, results.len());
+                        normalize_selection(&mut selected, results.len());
+                        status = edit_status(backend_label);
+                    }
+                    KeyCode::Char(ch) => {
+                        input.insert(ch);
+                        search_state.mark_dirty();
+                        last_edit = Instant::now();
+                        if backend_label == "live" {
+                            all_results.clear();
+                            results.clear();
                         }
-                        KeyCode::Up => move_selection(&mut selected, results.len(), -1),
-                        KeyCode::PageDown => move_selection(&mut selected, results.len(), 10),
-                        KeyCode::PageUp => move_selection(&mut selected, results.len(), -10),
-                        KeyCode::F(1) => {
-                            show_help = true;
-                        }
-                        KeyCode::Enter => {
-                            let query = input.as_str();
-                            let live_backfill = backend_label != "indexed"
-                                && !search_state.live_complete_for(query);
-                            if selected_path(&selected, &results).is_some() {
-                                if let Some(path) = selected_path(&selected, &results) {
-                                    open_file(Path::new(path))?;
-                                    record_access_if_indexed(&watch_target, path);
-                                    status = format!("opened {path}");
-                                }
-                            } else if live_backfill && should_show_results(query) {
-                                let options = tui_search_options(query)
-                                    .with_mode(mode)
-                                    .with_sort(sort)
-                                    .with_reverse(reverse)
-                                    .with_filters(filters.clone());
-                                search_worker.submit(SearchRequest {
-                                    options: options.clone(),
-                                    live_backfill,
-                                })?;
-                                search_state.mark_submitted(options, live_backfill);
-                                loading_query = Some(query.to_string());
-                                if backend_label == "live" || live_backfill {
-                                    all_results.clear();
-                                    results.clear();
-                                }
-                                normalize_selection(&mut selected, results.len());
-                                status = if live_backfill {
-                                    format!("searching live filenames for {query}")
-                                } else {
-                                    format!("searching {backend_label} filenames for {query}")
-                                };
-                            } else {
-                                status = "Type to search, then select a result".to_string();
-                            }
-                        }
-                        _ => {}
-                    },
-                    Focus::Results => match key.code {
-                        KeyCode::Char('j') | KeyCode::Down => {
-                            move_selection(&mut selected, results.len(), 1);
-                        }
-                        KeyCode::Char('k') | KeyCode::Up => {
-                            move_selection(&mut selected, results.len(), -1);
-                        }
-                        KeyCode::Char('g') if !results.is_empty() => {
-                            selected.select(Some(0));
-                        }
-                        KeyCode::Char('G') if !results.is_empty() => {
-                            selected.select(Some(results.len() - 1));
-                        }
-                        KeyCode::PageDown => move_selection(&mut selected, results.len(), 10),
-                        KeyCode::PageUp => move_selection(&mut selected, results.len(), -10),
-                        KeyCode::Char('o') | KeyCode::Enter => {
+                        normalize_selection(&mut selected, results.len());
+                        status = edit_status(backend_label);
+                    }
+                    KeyCode::Left => input.move_left(),
+                    KeyCode::Right => input.move_right(),
+                    KeyCode::Tab | KeyCode::Down if !results.is_empty() => {
+                        focus = Focus::Results;
+                        normalize_selection(&mut selected, results.len());
+                    }
+                    KeyCode::Up => move_selection(&mut selected, results.len(), -1),
+                    KeyCode::PageDown => move_selection(&mut selected, results.len(), 10),
+                    KeyCode::PageUp => move_selection(&mut selected, results.len(), -10),
+                    KeyCode::F(1) => {
+                        show_help = true;
+                    }
+                    KeyCode::Enter => {
+                        let query = input.as_str();
+                        let live_backfill =
+                            backend_label != "indexed" && !search_state.live_complete_for(query);
+                        if selected_path(&selected, &results).is_some() {
                             if let Some(path) = selected_path(&selected, &results) {
                                 open_file(Path::new(path))?;
                                 record_access_if_indexed(&watch_target, path);
                                 status = format!("opened {path}");
                             }
-                        }
-                        KeyCode::Char('r') => {
-                            if let Some(path) = selected_path(&selected, &results) {
-                                reveal_in_finder(Path::new(path))?;
-                                record_access_if_indexed(&watch_target, path);
-                                status = format!("revealed {path}");
+                        } else if live_backfill && should_show_results(query) {
+                            let options = tui_search_options(query)
+                                .with_mode(mode)
+                                .with_sort(sort)
+                                .with_reverse(reverse)
+                                .with_filters(filters.clone());
+                            search_worker.submit(SearchRequest {
+                                options: options.clone(),
+                                live_backfill,
+                            })?;
+                            search_state.mark_submitted(options, live_backfill);
+                            loading_query = Some(query.to_string());
+                            if backend_label == "live" || live_backfill {
+                                all_results.clear();
+                                results.clear();
                             }
-                        }
-                        KeyCode::Char('y') => {
-                            if let Some(path) = selected_path(&selected, &results) {
-                                copy_path(Path::new(path))?;
-                                record_access_if_indexed(&watch_target, path);
-                                status = format!("copied {path}");
-                            }
-                        }
-                        KeyCode::Char('m') => {
-                            mode = mode.next();
-                            results = apply_local_result_options(
-                                &all_results,
-                                &tui_search_options(input.as_str())
-                                    .with_mode(mode)
-                                    .with_sort(sort)
-                                    .with_reverse(reverse)
-                                    .with_filters(filters.clone()),
-                            );
-                            results_stamp = results_stamp.wrapping_add(1);
                             normalize_selection(&mut selected, results.len());
+                            status = if live_backfill {
+                                format!("searching live filenames for {query}")
+                            } else {
+                                format!("searching {backend_label} filenames for {query}")
+                            };
+                        } else {
+                            status = "Type to search, then select a result".to_string();
+                        }
+                    }
+                    _ => {}
+                },
+                Focus::Results => match key.code {
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        move_selection(&mut selected, results.len(), 1);
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        move_selection(&mut selected, results.len(), -1);
+                    }
+                    KeyCode::Char('g') if !results.is_empty() => {
+                        selected.select(Some(0));
+                    }
+                    KeyCode::Char('G') if !results.is_empty() => {
+                        selected.select(Some(results.len() - 1));
+                    }
+                    KeyCode::PageDown => move_selection(&mut selected, results.len(), 10),
+                    KeyCode::PageUp => move_selection(&mut selected, results.len(), -10),
+                    KeyCode::Char('o') | KeyCode::Enter => {
+                        if let Some(path) = selected_path(&selected, &results) {
+                            open_file(Path::new(path))?;
+                            record_access_if_indexed(&watch_target, path);
+                            status = format!("opened {path}");
+                        }
+                    }
+                    KeyCode::Char('r') => {
+                        if let Some(path) = selected_path(&selected, &results) {
+                            match finder_reveal.reveal(Path::new(path)) {
+                                Ok(()) => {
+                                    record_access_if_indexed(&watch_target, path);
+                                    status = format!("revealed {path}");
+                                }
+                                Err(error) => {
+                                    status = format!("reveal failed: {error:#}");
+                                }
+                            }
+                        }
+                    }
+                    KeyCode::Char('y') => {
+                        if let Some(path) = selected_path(&selected, &results) {
+                            copy_path(Path::new(path))?;
+                            record_access_if_indexed(&watch_target, path);
+                            status = format!("copied {path}");
+                        }
+                    }
+                    KeyCode::Char('m') => {
+                        mode = mode.next();
+                        results = apply_local_result_options(
+                            &all_results,
+                            &tui_search_options(input.as_str())
+                                .with_mode(mode)
+                                .with_sort(sort)
+                                .with_reverse(reverse)
+                                .with_filters(filters.clone()),
+                        );
+                        results_stamp = results_stamp.wrapping_add(1);
+                        normalize_selection(&mut selected, results.len());
+                        search_state.mark_dirty();
+                        last_edit = Instant::now();
+                        status = format!("mode: {}", mode.label());
+                    }
+                    KeyCode::Char('f') => {
+                        filters = cycle_kind_filter(filters);
+                        results = apply_local_result_options(
+                            &all_results,
+                            &tui_search_options(input.as_str())
+                                .with_mode(mode)
+                                .with_sort(sort)
+                                .with_reverse(reverse)
+                                .with_filters(filters.clone()),
+                        );
+                        results_stamp = results_stamp.wrapping_add(1);
+                        normalize_selection(&mut selected, results.len());
+                        search_state.mark_dirty();
+                        last_edit = Instant::now();
+                        status = "type filter changed".to_string();
+                    }
+                    KeyCode::Char('s') => {
+                        sort = sort.next();
+                        results = apply_local_result_options(
+                            &all_results,
+                            &tui_search_options(input.as_str())
+                                .with_mode(mode)
+                                .with_sort(sort)
+                                .with_reverse(reverse)
+                                .with_filters(filters.clone()),
+                        );
+                        results_stamp = results_stamp.wrapping_add(1);
+                        normalize_selection(&mut selected, results.len());
+                        status = format!("sort: {}", sort.label());
+                    }
+                    KeyCode::Char('S') => {
+                        reverse = toggle_sort_order(reverse);
+                        results = apply_local_result_options(
+                            &all_results,
+                            &tui_search_options(input.as_str())
+                                .with_mode(mode)
+                                .with_sort(sort)
+                                .with_reverse(reverse)
+                                .with_filters(filters.clone()),
+                        );
+                        results_stamp = results_stamp.wrapping_add(1);
+                        normalize_selection(&mut selected, results.len());
+                        status = format!("sort order: {}", sort_label(sort, reverse));
+                    }
+                    KeyCode::Char('t') => {
+                        theme = theme.cycle();
+                        if let Err(error) = theme.persist() {
+                            status = error.to_string();
+                        } else {
+                            status = format!("theme: {}", theme.name.label());
+                        }
+                    }
+                    KeyCode::Char('w') => {
+                        if live_index.is_some() {
+                            live_index = None;
+                            watch_enabled = false;
+                            status = "live watch off".to_string();
+                        } else if let Some((root, db_path)) = watch_target.as_ref() {
+                            match LiveIndex::spawn(root.clone(), db_path.clone()).ok() {
+                                Some(live) => {
+                                    live_generation = live.generation();
+                                    live_index = Some(live);
+                                    watch_enabled = true;
+                                    status =
+                                        "live watch on: index updates as files change".to_string();
+                                }
+                                None => {
+                                    status = "live watch unavailable for this index".to_string();
+                                }
+                            }
+                        } else {
+                            status = "live watch not available in live search mode".to_string();
+                        }
+                    }
+                    KeyCode::Char('?') | KeyCode::F(1) => {
+                        show_help = true;
+                    }
+                    KeyCode::Char('/') | KeyCode::Tab | KeyCode::Esc => {
+                        focus = Focus::Search;
+                    }
+                    KeyCode::Backspace => {
+                        focus = Focus::Search;
+                        if input.backspace() {
                             search_state.mark_dirty();
                             last_edit = Instant::now();
-                            status = format!("mode: {}", mode.label());
-                        }
-                        KeyCode::Char('f') => {
-                            filters = cycle_kind_filter(filters);
-                            results = apply_local_result_options(
-                                &all_results,
-                                &tui_search_options(input.as_str())
-                                    .with_mode(mode)
-                                    .with_sort(sort)
-                                    .with_reverse(reverse)
-                                    .with_filters(filters.clone()),
-                            );
-                            results_stamp = results_stamp.wrapping_add(1);
-                            normalize_selection(&mut selected, results.len());
-                            search_state.mark_dirty();
-                            last_edit = Instant::now();
-                            status = "type filter changed".to_string();
-                        }
-                        KeyCode::Char('s') => {
-                            sort = sort.next();
-                            results = apply_local_result_options(
-                                &all_results,
-                                &tui_search_options(input.as_str())
-                                    .with_mode(mode)
-                                    .with_sort(sort)
-                                    .with_reverse(reverse)
-                                    .with_filters(filters.clone()),
-                            );
-                            results_stamp = results_stamp.wrapping_add(1);
-                            normalize_selection(&mut selected, results.len());
-                            status = format!("sort: {}", sort.label());
-                        }
-                        KeyCode::Char('S') => {
-                            reverse = toggle_sort_order(reverse);
-                            results = apply_local_result_options(
-                                &all_results,
-                                &tui_search_options(input.as_str())
-                                    .with_mode(mode)
-                                    .with_sort(sort)
-                                    .with_reverse(reverse)
-                                    .with_filters(filters.clone()),
-                            );
-                            results_stamp = results_stamp.wrapping_add(1);
-                            normalize_selection(&mut selected, results.len());
-                            status = format!("sort order: {}", sort_label(sort, reverse));
-                        }
-                        KeyCode::Char('t') => {
-                            theme = theme.cycle();
-                            if let Err(error) = theme.persist() {
-                                status = error.to_string();
-                            } else {
-                                status = format!("theme: {}", theme.name.label());
+                            if backend_label == "live" {
+                                all_results.clear();
+                                results.clear();
                             }
+                            normalize_selection(&mut selected, results.len());
+                            status = edit_status(backend_label);
                         }
-                        KeyCode::Char('w') => {
-                            if live_index.is_some() {
-                                live_index = None;
-                                watch_enabled = false;
-                                status = "live watch off".to_string();
-                            } else if let Some((root, db_path)) = watch_target.as_ref() {
-                                match LiveIndex::spawn(root.clone(), db_path.clone()).ok() {
-                                    Some(live) => {
-                                        live_generation = live.generation();
-                                        live_index = Some(live);
-                                        watch_enabled = true;
-                                        status = "live watch on: index updates as files change"
-                                            .to_string();
-                                    }
-                                    None => {
-                                        status =
-                                            "live watch unavailable for this index".to_string();
-                                    }
-                                }
-                            } else {
-                                status = "live watch not available in live search mode".to_string();
-                            }
-                        }
-                        KeyCode::Char('?') | KeyCode::F(1) => {
-                            show_help = true;
-                        }
-                        KeyCode::Char('/') | KeyCode::Tab | KeyCode::Esc => {
-                            focus = Focus::Search;
-                        }
-                        KeyCode::Backspace => {
-                            focus = Focus::Search;
-                            if input.backspace() {
-                                search_state.mark_dirty();
-                                last_edit = Instant::now();
-                                if backend_label == "live" {
-                                    all_results.clear();
-                                    results.clear();
-                                }
-                                normalize_selection(&mut selected, results.len());
-                                status = edit_status(backend_label);
-                            }
-                        }
-                        _ => {}
-                    },
-                }
+                    }
+                    _ => {}
+                },
+            }
+            if let Some(code) = navigation_code {
+                drain_same_direction_input(
+                    &mut input_normalizer,
+                    &mut input_trace,
+                    focus,
+                    &input,
+                    &selected,
+                    code,
+                )?;
             }
         }
     }
+
+    finder_reveal
+        .close()
+        .context("close Finder reveal session")?;
 
     Ok(())
 }
@@ -1951,6 +2244,7 @@ fn cycle_kind_filter(filters: SearchFilters) -> SearchFilters {
 #[cfg(test)]
 mod tests {
     use chrono::{TimeZone, Utc};
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
     use tempfile::tempdir;
 
     use crate::db::{local_db_path_for_root, Database, FileRecord, SearchResult};
@@ -1963,12 +2257,13 @@ mod tests {
         format_result_summary, header_segments, rebuild_row_cache, search_backend_for_directory,
         search_bar_line, search_hybrid, should_show_results, sort_label, spinner_glyph,
         toggle_sort_order, top_chrome_height, top_controls_line, top_status_line,
-        tui_search_options, Focus, RowCache, SearchBackend, SearchInput, SearchRequest,
-        SearchState, SearchWorker, TopPanelArgs, TUI_RESULT_LIMIT,
+        tui_search_options, Focus, InputNormalizer, NavigationBurst, RowCache, SearchBackend,
+        SearchInput, SearchRequest, SearchState, SearchWorker, TopPanelArgs,
+        FRAGMENTED_ESCAPE_WINDOW, TUI_RESULT_LIMIT,
     };
     use ratatui::text::Line;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     fn test_result(
         name: &str,
@@ -2220,6 +2515,93 @@ mod tests {
         input.move_right();
 
         assert_eq!(input.cursor_column(), 6);
+    }
+
+    #[test]
+    fn input_normalizer_reassembles_fragmented_csi_arrow() {
+        let start = Instant::now();
+        let mut normalizer = InputNormalizer::default();
+
+        normalizer.push(
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            start,
+        );
+        normalizer.push(
+            Event::Key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE)),
+            start + Duration::from_millis(1),
+        );
+        normalizer.push(
+            Event::Key(KeyEvent::new(KeyCode::Char('B'), KeyModifiers::SHIFT)),
+            start + Duration::from_millis(2),
+        );
+
+        assert_eq!(
+            normalizer.pop_ready(),
+            Some(Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)))
+        );
+        assert!(normalizer.pop_ready().is_none());
+    }
+
+    #[test]
+    fn input_normalizer_preserves_a_slow_literal_escape_sequence() {
+        let start = Instant::now();
+        let mut normalizer = InputNormalizer::default();
+
+        normalizer.push(
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            start,
+        );
+        normalizer.push(
+            Event::Key(KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE)),
+            start + FRAGMENTED_ESCAPE_WINDOW,
+        );
+        normalizer.push(
+            Event::Key(KeyEvent::new(KeyCode::Char('B'), KeyModifiers::SHIFT)),
+            start + FRAGMENTED_ESCAPE_WINDOW + Duration::from_millis(1),
+        );
+
+        assert_eq!(
+            normalizer.pop_ready(),
+            Some(Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)))
+        );
+        assert_eq!(
+            normalizer.pop_ready(),
+            Some(Event::Key(KeyEvent::new(
+                KeyCode::Char('['),
+                KeyModifiers::NONE
+            )))
+        );
+        assert_eq!(
+            normalizer.pop_ready(),
+            Some(Event::Key(KeyEvent::new(
+                KeyCode::Char('B'),
+                KeyModifiers::SHIFT
+            )))
+        );
+    }
+
+    #[test]
+    fn navigation_burst_accepts_one_event_per_ratchet() {
+        let start = Instant::now();
+        let mut burst = NavigationBurst::default();
+
+        assert!(burst.accepts(KeyCode::Down, start));
+        assert!(!burst.accepts(KeyCode::Down, start + Duration::from_millis(3)));
+        assert!(!burst.accepts(KeyCode::Down, start + Duration::from_millis(49)));
+        assert!(!burst.accepts(KeyCode::Down, start + Duration::from_millis(50)));
+        assert!(burst.accepts(KeyCode::Down, start + Duration::from_millis(100)));
+    }
+
+    #[test]
+    fn navigation_burst_allows_direction_changes_and_resets() {
+        let start = Instant::now();
+        let mut burst = NavigationBurst::default();
+
+        assert!(burst.accepts(KeyCode::Down, start));
+        assert!(burst.accepts(KeyCode::Up, start + Duration::from_millis(3)));
+        assert!(!burst.accepts(KeyCode::Up, start + Duration::from_millis(4)));
+        burst.reset();
+        assert!(burst.accepts(KeyCode::Up, start + Duration::from_millis(5)));
     }
 
     #[test]
