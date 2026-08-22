@@ -1,9 +1,8 @@
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
-use crate::db::{sort_results, SearchResult};
+use crate::db::{sort_results, SearchBatch, SearchResult, SEARCH_BATCH_SIZE};
 use crate::query::{CompiledQuery, QueryScorer, SearchFilters, SearchOptions};
 use crate::scanner::{kind_for, pruned_walk, system_time_to_utc};
 
@@ -31,16 +30,17 @@ pub fn search_live_with_options(
     root: impl AsRef<Path>,
     options: &SearchOptions,
 ) -> Result<Vec<SearchResult>> {
-    let mut results = Vec::new();
-    search_live_streaming_with_options(
+    let (status, mut results) = search_live_streaming_batches_with_limit(
         root,
         options,
+        Some(options.limit),
         || false,
-        |_| {},
-        |partial| {
-            results = partial.to_vec();
-        },
+        |_| Ok(()),
     )?;
+    if matches!(status, LiveSearchStatus::Cancelled) {
+        return Ok(Vec::new());
+    }
+    results.truncate(options.limit);
     Ok(results)
 }
 
@@ -49,11 +49,25 @@ pub fn search_live_streaming(
     query: &str,
     options: LiveSearchOptions,
     should_cancel: impl FnMut() -> bool,
-    on_match: impl FnMut(&[SearchResult]),
-    on_partial: impl FnMut(&[SearchResult]),
+    mut on_match: impl FnMut(&[SearchResult]),
+    mut on_partial: impl FnMut(&[SearchResult]),
 ) -> Result<LiveSearchStatus> {
     let search_options = SearchOptions::new(query).with_limit(options.limit);
-    search_live_streaming_with_options(root, &search_options, should_cancel, on_match, on_partial)
+    let (status, final_results) = search_live_streaming_batches_with_limit(
+        root,
+        &search_options,
+        Some(options.limit),
+        should_cancel,
+        |batch| {
+            on_match(&batch.results);
+            on_partial(&batch.results);
+            Ok(())
+        },
+    )?;
+    if matches!(status, LiveSearchStatus::Complete) {
+        on_partial(&final_results);
+    }
+    Ok(status)
 }
 
 pub fn search_live_streaming_with_options(
@@ -63,30 +77,64 @@ pub fn search_live_streaming_with_options(
     mut on_match: impl FnMut(&[SearchResult]),
     mut on_partial: impl FnMut(&[SearchResult]),
 ) -> Result<LiveSearchStatus> {
+    let (status, final_results) = search_live_streaming_batches_with_limit(
+        root,
+        options,
+        Some(options.limit),
+        &mut should_cancel,
+        |batch| {
+            on_match(&batch.results);
+            on_partial(&batch.results);
+            Ok(())
+        },
+    )?;
+    if matches!(status, LiveSearchStatus::Complete) {
+        on_partial(&final_results);
+    }
+    Ok(status)
+}
+
+/// Uncapped live search used by the interactive worker. The callback receives
+/// ownership of each completed 500-result delta, while the returned vector is
+/// the single final ordering used by the completion update.
+pub(crate) fn search_live_streaming_batches_with_options(
+    root: impl AsRef<Path>,
+    options: &SearchOptions,
+    should_cancel: impl FnMut() -> bool,
+    on_batch: impl FnMut(SearchBatch) -> Result<()>,
+) -> Result<(LiveSearchStatus, Vec<SearchResult>)> {
+    search_live_streaming_batches_with_limit(root, options, None, should_cancel, on_batch)
+}
+
+fn search_live_streaming_batches_with_limit(
+    root: impl AsRef<Path>,
+    options: &SearchOptions,
+    max_results: Option<usize>,
+    mut should_cancel: impl FnMut() -> bool,
+    mut on_batch: impl FnMut(SearchBatch) -> Result<()>,
+) -> Result<(LiveSearchStatus, Vec<SearchResult>)> {
     options.validate()?;
-    if options.limit == 0 {
-        on_partial(&[]);
-        return Ok(LiveSearchStatus::Complete);
+    if max_results == Some(0) {
+        return Ok((LiveSearchStatus::Complete, Vec::new()));
     }
 
     let needle = normalize_query(&options.query);
     if needle.is_empty() {
-        on_partial(&[]);
-        return Ok(LiveSearchStatus::Complete);
+        return Ok((LiveSearchStatus::Complete, Vec::new()));
     }
 
     let root = root
         .as_ref()
         .canonicalize()
         .with_context(|| format!("resolve live search root {}", root.as_ref().display()))?;
-    let mut results = Vec::with_capacity(options.limit.min(50));
-    let mut last_partial = Instant::now();
+    let mut results = Vec::new();
+    let mut batch = Vec::with_capacity(SEARCH_BATCH_SIZE);
     let compiled = CompiledQuery::compile(options.mode, &options.query)?;
     let mut scorer = QueryScorer::new();
 
     for entry in pruned_walk(&root) {
         if should_cancel() {
-            return Ok(LiveSearchStatus::Cancelled);
+            return Ok((LiveSearchStatus::Cancelled, Vec::new()));
         }
 
         let entry = match entry {
@@ -113,24 +161,30 @@ pub fn search_live_streaming_with_options(
         if !compiled.matches_any(&mut scorer, [result.name.as_str(), result.path.as_str()]) {
             continue;
         }
-        results.push(result);
-        sort_results(&mut results, options);
-        on_match(&results);
-
-        if results.len() >= options.limit {
-            on_partial(&results);
-            return Ok(LiveSearchStatus::Complete);
+        if max_results.is_some_and(|limit| results.len() >= limit) {
+            break;
         }
-
-        if results.len() <= 10 || last_partial.elapsed() >= Duration::from_millis(100) {
-            on_partial(&results);
-            last_partial = Instant::now();
+        batch.push(result.clone());
+        results.push(result);
+        if batch.len() == SEARCH_BATCH_SIZE {
+            on_batch(SearchBatch {
+                results: std::mem::replace(&mut batch, Vec::with_capacity(SEARCH_BATCH_SIZE)),
+                count: results.len(),
+            })?;
+        }
+        if max_results.is_some_and(|limit| results.len() >= limit) {
+            break;
         }
     }
 
+    if !batch.is_empty() {
+        on_batch(SearchBatch {
+            results: batch,
+            count: results.len(),
+        })?;
+    }
     sort_results(&mut results, options);
-    on_partial(&results);
-    Ok(LiveSearchStatus::Complete)
+    Ok((LiveSearchStatus::Complete, results))
 }
 
 fn result_from_path(path: PathBuf, name: String) -> Option<SearchResult> {
@@ -219,4 +273,40 @@ fn matches_filters(result: &SearchResult, filters: &SearchFilters) -> bool {
         }
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::query::SortField;
+
+    #[test]
+    fn streaming_live_search_emits_uncapped_500_item_deltas() {
+        let dir = tempdir().expect("create temp directory");
+        for index in 0..1_001 {
+            let path = dir.path().join(format!("needle-{index:04}.txt"));
+            std::fs::write(path, b"match").expect("write match");
+        }
+
+        let options = SearchOptions::new("needle").with_sort(SortField::Name);
+        let mut batch_sizes = Vec::new();
+        let (status, results) = search_live_streaming_batches_with_options(
+            dir.path(),
+            &options,
+            || false,
+            |batch| {
+                batch_sizes.push(batch.results.len());
+                assert!(batch.results.len() <= SEARCH_BATCH_SIZE);
+                Ok(())
+            },
+        )
+        .expect("stream live matches");
+
+        assert_eq!(status, LiveSearchStatus::Complete);
+        assert_eq!(batch_sizes, vec![SEARCH_BATCH_SIZE, SEARCH_BATCH_SIZE, 1]);
+        assert_eq!(results.len(), 1_001);
+        assert!(results.windows(2).all(|pair| pair[0].name <= pair[1].name));
+    }
 }

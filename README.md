@@ -82,6 +82,8 @@ irm https://raw.githubusercontent.com/NotTanJune/locator/main/install.ps1 | iex
 
 If no index exists, `lctr search` uses live filesystem search. If an interrupted scan left an incomplete index, `lctr search` uses hybrid search: indexed results first, then live search for paths missing from the partial index.
 
+Interactive searches are uncapped and arrive in 500-result batches. Indexed results keep their final ranking as batches arrive. Live and hybrid searches show discovered paths immediately, then apply one final global reorder when discovery completes. The result list renders only its visible viewport, so navigation remains responsive with large result sets.
+
 Cargo-installed binaries download the matching prebuilt GitHub release archive when `lctr update` runs, so updates do not rebuild the Rust dependency graph locally. Homebrew and WinGet installations continue to update through their package managers.
 
 ## Privacy
@@ -197,7 +199,7 @@ LCTR_DATA_DIR=/tmp/locator-data lctr scan /tmp/files
 
 The TUI has two focuses: **Search** (default) and **Results**. The footer shows the live keys for the current focus.
 
-**Search focus** (active on open — type freely):
+**Search focus** (active on open, type freely):
 
 ```text
 type   filter results

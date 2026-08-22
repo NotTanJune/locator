@@ -40,6 +40,27 @@ pub struct SearchResult {
     pub modified_at: Option<DateTime<Utc>>,
 }
 
+pub(crate) const SEARCH_BATCH_SIZE: usize = 500;
+
+/// A completed chunk of search results. The count is the number of results
+/// emitted by the search so far, not the number of rows examined.
+#[derive(Debug)]
+pub(crate) struct SearchBatch {
+    pub results: Vec<SearchResult>,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SearchStreamStatus {
+    Complete { count: usize },
+    Cancelled,
+}
+
+struct IndexedSearchCandidate {
+    result: SearchResult,
+    frecency: u32,
+}
+
 pub struct Database {
     conn: Connection,
     path: Option<PathBuf>,
@@ -574,6 +595,128 @@ impl Database {
         let results = self.hydrate_search_results(results)?;
         timing.finish(candidate_count, matched_count);
         Ok(results)
+    }
+
+    /// Search the complete indexed result set for the interactive UI.
+    ///
+    /// The public limited search APIs intentionally remain separate from this
+    /// path. Candidates are filtered and globally ordered while they are still
+    /// lightweight index metadata, then hydrated in bounded batches so the UI
+    /// can render progress without changing the final indexed order.
+    pub(crate) fn search_streaming_with_options(
+        &self,
+        options: &SearchOptions,
+        mut should_cancel: impl FnMut() -> bool,
+        mut on_batch: impl FnMut(SearchBatch) -> Result<()>,
+    ) -> Result<SearchStreamStatus> {
+        options.validate()?;
+        if options.limit == 0 {
+            return Ok(SearchStreamStatus::Complete { count: 0 });
+        }
+
+        let has_access_table = self
+            .conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'access'",
+                [],
+                |_| Ok(true),
+            )
+            .optional()?
+            .unwrap_or(false);
+        let mut sql = if has_access_table {
+            String::from(
+                "SELECT f.path, f.name, f.extension, f.kind, f.size_bytes, f.created_at, f.modified_at,
+                        COALESCE(a.open_count, 0), a.last_opened_at
+                 FROM files f
+                 LEFT JOIN access a ON a.path = f.path
+                 WHERE f.deleted = 0",
+            )
+        } else {
+            String::from(
+                "SELECT f.path, f.name, f.extension, f.kind, f.size_bytes, f.created_at, f.modified_at,
+                        0, NULL
+                 FROM files f
+                 WHERE f.deleted = 0",
+            )
+        };
+        let mut values = Vec::<rusqlite::types::Value>::new();
+        apply_query_mode_sql(&mut sql, &mut values, options);
+        apply_filter_sql(&mut sql, &mut values, &options.filters);
+        apply_sort_sql_without_limit(&mut sql, options);
+
+        let timing = SearchTiming::start();
+        let mut stmt = self.conn.prepare(&sql)?;
+        let now = Utc::now().timestamp();
+        let rows = stmt.query_map(rusqlite::params_from_iter(values), |row| {
+            indexed_search_candidate_from_row(row, now)
+        })?;
+        let mut candidates = Vec::new();
+        let mut candidate_count = 0;
+        let compiled = CompiledQuery::compile(options.mode, &options.query)?;
+        let mut scorer = QueryScorer::new();
+
+        for row in rows {
+            if should_cancel() {
+                return Ok(SearchStreamStatus::Cancelled);
+            }
+            let candidate = row.context("read indexed search candidate")?;
+            candidate_count += 1;
+            if compiled.matches_any(
+                &mut scorer,
+                [
+                    candidate.result.name.as_str(),
+                    candidate.result.path.as_str(),
+                ],
+            ) {
+                candidates.push(candidate);
+            }
+        }
+        drop(stmt);
+        timing.lap("sql+filter");
+
+        let matched_count = candidates.len();
+        let mut results = Vec::with_capacity(matched_count);
+        let mut frecency = HashMap::new();
+        for candidate in candidates {
+            if candidate.frecency > 0 {
+                frecency.insert(candidate.result.path.clone(), candidate.frecency);
+            }
+            results.push(candidate.result);
+        }
+
+        sort_results_compiled(&mut results, options, &compiled, &mut scorer, &frecency);
+        timing.lap("sort");
+
+        let mut hydrated_batch = Vec::with_capacity(SEARCH_BATCH_SIZE);
+        let mut emitted = 0;
+        for result in results {
+            if should_cancel() {
+                return Ok(SearchStreamStatus::Cancelled);
+            }
+            if let Some(result) = self.hydrate_search_result(result)? {
+                hydrated_batch.push(result);
+                if hydrated_batch.len() == SEARCH_BATCH_SIZE {
+                    emitted += hydrated_batch.len();
+                    on_batch(SearchBatch {
+                        results: std::mem::replace(
+                            &mut hydrated_batch,
+                            Vec::with_capacity(SEARCH_BATCH_SIZE),
+                        ),
+                        count: emitted,
+                    })?;
+                }
+            }
+        }
+        if !hydrated_batch.is_empty() {
+            emitted += hydrated_batch.len();
+            on_batch(SearchBatch {
+                results: hydrated_batch,
+                count: emitted,
+            })?;
+        }
+
+        timing.finish(candidate_count, matched_count);
+        Ok(SearchStreamStatus::Complete { count: emitted })
     }
 
     pub fn search_interactive(&self, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
@@ -1337,6 +1480,17 @@ fn search_result_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SearchRes
     })
 }
 
+fn indexed_search_candidate_from_row(
+    row: &rusqlite::Row<'_>,
+    now: i64,
+) -> rusqlite::Result<IndexedSearchCandidate> {
+    let result = search_result_from_row(row)?;
+    let open_count = row.get::<_, i64>(7)?.max(0) as u32;
+    let last_opened_at = row.get::<_, Option<i64>>(8)?;
+    let frecency = frecency_weight(open_count, last_opened_at, now);
+    Ok(IndexedSearchCandidate { result, frecency })
+}
+
 impl Database {
     fn hydrate_search_results(&self, results: Vec<SearchResult>) -> Result<Vec<SearchResult>> {
         let mut hydrated = Vec::with_capacity(results.len());
@@ -1490,29 +1644,32 @@ fn apply_query_mode_sql(
 }
 
 fn apply_sort_sql(sql: &mut String, options: &SearchOptions) {
+    apply_sort_sql_without_limit(sql, options);
+    sql.push_str(" LIMIT ?");
+}
+
+fn apply_sort_sql_without_limit(sql: &mut String, options: &SearchOptions) {
     let direction = if options.reverse { "DESC" } else { "ASC" };
     match options.sort {
         SortField::Relevance => {
-            sql.push_str(" ORDER BY f.modified_at DESC NULLS LAST, f.name_lower ASC LIMIT ?");
+            sql.push_str(" ORDER BY f.modified_at DESC NULLS LAST, f.name_lower ASC");
         }
-        SortField::Name => sql.push_str(&format!(" ORDER BY f.name_lower {direction} LIMIT ?")),
-        SortField::Path => sql.push_str(&format!(" ORDER BY f.path {direction} LIMIT ?")),
-        SortField::Kind => sql.push_str(&format!(
-            " ORDER BY f.kind {direction}, f.name_lower ASC LIMIT ?"
-        )),
+        SortField::Name => sql.push_str(&format!(" ORDER BY f.name_lower {direction}")),
+        SortField::Path => sql.push_str(&format!(" ORDER BY f.path {direction}")),
+        SortField::Kind => sql.push_str(&format!(" ORDER BY f.kind {direction}, f.name_lower ASC")),
         SortField::Size => {
             sql.push_str(&format!(
-                " ORDER BY f.size_bytes {direction}, f.name_lower ASC LIMIT ?"
+                " ORDER BY f.size_bytes {direction}, f.name_lower ASC"
             ));
         }
         SortField::Created => {
             sql.push_str(&format!(
-                " ORDER BY f.created_at {direction} NULLS LAST, f.name_lower ASC LIMIT ?"
+                " ORDER BY f.created_at {direction} NULLS LAST, f.name_lower ASC"
             ));
         }
         SortField::Modified => {
             sql.push_str(&format!(
-                " ORDER BY f.modified_at {direction} NULLS LAST, f.name_lower ASC LIMIT ?"
+                " ORDER BY f.modified_at {direction} NULLS LAST, f.name_lower ASC"
             ));
         }
     }
@@ -1760,5 +1917,64 @@ fn relevance_score(result: &SearchResult, query: &str) -> u8 {
         3
     } else {
         4
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use tempfile::tempdir;
+
+    use super::*;
+    use crate::query::SortField;
+
+    #[test]
+    fn streaming_search_emits_every_match_in_500_item_batches() {
+        let dir = tempdir().expect("create temp directory");
+        let db = Database::open_in_memory().expect("open database");
+        let mut records = Vec::with_capacity(5_501);
+
+        for index in 0..5_501 {
+            let name = format!("needle-{index:05}.txt");
+            let path = dir.path().join(&name);
+            std::fs::write(&path, b"match").expect("write match");
+            records.push(FileRecord {
+                path: path.to_string_lossy().to_string(),
+                name,
+                parent: dir.path().to_string_lossy().to_string(),
+                extension: Some("txt".to_string()),
+                root: dir.path().to_string_lossy().to_string(),
+                volume: "local".to_string(),
+                kind: "text".to_string(),
+                size_bytes: 5,
+                created_at: None,
+                modified_at: None,
+            });
+        }
+        db.upsert_files(&records).expect("insert matches");
+
+        let options = SearchOptions::new("needle").with_sort(SortField::Name);
+        let mut batch_sizes = Vec::new();
+        let mut paths = Vec::new();
+        let status = db
+            .search_streaming_with_options(
+                &options,
+                || false,
+                |batch| {
+                    batch_sizes.push(batch.results.len());
+                    paths.extend(batch.results.into_iter().map(|result| result.path));
+                    Ok(())
+                },
+            )
+            .expect("stream indexed matches");
+
+        let mut expected_sizes = vec![SEARCH_BATCH_SIZE; 11];
+        expected_sizes.push(1);
+        assert_eq!(batch_sizes, expected_sizes);
+        assert_eq!(status, SearchStreamStatus::Complete { count: 5_501 });
+        assert_eq!(paths.len(), 5_501);
+        assert_eq!(paths.iter().collect::<HashSet<_>>().len(), 5_501);
+        assert!(paths.windows(2).all(|pair| pair[0] < pair[1]));
     }
 }

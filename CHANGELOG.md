@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.4
+
+- Removed the interactive 1,000-result ceiling and stream all valid indexed, live, and hybrid matches in 500-result batches.
+- Added request-aware progressive search updates, cancellation of stale searches, selection preservation, and viewport-only result rendering.
+- Added an Apple silicon Finder reveal worker using compiled `NSAppleScript` automation and descriptor arguments.
+- Added a selected-row and total-results footer counter.
+- Fixed fragmented mouse packets entering the search field and eliminated free-spin direction-reversal latency.
+- Fixed Finder reveal panics and delayed Apple-event completion on Apple silicon.
+
 ## 0.1.59
 
 - Switched stable Homebrew installs on Apple silicon macOS to the prebuilt release binary.

@@ -1,5 +1,15 @@
 use std::path::Path;
+#[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+use std::path::PathBuf;
+#[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+use std::sync::mpsc::{self, Receiver, Sender};
+#[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+use std::thread;
+#[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+use std::time::Duration;
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+use anyhow::anyhow;
 use anyhow::{bail, Context, Result};
 
 pub fn open_file(path: &Path) -> Result<()> {
@@ -12,26 +22,55 @@ pub fn open_file(path: &Path) -> Result<()> {
 
 /// Owns one Finder window created by a single TUI search session.
 pub struct FinderRevealSession {
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(any(test, all(target_os = "macos", not(target_arch = "aarch64"))))]
     automation: Box<dyn FinderAutomation>,
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(any(test, all(target_os = "macos", not(target_arch = "aarch64"))))]
     window_id: Option<u64>,
+    #[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+    apple: AppleFinderSession,
 }
 
 impl FinderRevealSession {
     pub fn new() -> Self {
-        Self {
-            #[cfg(any(target_os = "macos", test))]
-            automation: Box::new(OsascriptAutomation),
-            #[cfg(any(target_os = "macos", test))]
-            window_id: None,
+        #[cfg(any(test, all(target_os = "macos", not(target_arch = "aarch64"))))]
+        {
+            Self {
+                automation: Box::new(OsascriptAutomation),
+                window_id: None,
+            }
+        }
+
+        #[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+        {
+            Self {
+                apple: AppleFinderSession::new(),
+            }
+        }
+
+        #[cfg(all(not(target_os = "macos"), not(test)))]
+        {
+            Self {}
         }
     }
 
     pub fn reveal(&mut self, path: &Path) -> Result<()> {
-        #[cfg(any(target_os = "macos", test))]
+        #[cfg(any(test, all(target_os = "macos", not(target_arch = "aarch64"))))]
         {
             self.reveal_with_finder(path)
+        }
+
+        #[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+        {
+            let target = path.to_path_buf();
+            self.request_reveal(path)?;
+            loop {
+                if let Some(response) = self.try_reveal_response() {
+                    if response.path == target {
+                        return response.result.map_err(|error| anyhow!(error));
+                    }
+                }
+                thread::sleep(Duration::from_millis(1));
+            }
         }
 
         #[cfg(all(not(target_os = "macos"), not(test)))]
@@ -42,7 +81,7 @@ impl FinderRevealSession {
 
     /// Closes only this session's dedicated Finder window.
     pub fn close(&mut self) -> Result<()> {
-        #[cfg(any(target_os = "macos", test))]
+        #[cfg(any(test, all(target_os = "macos", not(target_arch = "aarch64"))))]
         {
             let Some(window_id) = self.window_id.take() else {
                 return Ok(());
@@ -59,13 +98,18 @@ impl FinderRevealSession {
             bail!("close Finder window {window_id}: unexpected osascript output {response:?}");
         }
 
+        #[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+        {
+            self.apple.close()
+        }
+
         #[cfg(all(not(target_os = "macos"), not(test)))]
         {
             Ok(())
         }
     }
 
-    #[cfg(any(target_os = "macos", test))]
+    #[cfg(any(test, all(target_os = "macos", not(target_arch = "aarch64"))))]
     fn reveal_with_finder(&mut self, path: &Path) -> Result<()> {
         if let Some(window_id) = self.window_id {
             let output = self
@@ -129,7 +173,332 @@ impl Drop for FinderRevealSession {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+pub(crate) struct FinderRevealResponse {
+    pub(crate) path: PathBuf,
+    pub(crate) result: std::result::Result<(), String>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+enum AppleFinderCommand {
+    Reveal {
+        path: PathBuf,
+        window_id: Option<u64>,
+    },
+    Close {
+        window_id: u64,
+    },
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+enum AppleFinderReply {
+    Reveal {
+        path: PathBuf,
+        result: std::result::Result<u64, String>,
+    },
+    Close {
+        result: std::result::Result<(), String>,
+    },
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+struct AppleFinderSession {
+    command_tx: Sender<AppleFinderCommand>,
+    reply_rx: Receiver<AppleFinderReply>,
+    active: bool,
+    pending: Option<PathBuf>,
+    window_id: Option<u64>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+impl AppleFinderSession {
+    fn new() -> Self {
+        initialize_apple_event_runtime();
+        let (command_tx, command_rx) = mpsc::channel();
+        let (reply_tx, reply_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let script = compile_finder_script();
+            while let Ok(command) = command_rx.recv() {
+                let reply = match command {
+                    AppleFinderCommand::Reveal { path, window_id } => {
+                        let result = match &script {
+                            Ok(script) => run_finder_script(script, 1, window_id, Some(&path)),
+                            Err(error) => Err(error.clone()),
+                        };
+                        AppleFinderReply::Reveal { path, result }
+                    }
+                    AppleFinderCommand::Close { window_id } => {
+                        let result = match &script {
+                            Ok(script) => {
+                                run_finder_script(script, 2, Some(window_id), None).map(|_| ())
+                            }
+                            Err(error) => Err(error.clone()),
+                        };
+                        AppleFinderReply::Close { result }
+                    }
+                };
+                if reply_tx.send(reply).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            command_tx,
+            reply_rx,
+            active: false,
+            pending: None,
+            window_id: None,
+        }
+    }
+
+    fn dispatch_reveal(&mut self, path: PathBuf) -> Result<()> {
+        self.command_tx
+            .send(AppleFinderCommand::Reveal {
+                path,
+                window_id: self.window_id,
+            })
+            .context("queue Finder reveal")?;
+        self.active = true;
+        Ok(())
+    }
+
+    fn request_reveal(&mut self, path: &Path) -> Result<()> {
+        if self.active {
+            self.pending = Some(path.to_path_buf());
+            return Ok(());
+        }
+        self.dispatch_reveal(path.to_path_buf())
+    }
+
+    fn is_pending(&self) -> bool {
+        self.active || self.pending.is_some()
+    }
+
+    fn handle_reveal_reply(
+        &mut self,
+        path: PathBuf,
+        result: std::result::Result<u64, String>,
+    ) -> FinderRevealResponse {
+        self.active = false;
+        let result = result.map(|window_id| {
+            self.window_id = Some(window_id);
+        });
+        if let Some(pending) = self.pending.take() {
+            let _ = self.dispatch_reveal(pending);
+        }
+        FinderRevealResponse {
+            path,
+            result: result.map(|_| ()),
+        }
+    }
+
+    fn try_reveal_response(&mut self) -> Option<FinderRevealResponse> {
+        match self.reply_rx.try_recv().ok()? {
+            AppleFinderReply::Reveal { path, result } => {
+                Some(self.handle_reveal_reply(path, result))
+            }
+            AppleFinderReply::Close { .. } => None,
+        }
+    }
+
+    fn close(&mut self) -> Result<()> {
+        self.pending = None;
+        while self.active {
+            let reply = self.reply_rx.recv().context("receive Finder reveal")?;
+            if let AppleFinderReply::Reveal { path, result } = reply {
+                let _ = self.handle_reveal_reply(path, result);
+            }
+        }
+
+        let Some(window_id) = self.window_id.take() else {
+            return Ok(());
+        };
+        self.command_tx
+            .send(AppleFinderCommand::Close { window_id })
+            .context("queue Finder window close")?;
+        match self
+            .reply_rx
+            .recv()
+            .context("receive Finder window close")?
+        {
+            AppleFinderReply::Close { result } => result.map_err(|error| anyhow!(error)),
+            AppleFinderReply::Reveal { .. } => {
+                bail!("Finder returned a reveal while closing window {window_id}")
+            }
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+fn initialize_apple_event_runtime() {
+    use objc2::rc::autoreleasepool;
+    use objc2_foundation::NSAppleEventDescriptor;
+
+    autoreleasepool(|_| {
+        let _ = NSAppleEventDescriptor::nullDescriptor();
+    });
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+impl FinderRevealSession {
+    pub(crate) fn request_reveal(&mut self, path: &Path) -> Result<()> {
+        self.apple.request_reveal(path)
+    }
+
+    pub(crate) fn try_reveal_response(&mut self) -> Option<FinderRevealResponse> {
+        self.apple.try_reveal_response()
+    }
+
+    pub(crate) fn reveal_pending(&self) -> bool {
+        self.apple.is_pending()
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+const APPLE_FINDER_SCRIPT: &str = r#"
+on locatorReveal(operation, existingWindowID, filePath)
+    set operation to operation as integer
+    set existingWindowID to existingWindowID as integer
+    tell application "Finder"
+        if operation is 1 then
+            set itemRef to POSIX file filePath as alias
+            set parentRef to container of itemRef
+            if existingWindowID is 0 then
+                open parentRef
+                set finderWindow to front window
+            else
+                try
+                    set finderWindow to window id existingWindowID
+                on error
+                    open parentRef
+                    set finderWindow to front window
+                end try
+            end if
+            set target of finderWindow to parentRef
+            set index of finderWindow to 1
+            activate
+            select itemRef
+            return id of finderWindow
+        else
+            try
+                close window id existingWindowID
+            on error
+                return 0
+            end try
+            return 0
+        end if
+    end tell
+end locatorReveal
+"#;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+fn compile_finder_script() -> Result<objc2::rc::Retained<objc2_foundation::NSAppleScript>, String> {
+    use objc2::AnyThread;
+    use objc2_foundation::{NSAppleScript, NSString};
+
+    let source = NSString::from_str(APPLE_FINDER_SCRIPT);
+    let Some(script) = NSAppleScript::initWithSource(NSAppleScript::alloc(), &source) else {
+        return Err("allocate NSAppleScript".to_string());
+    };
+    let mut error = None;
+    let compiled = unsafe { script.compileAndReturnError(Some(&mut error)) };
+    if compiled {
+        Ok(script)
+    } else {
+        Err(format_apple_error(error))
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+fn run_finder_script(
+    script: &objc2_foundation::NSAppleScript,
+    operation: i32,
+    window_id: Option<u64>,
+    path: Option<&Path>,
+) -> std::result::Result<u64, String> {
+    use objc2::rc::{autoreleasepool, Retained};
+    use objc2::{msg_send, ClassType};
+    use objc2_foundation::{NSAppleEventDescriptor, NSDictionary, NSString};
+
+    autoreleasepool(|_| {
+        let arguments = NSAppleEventDescriptor::listDescriptor();
+        let operation = NSAppleEventDescriptor::descriptorWithInt32(operation);
+        arguments.insertDescriptor_atIndex(&operation, 1);
+        let window = NSAppleEventDescriptor::descriptorWithInt32(
+            window_id.unwrap_or(0).min(i32::MAX as u64) as i32,
+        );
+        arguments.insertDescriptor_atIndex(&window, 2);
+        let path = path.map_or_else(String::new, |path| path.to_string_lossy().into_owned());
+        let path = NSString::from_str(&path);
+        let path = NSAppleEventDescriptor::descriptorWithString(&path);
+        arguments.insertDescriptor_atIndex(&path, 3);
+
+        let event: objc2::rc::Retained<NSAppleEventDescriptor> = unsafe {
+            msg_send![
+                NSAppleEventDescriptor::class(),
+                appleEventWithEventClass: fourcc(*b"ascr"),
+                eventID: fourcc(*b"psbr"),
+                targetDescriptor: Option::<&NSAppleEventDescriptor>::None,
+                returnID: -1i16,
+                transactionID: 0i32
+            ]
+        };
+        let _: () = unsafe {
+            msg_send![
+                &*event,
+                setParamDescriptor: &*arguments,
+                forKeyword: fourcc(*b"----")
+            ]
+        };
+        let handler_name = NSString::from_str("locatorReveal");
+        let handler_name = NSAppleEventDescriptor::descriptorWithString(&handler_name);
+        let _: () = unsafe {
+            msg_send![
+                &*event,
+                setParamDescriptor: &*handler_name,
+                forKeyword: fourcc(*b"snam")
+            ]
+        };
+        let mut error: Option<Retained<NSDictionary<NSString, objc2::runtime::AnyObject>>> = None;
+        let response: Option<Retained<NSAppleEventDescriptor>> = unsafe {
+            msg_send![
+                script,
+                executeAppleEvent: &*event,
+                error: Some(&mut error)
+            ]
+        };
+        if let Some(error) = error {
+            return Err(format_apple_error(Some(error)));
+        }
+        let Some(response) = response else {
+            return Err("AppleScript returned no result and no error details".to_string());
+        };
+        Ok(response.int32Value().max(0) as u64)
+    })
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+fn format_apple_error(
+    error: Option<
+        objc2::rc::Retained<
+            objc2_foundation::NSDictionary<objc2_foundation::NSString, objc2::runtime::AnyObject>,
+        >,
+    >,
+) -> String {
+    error
+        .map(|error| format!("{error:?}"))
+        .unwrap_or_else(|| "unknown AppleScript error".to_string())
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+const fn fourcc(value: [u8; 4]) -> u32 {
+    ((value[0] as u32) << 24)
+        | ((value[1] as u32) << 16)
+        | ((value[2] as u32) << 8)
+        | value[3] as u32
+}
+
+#[cfg(any(test, all(target_os = "macos", not(target_arch = "aarch64"))))]
 const CREATE_WINDOW_SCRIPT: &str = r#"
 on run argv
     set filePath to item 1 of argv
@@ -147,7 +516,7 @@ on run argv
 end run
 "#;
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(test, all(target_os = "macos", not(target_arch = "aarch64"))))]
 const RETARGET_WINDOW_SCRIPT: &str = r#"
 on run argv
     set filePath to item 1 of argv
@@ -169,7 +538,7 @@ on run argv
 end run
 "#;
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(test, all(target_os = "macos", not(target_arch = "aarch64"))))]
 const CLOSE_WINDOW_SCRIPT: &str = r#"
 on run argv
     set windowID to (item 1 of argv) as integer
@@ -184,22 +553,22 @@ on run argv
 end run
 "#;
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(test, all(target_os = "macos", not(target_arch = "aarch64"))))]
 struct AutomationOutput {
     success: bool,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(test, all(target_os = "macos", not(target_arch = "aarch64"))))]
 trait FinderAutomation {
     fn run(&mut self, source: &str, args: &[std::ffi::OsString]) -> Result<AutomationOutput>;
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(test, all(target_os = "macos", not(target_arch = "aarch64"))))]
 struct OsascriptAutomation;
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(test, all(target_os = "macos", not(target_arch = "aarch64"))))]
 impl FinderAutomation for OsascriptAutomation {
     fn run(&mut self, source: &str, args: &[std::ffi::OsString]) -> Result<AutomationOutput> {
         let output = std::process::Command::new("/usr/bin/osascript")
@@ -216,7 +585,7 @@ impl FinderAutomation for OsascriptAutomation {
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(test, all(target_os = "macos", not(target_arch = "aarch64"))))]
 fn ensure_success(output: &AutomationOutput, action: &str) -> Result<()> {
     if output.success {
         return Ok(());
@@ -225,14 +594,14 @@ fn ensure_success(output: &AutomationOutput, action: &str) -> Result<()> {
     bail!("{action}: osascript failed: {stderr}");
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(test, all(target_os = "macos", not(target_arch = "aarch64"))))]
 fn stdout_text(output: &AutomationOutput, action: &str) -> Result<String> {
     String::from_utf8(output.stdout.clone())
         .with_context(|| format!("{action}: osascript returned non-UTF-8 output"))
         .map(|text| text.trim().to_string())
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(test, all(target_os = "macos", not(target_arch = "aarch64"))))]
 fn parse_window_id(response: &str, path: &Path) -> Result<u64> {
     response.parse::<u64>().with_context(|| {
         format!(

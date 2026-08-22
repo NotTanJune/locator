@@ -1,3 +1,28 @@
+# lctr v0.3.4
+
+A responsiveness and scale release for large searches, Apple-silicon input, and Finder reveal.
+
+## Highlights
+
+- Interactive indexed, live, and hybrid searches are now uncapped and stream every valid match in 500-result batches.
+- Indexed results retain stable global ordering. Live and hybrid searches show discovery batches immediately, then apply one final ordering while preserving the selected path.
+- Result rendering is viewport-only, keeping navigation work independent of the total result count.
+- The footer now shows the selected row and total count, such as `25/2,049`.
+
+## Apple silicon
+
+- Arrow keys, `j`/`k`, and mouse-wheel events move exactly one row without the previous input throttle.
+- Free-spin wheel bursts are drained before one redraw, so immediate direction reversals no longer wait behind queued events.
+- Fragmented SGR mouse packets are reconstructed or discarded instead of leaking terminal bytes into the search field.
+- Finder reveal now uses a compiled `NSAppleScript` worker with descriptor arguments, one reusable lctr-owned Finder window, and asynchronous TUI completion.
+- Finder script errors return to the TUI instead of panicking on a nullable Objective-C response.
+
+## Compatibility
+
+- Public `find --limit` and library search limits are unchanged.
+- No database migration or schema change is required.
+- The macOS arm64 binary remains M1-compatible.
+
 # lctr v0.3.3
 
 ## Fixes

@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -9,8 +9,9 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use crossterm::cursor::{SetCursorStyle, Show};
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, KeyboardEnhancementFlags, MouseEventKind, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -30,11 +31,12 @@ use ratatui_image::StatefulImage;
 use crate::config::Config;
 use crate::db::{
     existing_index_for_working_dir, sort_results_compiled, Database, ScanCompletion, SearchResult,
+    SearchStreamStatus, SEARCH_BATCH_SIZE,
 };
 use crate::live_index::LiveIndex;
-use crate::live_search::{
-    search_live_streaming_with_options, search_live_with_options, LiveSearchStatus,
-};
+#[cfg(test)]
+use crate::live_search::search_live_with_options;
+use crate::live_search::{search_live_streaming_batches_with_options, LiveSearchStatus};
 use crate::open::{copy_path, open_file, FinderRevealSession};
 use crate::preview::{self, Preview};
 use crate::query::{
@@ -46,11 +48,14 @@ pub mod theme;
 
 use theme::Theme;
 
-const TUI_RESULT_LIMIT: usize = 1000;
+const TUI_RESULT_LIMIT: usize = usize::MAX;
 const NAVIGATION_BURST_WINDOW: Duration = Duration::from_millis(50);
 const FRAGMENTED_ESCAPE_WINDOW: Duration = Duration::from_millis(50);
 const INPUT_DRAIN_LIMIT: usize = 4096;
 const INPUT_DRAIN_BUDGET: Duration = Duration::from_millis(5);
+const APPLE_SILICON: bool = cfg!(all(target_os = "macos", target_arch = "aarch64"));
+const ACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(8);
+const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Focus {
@@ -89,6 +94,10 @@ enum PendingEscape {
     Prefix {
         escape: KeyEvent,
         prefix: KeyEvent,
+        at: Instant,
+    },
+    SgrMouse {
+        payload: String,
         at: Instant,
     },
 }
@@ -130,8 +139,30 @@ impl InputNormalizer {
                                 .push_back(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
                             return;
                         }
+                        if is_fragment_char(prefix, '[') && is_fragment_char(key, '<') {
+                            self.pending = Some(PendingEscape::SgrMouse {
+                                payload: String::new(),
+                                at: now,
+                            });
+                            return;
+                        }
                         self.ready.push_back(Event::Key(escape));
                         self.ready.push_back(Event::Key(prefix));
+                    }
+                    PendingEscape::SgrMouse { mut payload, .. } => {
+                        if let KeyCode::Char(ch) = key.code {
+                            if ch.is_ascii_digit() || ch == ';' {
+                                payload.push(ch);
+                                self.pending = Some(PendingEscape::SgrMouse { payload, at: now });
+                                return;
+                            }
+                            if matches!(ch, 'M' | 'm') {
+                                if let Some(mouse) = fragmented_sgr_mouse(&payload, ch) {
+                                    self.ready.push_back(Event::Mouse(mouse));
+                                }
+                                return;
+                            }
+                        }
                     }
                     PendingEscape::Escape { key: escape, .. } => {
                         self.ready.push_back(Event::Key(escape));
@@ -156,6 +187,7 @@ impl InputNormalizer {
                 self.ready.push_back(Event::Key(escape));
                 self.ready.push_back(Event::Key(prefix));
             }
+            PendingEscape::SgrMouse { .. } => {}
         }
     }
 
@@ -187,6 +219,10 @@ impl InputNormalizer {
         self.ready.pop_front()
     }
 
+    fn push_ready_front(&mut self, event: Event) {
+        self.ready.push_front(event);
+    }
+
     fn has_ready(&self) -> bool {
         !self.ready.is_empty()
     }
@@ -202,7 +238,9 @@ impl InputNormalizer {
 
 fn pending_at(pending: &PendingEscape) -> Instant {
     match pending {
-        PendingEscape::Escape { at, .. } | PendingEscape::Prefix { at, .. } => *at,
+        PendingEscape::Escape { at, .. }
+        | PendingEscape::Prefix { at, .. }
+        | PendingEscape::SgrMouse { at, .. } => *at,
     }
 }
 
@@ -226,12 +264,48 @@ fn fragmented_arrow_code(key: KeyEvent) -> Option<KeyCode> {
     }
 }
 
+fn fragmented_sgr_mouse(payload: &str, terminator: char) -> Option<event::MouseEvent> {
+    if terminator != 'M' {
+        return None;
+    }
+    let mut fields = payload.split(';');
+    let button_code = fields.next()?.parse::<u16>().ok()?;
+    let column = fields.next()?.parse::<u16>().ok()?.saturating_sub(1);
+    let row = fields.next()?.parse::<u16>().ok()?.saturating_sub(1);
+    if fields.next().is_some() {
+        return None;
+    }
+
+    let kind = match button_code & !(4 | 8 | 16) {
+        64 => MouseEventKind::ScrollUp,
+        65 => MouseEventKind::ScrollDown,
+        _ => return None,
+    };
+    let mut modifiers = KeyModifiers::NONE;
+    if button_code & 4 != 0 {
+        modifiers |= KeyModifiers::SHIFT;
+    }
+    if button_code & 8 != 0 {
+        modifiers |= KeyModifiers::ALT;
+    }
+    if button_code & 16 != 0 {
+        modifiers |= KeyModifiers::CONTROL;
+    }
+    Some(event::MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers,
+    })
+}
+
 fn read_normalized_input(
     normalizer: &mut InputNormalizer,
     input_trace: &mut input_trace::InputTrace,
     focus: Focus,
     input: &SearchInput,
     selected: &TableState,
+    fallback_timeout: Duration,
 ) -> Result<Option<Event>> {
     let now = Instant::now();
     normalizer.flush_expired(now);
@@ -239,7 +313,7 @@ fn read_normalized_input(
         return Ok(Some(event));
     }
 
-    let timeout = normalizer.poll_timeout(Duration::from_millis(100), now);
+    let timeout = normalizer.poll_timeout(fallback_timeout, now);
     if !event::poll(timeout)? {
         return Ok(None);
     }
@@ -256,6 +330,73 @@ fn read_normalized_input(
     normalizer.push(raw_event, now);
     normalizer.flush_expired(now);
     Ok(normalizer.pop_ready())
+}
+
+fn scroll_delta(kind: MouseEventKind) -> isize {
+    match kind {
+        MouseEventKind::ScrollUp => -1,
+        MouseEventKind::ScrollDown => 1,
+        _ => 0,
+    }
+}
+
+fn move_selection_if_changed(selected: &mut TableState, result_count: usize, delta: isize) -> bool {
+    if delta == 0 {
+        return false;
+    }
+    let before = selected.selected();
+    move_selection(selected, result_count, delta);
+    selected.selected() != before
+}
+
+fn drain_apple_scroll_burst(
+    normalizer: &mut InputNormalizer,
+    input_trace: &mut input_trace::InputTrace,
+    focus: Focus,
+    input: &SearchInput,
+    selected: &mut TableState,
+    result_count: usize,
+    initial_delta: isize,
+) -> Result<bool> {
+    let mut changed = move_selection_if_changed(selected, result_count, initial_delta);
+    for _ in 1..INPUT_DRAIN_LIMIT {
+        let next = if let Some(ready) = normalizer.pop_ready() {
+            Some(ready)
+        } else if event::poll(Duration::ZERO)? {
+            let raw_event = event::read()?;
+            input_trace.record(
+                &raw_event,
+                focus,
+                input.as_str(),
+                input.cursor_column(),
+                selected.selected(),
+            )?;
+            let now = Instant::now();
+            normalizer.push(raw_event, now);
+            normalizer.flush_expired(now);
+            normalizer.pop_ready()
+        } else {
+            None
+        };
+
+        let Some(next) = next else {
+            if event::poll(Duration::ZERO)? {
+                continue;
+            }
+            break;
+        };
+        match next {
+            Event::Mouse(mouse) => {
+                changed |=
+                    move_selection_if_changed(selected, result_count, scroll_delta(mouse.kind));
+            }
+            event => {
+                normalizer.push_ready_front(event);
+                break;
+            }
+        }
+    }
+    Ok(changed)
 }
 
 fn drain_same_direction_input(
@@ -384,6 +525,7 @@ pub(crate) struct TerminalGuard {
     /// Whether we pushed kitty keyboard-enhancement flags; only pop on drop if
     /// we actually pushed, so we never disturb a terminal that lacked support.
     keyboard_enhanced: bool,
+    mouse_captured: bool,
 }
 
 impl TerminalGuard {
@@ -396,7 +538,15 @@ impl TerminalGuard {
             Show
         )?;
         let keyboard_enhanced = enable_keyboard_enhancement();
-        Ok(Self { keyboard_enhanced })
+        let mouse_captured = if APPLE_SILICON {
+            execute!(io::stdout(), EnableMouseCapture).is_ok()
+        } else {
+            false
+        };
+        Ok(Self {
+            keyboard_enhanced,
+            mouse_captured,
+        })
     }
 
     /// Like [`TerminalGuard::enter`] but leaves the cursor style untouched,
@@ -405,7 +555,10 @@ impl TerminalGuard {
         enable_raw_mode()?;
         execute!(io::stdout(), EnterAlternateScreen)?;
         let keyboard_enhanced = enable_keyboard_enhancement();
-        Ok(Self { keyboard_enhanced })
+        Ok(Self {
+            keyboard_enhanced,
+            mouse_captured: false,
+        })
     }
 }
 
@@ -413,6 +566,9 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         if self.keyboard_enhanced {
             let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+        }
+        if self.mouse_captured {
+            let _ = execute!(io::stdout(), DisableMouseCapture);
         }
         let _ = disable_raw_mode();
         let _ = execute!(
@@ -452,8 +608,10 @@ fn run_loop(
     update_check_disabled: bool,
 ) -> Result<()> {
     let mut input = SearchInput::default();
-    let mut all_results = Vec::new();
     let mut results = Vec::new();
+    let mut result_paths = HashSet::new();
+    let mut reset_pending = false;
+    let mut selection_anchor: Option<String> = None;
     let mut results_stamp: u64 = 0;
     let mut row_cache = RowCache::empty();
     let mut selected = TableState::default();
@@ -492,45 +650,112 @@ fn run_loop(
     let mut input_trace = input_trace::InputTrace::from_env()?;
     let mut input_normalizer = InputNormalizer::default();
     let mut navigation_burst = NavigationBurst::default();
+    let mut needs_draw = true;
+    let mut next_spinner_deadline = Instant::now();
 
     loop {
-        while let Some(response) = search_worker.try_recv() {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+        while let Some(response) = finder_reveal.try_reveal_response() {
+            match response.result {
+                Ok(()) => {
+                    let path = response.path.to_string_lossy().to_string();
+                    record_access_if_indexed(&watch_target, &path);
+                    status = format!("revealed {path}");
+                }
+                Err(error) => {
+                    status = format!("reveal failed: {error}");
+                }
+            }
+            needs_draw = true;
+        }
+
+        while let Some(update) = search_worker.try_recv() {
             let query = input.as_str();
-            if search_state.accepts_response(query, &response.options) {
-                match response.results {
-                    Ok(next_results) => {
-                        all_results = next_results;
-                        results = apply_local_result_options(
-                            &all_results,
-                            &tui_search_options(input.as_str())
-                                .with_mode(mode)
-                                .with_sort(sort)
-                                .with_reverse(reverse)
-                                .with_filters(filters.clone()),
-                        );
-                        results_stamp = results_stamp.wrapping_add(1);
-                        normalize_selection(&mut selected, results.len());
-                        if response.complete {
-                            loading_query = None;
-                            if response.live_backfill {
-                                search_state.mark_live_complete(response.options.query.clone());
-                            }
-                            status = format!(
-                                "{backend_label} search complete, {} results",
-                                results.len()
-                            );
-                        } else {
-                            status = format!(
-                                "{backend_label} search found {} results so far",
-                                results.len()
-                            );
+            match update {
+                SearchUpdate::Reset {
+                    request_id,
+                    options,
+                } if search_state.accepts_update(request_id, query, &options) => {
+                    selection_anchor = selected_path(&selected, &results).map(str::to_string);
+                    reset_pending = true;
+                    loading_query = Some(options.query.clone());
+                    next_spinner_deadline = Instant::now();
+                    status = format!("searching {backend_label} for {}", options.query);
+                    needs_draw = true;
+                }
+                SearchUpdate::Append {
+                    request_id,
+                    options,
+                    results: batch,
+                    count,
+                } if search_state.accepts_update(request_id, query, &options) => {
+                    let current_anchor = selected_path(&selected, &results)
+                        .map(str::to_string)
+                        .or_else(|| selection_anchor.clone());
+                    if reset_pending {
+                        results.clear();
+                        result_paths.clear();
+                        selected.select(None);
+                        reset_pending = false;
+                    }
+                    for result in batch {
+                        if result_paths.insert(result.path.clone()) {
+                            results.push(result);
                         }
                     }
-                    Err(error) => {
-                        loading_query = None;
-                        status = error.to_string();
-                    }
+                    restore_selection_by_path(&mut selected, &results, current_anchor.as_deref());
+                    selection_anchor = None;
+                    results_stamp = results_stamp.wrapping_add(1);
+                    loading_query = Some(options.query.clone());
+                    status = format!("{} results, searching…", format_count(count));
+                    needs_draw = true;
                 }
+                SearchUpdate::Complete {
+                    request_id,
+                    options,
+                    count,
+                    final_results,
+                    live_backfill,
+                } if search_state.accepts_update(request_id, query, &options) => {
+                    let current_anchor = selected_path(&selected, &results)
+                        .map(str::to_string)
+                        .or_else(|| selection_anchor.clone());
+                    if let Some(final_results) = final_results {
+                        results.clear();
+                        result_paths.clear();
+                        for result in final_results {
+                            if result_paths.insert(result.path.clone()) {
+                                results.push(result);
+                            }
+                        }
+                    } else if reset_pending {
+                        results.clear();
+                        result_paths.clear();
+                    }
+                    reset_pending = false;
+                    restore_selection_by_path(&mut selected, &results, current_anchor.as_deref());
+                    selection_anchor = None;
+                    results_stamp = results_stamp.wrapping_add(1);
+                    loading_query = None;
+                    next_spinner_deadline = Instant::now();
+                    if live_backfill {
+                        search_state.mark_live_complete(options.query.clone());
+                    }
+                    status = format!("{} results complete", format_count(count));
+                    needs_draw = true;
+                }
+                SearchUpdate::Error {
+                    request_id,
+                    options,
+                    error,
+                } if search_state.accepts_update(request_id, query, &options) => {
+                    loading_query = None;
+                    reset_pending = false;
+                    selection_anchor = None;
+                    status = error;
+                    needs_draw = true;
+                }
+                _ => {}
             }
         }
 
@@ -541,16 +766,13 @@ fn run_loop(
                 .with_sort(sort)
                 .with_reverse(reverse)
                 .with_filters(filters.clone());
-            if search_worker
-                .submit(SearchRequest {
-                    options: options.clone(),
-                    live_backfill: false,
-                })
-                .is_ok()
-            {
-                search_state.mark_submitted(options, false);
+            if let Ok(request_id) = search_worker.submit(SearchRequest {
+                options: options.clone(),
+            }) {
+                search_state.mark_submitted_with_id(options, false, request_id);
                 loading_query = Some(query.to_string());
                 status = format!("searching {backend_label} index for {query}");
+                needs_draw = true;
             }
         }
 
@@ -567,14 +789,12 @@ fn run_loop(
                         .with_sort(sort)
                         .with_reverse(reverse)
                         .with_filters(filters.clone());
-                    if search_worker
-                        .submit(SearchRequest {
-                            options: options.clone(),
-                            live_backfill: false,
-                        })
-                        .is_ok()
-                    {
-                        search_state.mark_submitted(options, false);
+                    if let Ok(request_id) = search_worker.submit(SearchRequest {
+                        options: options.clone(),
+                    }) {
+                        search_state.mark_submitted_with_id(options, false, request_id);
+                        loading_query = Some(query.to_string());
+                        needs_draw = true;
                     }
                 }
             }
@@ -583,6 +803,7 @@ fn run_loop(
         if update_status.is_none() {
             if let Ok(Some(s)) = update_rx.try_recv() {
                 update_status = Some(s);
+                needs_draw = true;
             }
         }
 
@@ -604,265 +825,132 @@ fn run_loop(
                     && preview_pending_since.elapsed() >= PREVIEW_DEBOUNCE
                 {
                     preview_state = Some(build_preview(&mut picker, path));
+                    needs_draw = true;
                 }
             }
-            None => preview_state = None,
+            None => {
+                if preview_state.take().is_some() {
+                    needs_draw = true;
+                }
+            }
         }
 
-        // Rebuild the per-row highlight/format cache when query, mode, or
-        // results changed. This avoids re-running the matcher and format! on
-        // every draw tick (which fires on every event, not just result changes).
-        if cache_stale(&row_cache, input.as_str(), mode, results_stamp) {
-            row_cache = rebuild_row_cache(&results, input.as_str(), mode, results_stamp);
+        let spinner_due = loading_query.is_some() && Instant::now() >= next_spinner_deadline;
+        if spinner_due {
+            next_spinner_deadline = Instant::now() + Duration::from_millis(100);
+            needs_draw = true;
         }
+        if needs_draw {
+            spinner_frame = spinner_frame.wrapping_add(1);
+            terminal.draw(|frame| {
+                // Fill the entire terminal area with the theme background.
+                frame.render_widget(
+                    Block::default().style(Style::default().bg(theme.bg)),
+                    frame.area(),
+                );
 
-        spinner_frame = spinner_frame.wrapping_add(1);
-        terminal.draw(|frame| {
-            // Fill the entire terminal area with the theme background.
-            frame.render_widget(
-                Block::default().style(Style::default().bg(theme.bg)),
-                frame.area(),
-            );
+                let query = input.as_str();
+                let has_detail = frame.area().height >= 20;
+                let top_args = TopPanelArgs {
+                    query,
+                    root_label: &root_label,
+                    backend_label,
+                    result_count: results.len(),
+                    watch_enabled,
+                    watch_errors: live_index.as_ref().map_or(0, LiveIndex::write_errors),
+                    mode,
+                    sort,
+                    reverse,
+                    filters: &filters,
+                    theme,
+                    status: status.as_str(),
+                };
+                let show_banner = update_status.is_some();
+                let all_chunks = if show_banner {
+                    Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Length(1),
+                            Constraint::Length(top_chrome_height(&top_args)),
+                            Constraint::Min(6),
+                            Constraint::Length(if has_detail { 4 } else { 0 }),
+                        ])
+                        .split(frame.area())
+                } else {
+                    Layout::default()
+                        .direction(Direction::Vertical)
+                        .constraints([
+                            Constraint::Length(top_chrome_height(&top_args)),
+                            Constraint::Min(6),
+                            Constraint::Length(if has_detail { 4 } else { 0 }),
+                        ])
+                        .split(frame.area())
+                };
+                let offset = if show_banner { 1 } else { 0 };
+                let chunks = &all_chunks[offset..];
 
-            let query = input.as_str();
-            let has_detail = frame.area().height >= 20;
-            let top_args = TopPanelArgs {
-                query,
-                root_label: &root_label,
-                backend_label,
-                result_count: results.len(),
-                watch_enabled,
-                watch_errors: live_index.as_ref().map_or(0, LiveIndex::write_errors),
-                mode,
-                sort,
-                reverse,
-                filters: &filters,
-                theme,
-                status: status.as_str(),
-            };
-            let show_banner = update_status.is_some();
-            let all_chunks = if show_banner {
-                Layout::default()
+                if show_banner {
+                    if let Some(ref s) = update_status {
+                        let banner_text = format!(
+                            "\u{2728} lctr {} available, run `{}`",
+                            s.latest, s.update_cmd
+                        );
+                        let banner = Paragraph::new(banner_text)
+                            .style(Style::default().fg(theme.warn).add_modifier(Modifier::BOLD));
+                        frame.render_widget(banner, all_chunks[0]);
+                    }
+                }
+
+                // Compact chrome: 1-row header band + bordered search bar (focal) +
+                // one status line + one controls line.
+                // Full key help lives in the `?` overlay.
+                let top_chunks = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
                         Constraint::Length(1),
-                        Constraint::Length(top_chrome_height(&top_args)),
-                        Constraint::Min(6),
-                        Constraint::Length(if has_detail { 4 } else { 0 }),
+                        Constraint::Length(3),
+                        Constraint::Length(1),
+                        Constraint::Length(1),
                     ])
-                    .split(frame.area())
-            } else {
-                Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(top_chrome_height(&top_args)),
-                        Constraint::Min(6),
-                        Constraint::Length(if has_detail { 4 } else { 0 }),
-                    ])
-                    .split(frame.area())
-            };
-            let offset = if show_banner { 1 } else { 0 };
-            let chunks = &all_chunks[offset..];
+                    .split(chunks[0]);
 
-            if show_banner {
-                if let Some(ref s) = update_status {
-                    let banner_text = format!(
-                        "\u{2728} lctr {} available, run `{}`",
-                        s.latest, s.update_cmd
-                    );
-                    let banner = Paragraph::new(banner_text)
-                        .style(Style::default().fg(theme.warn).add_modifier(Modifier::BOLD));
-                    frame.render_widget(banner, all_chunks[0]);
-                }
-            }
-
-            // Compact chrome: 1-row header band + bordered search bar (focal) +
-            // one status line + one controls line.
-            // Full key help lives in the `?` overlay.
-            let top_chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Length(1),
-                    Constraint::Length(3),
-                    Constraint::Length(1),
-                    Constraint::Length(1),
-                ])
-                .split(chunks[0]);
-
-            // Header band: wordmark left, root + backend right.
-            let (wordmark, right_label) = header_segments(&root_label, backend_label);
-            let band_width = top_chunks[0].width as usize;
-            let right_len = right_label.len();
-            let left_len = wordmark.len() + 2; // " lctr " padding
-            let padding = if band_width > left_len + right_len + 2 {
-                " ".repeat(band_width - left_len - right_len)
-            } else {
-                " ".to_string()
-            };
-            let band_line = Line::from(vec![
-                Span::styled(
-                    format!(" {wordmark} "),
-                    Style::default()
-                        .fg(theme.accent)
-                        .bg(theme.panel_bg)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(padding, Style::default().bg(theme.panel_bg).fg(theme.muted)),
-                Span::styled(
-                    right_label,
-                    Style::default().fg(theme.muted).bg(theme.panel_bg),
-                ),
-            ]);
-            frame.render_widget(Paragraph::new(band_line), top_chunks[0]);
-
-            let search_focused = focus == Focus::Search;
-            let search_border_style = if search_focused {
-                Style::default()
-                    .fg(theme.accent)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme.muted)
-            };
-            let search_panel = Paragraph::new(search_bar_line(&top_args)).block(
-                Block::default()
-                    .title("search")
-                    .title_style(
+                // Header band: wordmark left, root + backend right.
+                let (wordmark, right_label) = header_segments(&root_label, backend_label);
+                let band_width = top_chunks[0].width as usize;
+                let right_len = right_label.len();
+                let left_len = wordmark.len() + 2; // " lctr " padding
+                let padding = if band_width > left_len + right_len + 2 {
+                    " ".repeat(band_width - left_len - right_len)
+                } else {
+                    " ".to_string()
+                };
+                let band_line = Line::from(vec![
+                    Span::styled(
+                        format!(" {wordmark} "),
                         Style::default()
                             .fg(theme.accent)
+                            .bg(theme.panel_bg)
                             .add_modifier(Modifier::BOLD),
-                    )
-                    .borders(Borders::ALL)
-                    .border_type(BorderType::Rounded)
-                    .border_style(search_border_style)
-                    .style(Style::default().bg(theme.panel_bg)),
-            );
-            frame.render_widget(search_panel, top_chunks[1]);
-            if search_focused {
-                frame.set_cursor_position(Position {
-                    x: top_chunks[1].x + 1 + input.cursor_column() as u16,
-                    y: top_chunks[1].y + 1,
-                });
-            }
+                    ),
+                    Span::styled(padding, Style::default().bg(theme.panel_bg).fg(theme.muted)),
+                    Span::styled(
+                        right_label,
+                        Style::default().fg(theme.muted).bg(theme.panel_bg),
+                    ),
+                ]);
+                frame.render_widget(Paragraph::new(band_line), top_chunks[0]);
 
-            frame.render_widget(Paragraph::new(top_status_line(&top_args)), top_chunks[2]);
-            frame.render_widget(Paragraph::new(top_controls_line(&top_args)), top_chunks[3]);
-
-            // Split the results region into table + preview when wide enough and
-            // a preview is available; otherwise the table takes the full width.
-            let (results_area, preview_area) = if preview_enabled
-                && preview_state.is_some()
-                && chunks[1].width >= PREVIEW_MIN_WIDTH
-            {
-                let parts = Layout::default()
-                    .direction(Direction::Horizontal)
-                    .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
-                    .split(chunks[1]);
-                (parts[0], Some(parts[1]))
-            } else {
-                (chunks[1], None)
-            };
-
-            if search_state.should_render_results(query) {
-                let rows = results
-                    .iter()
-                    .zip(row_cache.rows.iter().chain(std::iter::repeat_with(|| {
-                        // Safety net: cache should always be large enough; use
-                        // a static empty RowData if somehow out of sync.
-                        static EMPTY: std::sync::OnceLock<RowData> = std::sync::OnceLock::new();
-                        EMPTY.get_or_init(|| RowData {
-                            name_positions: Vec::new(),
-                            path_positions: Vec::new(),
-                            size_text: String::new(),
-                            date_text: String::new(),
-                            kind: String::new(),
-                        })
-                    })))
-                    .map(|(result, row_data)| {
-                        result_row(result, backend_label, mode, &theme, row_data, icons_enabled)
-                    })
-                    .collect::<Vec<_>>();
-                let table = Table::new(
-                    rows,
-                    [
-                        Constraint::Length(2),
-                        Constraint::Percentage(24),
-                        Constraint::Length(10),
-                        Constraint::Length(10),
-                        Constraint::Length(17),
-                        Constraint::Length(8),
-                        Constraint::Length(9),
-                        Constraint::Min(18),
-                    ],
-                )
-                .header(
-                    Row::new([
-                        Cell::from(""),
-                        Cell::from("name"),
-                        Cell::from("kind"),
-                        Cell::from("size"),
-                        Cell::from("modified"),
-                        Cell::from("source"),
-                        Cell::from("match"),
-                        Cell::from("path"),
-                    ])
-                    .style(Style::default().fg(theme.muted)),
-                )
-                .block(
-                    Block::default()
-                        .title(match &loading_query {
-                            Some(active) if active == query => {
-                                format!("{} searching {active}", spinner_glyph(spinner_frame))
-                            }
-                            _ => format!("results ({})", results.len()),
-                        })
-                        .title_style(Style::default().fg(theme.ok).add_modifier(Modifier::BOLD))
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded)
-                        .border_style(if focus == Focus::Results {
-                            Style::default()
-                                .fg(theme.accent)
-                                .add_modifier(Modifier::BOLD)
-                        } else {
-                            Style::default().fg(theme.muted)
-                        })
-                        .style(Style::default().bg(theme.panel_bg)),
-                )
-                .row_highlight_style(
+                let search_focused = focus == Focus::Search;
+                let search_border_style = if search_focused {
                     Style::default()
-                        .bg(theme.selected_bg)
-                        .add_modifier(Modifier::BOLD),
-                )
-                .highlight_symbol("\u{258c} ");
-                frame.render_stateful_widget(table, results_area, &mut selected);
-            } else if !query.is_empty() {
-                let hint = Paragraph::new(if should_show_results(query) {
-                    match backend_label {
-                        "indexed" => "Indexed results update while typing",
-                        "hybrid" => "Indexed results update while typing. Tab or Down for results",
-                        _ => "Press Enter to search live filenames",
-                    }
+                        .fg(theme.accent)
+                        .add_modifier(Modifier::BOLD)
                 } else {
-                    "Type at least 2 letters to search"
-                })
-                .style(Style::default().fg(theme.muted))
-                .block(
+                    Style::default().fg(theme.muted)
+                };
+                let search_panel = Paragraph::new(search_bar_line(&top_args)).block(
                     Block::default()
-                        .title("waiting")
-                        .title_style(Style::default().fg(theme.ok))
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded)
-                        .border_style(Style::default().fg(theme.muted))
-                        .style(Style::default().bg(theme.panel_bg)),
-                );
-                frame.render_widget(hint, results_area);
-            } else {
-                let card_lines = empty_state_lines(&root_label)
-                    .into_iter()
-                    .map(|s| Line::from(Span::styled(s, Style::default().fg(theme.muted))))
-                    .collect::<Vec<_>>();
-                let card = Paragraph::new(card_lines).block(
-                    Block::default()
-                        .title(" search ")
+                        .title("search")
                         .title_style(
                             Style::default()
                                 .fg(theme.accent)
@@ -870,54 +958,242 @@ fn run_loop(
                         )
                         .borders(Borders::ALL)
                         .border_type(BorderType::Rounded)
-                        .border_style(Style::default().fg(theme.accent))
+                        .border_style(search_border_style)
                         .style(Style::default().bg(theme.panel_bg)),
                 );
-                frame.render_widget(card, results_area);
-            }
-
-            if let Some(area) = preview_area {
-                if let Some(state) = preview_state.as_mut() {
-                    render_preview(frame, area, state, &theme);
+                frame.render_widget(search_panel, top_chunks[1]);
+                if search_focused {
+                    frame.set_cursor_position(Position {
+                        x: top_chunks[1].x + 1 + input.cursor_column() as u16,
+                        y: top_chunks[1].y + 1,
+                    });
                 }
-            }
 
-            if has_detail {
-                let hint_line = Line::from(Span::styled(
-                    footer_hint(focus),
-                    Style::default().fg(theme.muted).bg(theme.bg),
-                ));
-                let mut detail_lines = vec![hint_line];
-                let detail_text = selected_detail(&selected, &results, &theme);
-                for line in detail_text.lines {
-                    detail_lines.push(line);
-                }
-                let detail = Paragraph::new(detail_lines)
-                    .style(Style::default().fg(theme.muted))
-                    .wrap(Wrap { trim: false })
+                frame.render_widget(Paragraph::new(top_status_line(&top_args)), top_chunks[2]);
+                frame.render_widget(Paragraph::new(top_controls_line(&top_args)), top_chunks[3]);
+
+                // Split the results region into table + preview when wide enough and
+                // a preview is available; otherwise the table takes the full width.
+                let (results_area, preview_area) = if preview_enabled
+                    && preview_state.is_some()
+                    && chunks[1].width >= PREVIEW_MIN_WIDTH
+                {
+                    let parts = Layout::default()
+                        .direction(Direction::Horizontal)
+                        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+                        .split(chunks[1]);
+                    (parts[0], Some(parts[1]))
+                } else {
+                    (chunks[1], None)
+                };
+
+                if search_state.should_render_results(query) {
+                    let capacity = results_area.height.saturating_sub(3).max(1) as usize;
+                    let (viewport_start, viewport_end) =
+                        viewport_range(results.len(), selected.selected(), capacity);
+                    if cache_stale_for_viewport(
+                        &row_cache,
+                        input.as_str(),
+                        mode,
+                        results_stamp,
+                        viewport_start,
+                        viewport_end,
+                    ) {
+                        row_cache = rebuild_viewport_row_cache(
+                            &results,
+                            input.as_str(),
+                            mode,
+                            results_stamp,
+                            viewport_start,
+                            viewport_end,
+                        );
+                    }
+                    let rows = results[viewport_start..viewport_end]
+                        .iter()
+                        .zip(row_cache.rows.iter())
+                        .map(|(result, row_data)| {
+                            result_row(result, backend_label, mode, &theme, row_data, icons_enabled)
+                        })
+                        .collect::<Vec<_>>();
+                    let table = Table::new(
+                        rows,
+                        [
+                            Constraint::Length(2),
+                            Constraint::Percentage(24),
+                            Constraint::Length(10),
+                            Constraint::Length(10),
+                            Constraint::Length(17),
+                            Constraint::Length(8),
+                            Constraint::Length(9),
+                            Constraint::Min(18),
+                        ],
+                    )
+                    .header(
+                        Row::new([
+                            Cell::from(""),
+                            Cell::from("name"),
+                            Cell::from("kind"),
+                            Cell::from("size"),
+                            Cell::from("modified"),
+                            Cell::from("source"),
+                            Cell::from("match"),
+                            Cell::from("path"),
+                        ])
+                        .style(Style::default().fg(theme.muted)),
+                    )
                     .block(
                         Block::default()
-                            .borders(Borders::TOP)
-                            .border_style(Style::default().fg(theme.muted)),
+                            .title(match &loading_query {
+                                Some(active) if active == query => {
+                                    format!("{} searching {active}", spinner_glyph(spinner_frame))
+                                }
+                                _ => format!("results ({})", format_count(results.len())),
+                            })
+                            .title_style(Style::default().fg(theme.ok).add_modifier(Modifier::BOLD))
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .border_style(if focus == Focus::Results {
+                                Style::default()
+                                    .fg(theme.accent)
+                                    .add_modifier(Modifier::BOLD)
+                            } else {
+                                Style::default().fg(theme.muted)
+                            })
+                            .style(Style::default().bg(theme.panel_bg)),
+                    )
+                    .row_highlight_style(
+                        Style::default()
+                            .bg(theme.selected_bg)
+                            .add_modifier(Modifier::BOLD),
+                    )
+                    .highlight_symbol("\u{258c} ");
+                    let mut viewport_state = TableState::default();
+                    if let Some(index) = selected.selected() {
+                        if index >= viewport_start && index < viewport_end {
+                            viewport_state.select(Some(index - viewport_start));
+                        }
+                    }
+                    frame.render_stateful_widget(table, results_area, &mut viewport_state);
+                } else if !query.is_empty() {
+                    let hint = Paragraph::new(if should_show_results(query) {
+                        match backend_label {
+                            "indexed" => "Indexed results update while typing",
+                            "hybrid" => {
+                                "Indexed results update while typing. Tab or Down for results"
+                            }
+                            _ => "Press Enter to search live filenames",
+                        }
+                    } else {
+                        "Type at least 2 letters to search"
+                    })
+                    .style(Style::default().fg(theme.muted))
+                    .block(
+                        Block::default()
+                            .title("waiting")
+                            .title_style(Style::default().fg(theme.ok))
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .border_style(Style::default().fg(theme.muted))
+                            .style(Style::default().bg(theme.panel_bg)),
                     );
-                frame.render_widget(detail, chunks[2]);
-            }
+                    frame.render_widget(hint, results_area);
+                } else {
+                    let card_lines = empty_state_lines(&root_label)
+                        .into_iter()
+                        .map(|s| Line::from(Span::styled(s, Style::default().fg(theme.muted))))
+                        .collect::<Vec<_>>();
+                    let card = Paragraph::new(card_lines).block(
+                        Block::default()
+                            .title(" search ")
+                            .title_style(
+                                Style::default()
+                                    .fg(theme.accent)
+                                    .add_modifier(Modifier::BOLD),
+                            )
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .border_style(Style::default().fg(theme.accent))
+                            .style(Style::default().bg(theme.panel_bg)),
+                    );
+                    frame.render_widget(card, results_area);
+                }
 
-            if show_help {
-                render_help_overlay(frame, &theme);
-            }
-        })?;
+                if let Some(area) = preview_area {
+                    if let Some(state) = preview_state.as_mut() {
+                        render_preview(frame, area, state, &theme);
+                    }
+                }
 
+                if has_detail {
+                    let hint_line = Line::from(Span::styled(
+                        footer_with_position(focus, selected.selected(), results.len()),
+                        Style::default().fg(theme.muted).bg(theme.bg),
+                    ));
+                    let mut detail_lines = vec![hint_line];
+                    let detail_text = selected_detail(&selected, &results, &theme);
+                    for line in detail_text.lines {
+                        detail_lines.push(line);
+                    }
+                    let detail = Paragraph::new(detail_lines)
+                        .style(Style::default().fg(theme.muted))
+                        .wrap(Wrap { trim: false })
+                        .block(
+                            Block::default()
+                                .borders(Borders::TOP)
+                                .border_style(Style::default().fg(theme.muted)),
+                        );
+                    frame.render_widget(detail, chunks[2]);
+                }
+
+                if show_help {
+                    render_help_overlay(frame, &theme);
+                }
+            })?;
+            needs_draw = false;
+        }
+
+        #[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+        let finder_pending = finder_reveal.reveal_pending();
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64", not(test))))]
+        let finder_pending = false;
+        let poll_timeout = if APPLE_SILICON && (loading_query.is_some() || finder_pending) {
+            ACTIVE_POLL_INTERVAL
+        } else {
+            IDLE_POLL_INTERVAL
+        };
         let Some(event) = read_normalized_input(
             &mut input_normalizer,
             &mut input_trace,
             focus,
             &input,
             &selected,
+            poll_timeout,
         )?
         else {
             continue;
         };
+        if matches!(&event, Event::Resize(_, _)) {
+            needs_draw = true;
+            continue;
+        }
+        if let Event::Mouse(mouse) = event {
+            if APPLE_SILICON && focus == Focus::Results {
+                let initial_delta = scroll_delta(mouse.kind);
+                if initial_delta != 0 {
+                    let changed = drain_apple_scroll_burst(
+                        &mut input_normalizer,
+                        &mut input_trace,
+                        focus,
+                        &input,
+                        &mut selected,
+                        results.len(),
+                        initial_delta,
+                    )?;
+                    needs_draw |= changed;
+                }
+            }
+            continue;
+        }
         if let Event::Key(key) = event {
             if key.kind != KeyEventKind::Press {
                 continue;
@@ -933,22 +1209,25 @@ fn run_loop(
             }
             let navigation_code =
                 matches!(key.code, KeyCode::Up | KeyCode::Down).then_some(key.code);
-            let is_vertical_navigation = navigation_code.is_some();
-            if focus != Focus::Results || !is_vertical_navigation {
-                navigation_burst.reset();
-            } else if !navigation_burst.accepts(key.code, Instant::now()) {
-                if let Some(code) = navigation_code {
-                    drain_same_direction_input(
-                        &mut input_normalizer,
-                        &mut input_trace,
-                        focus,
-                        &input,
-                        &selected,
-                        code,
-                    )?;
+            if !APPLE_SILICON {
+                let is_vertical_navigation = navigation_code.is_some();
+                if focus != Focus::Results || !is_vertical_navigation {
+                    navigation_burst.reset();
+                } else if !navigation_burst.accepts(key.code, Instant::now()) {
+                    if let Some(code) = navigation_code {
+                        drain_same_direction_input(
+                            &mut input_normalizer,
+                            &mut input_trace,
+                            focus,
+                            &input,
+                            &selected,
+                            code,
+                        )?;
+                    }
+                    continue;
                 }
-                continue;
             }
+            needs_draw = true;
             match focus {
                 Focus::Search => match key.code {
                     KeyCode::Esc => {
@@ -956,8 +1235,7 @@ fn run_loop(
                             input = SearchInput::default();
                             search_state.mark_dirty();
                             if backend_label == "live" {
-                                all_results.clear();
-                                results.clear();
+                                clear_results(&mut results, &mut result_paths, &mut selected);
                             }
                             normalize_selection(&mut selected, results.len());
                             status = "cleared".to_string();
@@ -969,8 +1247,7 @@ fn run_loop(
                         search_state.mark_dirty();
                         last_edit = Instant::now();
                         if backend_label == "live" {
-                            all_results.clear();
-                            results.clear();
+                            clear_results(&mut results, &mut result_paths, &mut selected);
                         }
                         normalize_selection(&mut selected, results.len());
                         status = edit_status(backend_label);
@@ -980,8 +1257,7 @@ fn run_loop(
                         search_state.mark_dirty();
                         last_edit = Instant::now();
                         if backend_label == "live" {
-                            all_results.clear();
-                            results.clear();
+                            clear_results(&mut results, &mut result_paths, &mut selected);
                         }
                         normalize_selection(&mut selected, results.len());
                         status = edit_status(backend_label);
@@ -1014,15 +1290,13 @@ fn run_loop(
                                 .with_sort(sort)
                                 .with_reverse(reverse)
                                 .with_filters(filters.clone());
-                            search_worker.submit(SearchRequest {
+                            let request_id = search_worker.submit(SearchRequest {
                                 options: options.clone(),
-                                live_backfill,
                             })?;
-                            search_state.mark_submitted(options, live_backfill);
+                            search_state.mark_submitted_with_id(options, live_backfill, request_id);
                             loading_query = Some(query.to_string());
                             if backend_label == "live" || live_backfill {
-                                all_results.clear();
-                                results.clear();
+                                clear_results(&mut results, &mut result_paths, &mut selected);
                             }
                             normalize_selection(&mut selected, results.len());
                             status = if live_backfill {
@@ -1060,6 +1334,16 @@ fn run_loop(
                     }
                     KeyCode::Char('r') => {
                         if let Some(path) = selected_path(&selected, &results) {
+                            #[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+                            {
+                                finder_reveal.request_reveal(Path::new(path))?;
+                                status = format!("revealing {path}");
+                            }
+                            #[cfg(not(all(
+                                target_os = "macos",
+                                target_arch = "aarch64",
+                                not(test)
+                            )))]
                             match finder_reveal.reveal(Path::new(path)) {
                                 Ok(()) => {
                                     record_access_if_indexed(&watch_target, path);
@@ -1080,62 +1364,26 @@ fn run_loop(
                     }
                     KeyCode::Char('m') => {
                         mode = mode.next();
-                        results = apply_local_result_options(
-                            &all_results,
-                            &tui_search_options(input.as_str())
-                                .with_mode(mode)
-                                .with_sort(sort)
-                                .with_reverse(reverse)
-                                .with_filters(filters.clone()),
-                        );
-                        results_stamp = results_stamp.wrapping_add(1);
-                        normalize_selection(&mut selected, results.len());
                         search_state.mark_dirty();
                         last_edit = Instant::now();
                         status = format!("mode: {}", mode.label());
                     }
                     KeyCode::Char('f') => {
                         filters = cycle_kind_filter(filters);
-                        results = apply_local_result_options(
-                            &all_results,
-                            &tui_search_options(input.as_str())
-                                .with_mode(mode)
-                                .with_sort(sort)
-                                .with_reverse(reverse)
-                                .with_filters(filters.clone()),
-                        );
-                        results_stamp = results_stamp.wrapping_add(1);
-                        normalize_selection(&mut selected, results.len());
                         search_state.mark_dirty();
                         last_edit = Instant::now();
                         status = "type filter changed".to_string();
                     }
                     KeyCode::Char('s') => {
                         sort = sort.next();
-                        results = apply_local_result_options(
-                            &all_results,
-                            &tui_search_options(input.as_str())
-                                .with_mode(mode)
-                                .with_sort(sort)
-                                .with_reverse(reverse)
-                                .with_filters(filters.clone()),
-                        );
-                        results_stamp = results_stamp.wrapping_add(1);
-                        normalize_selection(&mut selected, results.len());
+                        search_state.mark_dirty();
+                        last_edit = Instant::now();
                         status = format!("sort: {}", sort.label());
                     }
                     KeyCode::Char('S') => {
                         reverse = toggle_sort_order(reverse);
-                        results = apply_local_result_options(
-                            &all_results,
-                            &tui_search_options(input.as_str())
-                                .with_mode(mode)
-                                .with_sort(sort)
-                                .with_reverse(reverse)
-                                .with_filters(filters.clone()),
-                        );
-                        results_stamp = results_stamp.wrapping_add(1);
-                        normalize_selection(&mut selected, results.len());
+                        search_state.mark_dirty();
+                        last_edit = Instant::now();
                         status = format!("sort order: {}", sort_label(sort, reverse));
                     }
                     KeyCode::Char('t') => {
@@ -1180,8 +1428,7 @@ fn run_loop(
                             search_state.mark_dirty();
                             last_edit = Instant::now();
                             if backend_label == "live" {
-                                all_results.clear();
-                                results.clear();
+                                clear_results(&mut results, &mut result_paths, &mut selected);
                             }
                             normalize_selection(&mut selected, results.len());
                             status = edit_status(backend_label);
@@ -1190,15 +1437,17 @@ fn run_loop(
                     _ => {}
                 },
             }
-            if let Some(code) = navigation_code {
-                drain_same_direction_input(
-                    &mut input_normalizer,
-                    &mut input_trace,
-                    focus,
-                    &input,
-                    &selected,
-                    code,
-                )?;
+            if !APPLE_SILICON {
+                if let Some(code) = navigation_code {
+                    drain_same_direction_input(
+                        &mut input_normalizer,
+                        &mut input_trace,
+                        focus,
+                        &input,
+                        &selected,
+                        code,
+                    )?;
+                }
             }
         }
     }
@@ -1210,6 +1459,7 @@ fn run_loop(
     Ok(())
 }
 
+#[cfg(test)]
 fn search_for_tui(db: &Database, options: &SearchOptions) -> Result<Vec<SearchResult>> {
     if !should_show_results(&options.query) {
         return Ok(Vec::new());
@@ -1223,6 +1473,7 @@ fn open_search_database(path: &Path) -> Result<Database> {
         .map(Database::with_search_path_verification)
 }
 
+#[cfg(test)]
 fn search_hybrid(db: &Database, root: &Path, options: &SearchOptions) -> Result<Vec<SearchResult>> {
     let indexed = search_for_tui(db, options)?;
     let live = search_live_with_options(root, options)?;
@@ -1230,163 +1481,423 @@ fn search_hybrid(db: &Database, root: &Path, options: &SearchOptions) -> Result<
 }
 
 struct SearchWorker {
-    tx: Sender<SearchRequest>,
-    rx: Receiver<SearchResponse>,
+    tx: Sender<QueuedSearchRequest>,
+    rx: Receiver<SearchUpdate>,
+    next_request_id: u64,
 }
 
 impl SearchWorker {
     fn spawn(search_backend: SearchBackend) -> Result<Self> {
-        let (query_tx, query_rx) = mpsc::channel::<SearchRequest>();
-        let (result_tx, result_rx) = mpsc::channel::<SearchResponse>();
+        let (query_tx, query_rx) = mpsc::channel::<QueuedSearchRequest>();
+        let (result_tx, result_rx) = mpsc::channel::<SearchUpdate>();
 
-        thread::spawn(move || match search_backend {
-            SearchBackend::Indexed { db_path, .. } => {
-                while let Ok(mut request) = query_rx.recv() {
-                    while let Ok(newer_request) = query_rx.try_recv() {
-                        request = newer_request;
-                    }
-                    let results = open_search_database(&db_path)
-                        .and_then(|db| search_for_tui(&db, &request.options));
-                    if result_tx
-                        .send(SearchResponse {
-                            options: request.options,
-                            results,
-                            complete: true,
-                            live_backfill: false,
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            }
-            SearchBackend::Live { root } => {
-                while let Ok(mut request) = query_rx.recv() {
-                    loop {
-                        while let Ok(newer_request) = query_rx.try_recv() {
-                            request = newer_request;
-                        }
-                        let response_options = request.options.clone();
-                        let mut next_query = None;
-                        let mut latest = Vec::new();
-                        let status = search_live_streaming_with_options(
-                            &root,
-                            &response_options,
-                            || {
-                                while let Ok(newer_request) = query_rx.try_recv() {
-                                    next_query = Some(newer_request);
-                                }
-                                next_query.is_some()
-                            },
-                            |_| {},
-                            |partial| {
-                                latest = partial.to_vec();
-                                let _ = result_tx.send(SearchResponse {
-                                    options: response_options.clone(),
-                                    results: Ok(latest.clone()),
-                                    complete: false,
-                                    live_backfill: true,
-                                });
-                            },
-                        );
-
-                        if matches!(status, Ok(LiveSearchStatus::Cancelled)) {
-                            if let Some(newer_request) = next_query.take() {
-                                request = newer_request;
-                                continue;
-                            }
-                        }
-
-                        let results = status.map(|_| latest);
-                        if result_tx
-                            .send(SearchResponse {
-                                options: response_options,
-                                results,
-                                complete: true,
-                                live_backfill: true,
-                            })
-                            .is_err()
-                        {
-                            break;
-                        }
-                        break;
-                    }
-                }
-            }
-            SearchBackend::Hybrid { db_path, root } => {
-                while let Ok(mut request) = query_rx.recv() {
-                    while let Ok(newer_request) = query_rx.try_recv() {
-                        request = newer_request;
-                    }
-                    let response_options = request.options.clone();
-                    let indexed = open_search_database(&db_path)
-                        .and_then(|db| search_for_tui(&db, &response_options));
-                    if request.live_backfill {
-                        if let Ok(results) = &indexed {
-                            let _ = result_tx.send(SearchResponse {
-                                options: response_options.clone(),
-                                results: Ok(results.clone()),
-                                complete: false,
-                                live_backfill: true,
-                            });
-                        }
-                    }
-
-                    let results = if request.live_backfill {
-                        indexed.and_then(|_| {
-                            open_search_database(&db_path)
-                                .and_then(|db| search_hybrid(&db, &root, &response_options))
-                        })
-                    } else {
-                        indexed
-                    };
-                    if result_tx
-                        .send(SearchResponse {
-                            options: response_options,
-                            results,
-                            complete: true,
-                            live_backfill: request.live_backfill,
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            }
-        });
+        thread::spawn(move || search_worker_loop(search_backend, query_rx, result_tx));
 
         Ok(Self {
             tx: query_tx,
             rx: result_rx,
+            next_request_id: 1,
         })
     }
 
-    fn submit(&mut self, request: SearchRequest) -> Result<()> {
-        self.tx.send(request).context("send search request")
+    fn submit(&mut self, request: SearchRequest) -> Result<u64> {
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
+        self.tx
+            .send(QueuedSearchRequest {
+                request_id,
+                request,
+            })
+            .context("send search request")?;
+        Ok(request_id)
     }
 
     fn try_recv(&mut self) -> Option<SearchResponse> {
-        let mut latest = None;
-        while let Ok(response) = self.rx.try_recv() {
-            latest = Some(response);
-        }
-        latest
+        self.rx.try_recv().ok()
     }
 }
 
 #[derive(Debug, Clone)]
 struct SearchRequest {
     options: SearchOptions,
-    live_backfill: bool,
 }
 
-struct SearchResponse {
-    options: SearchOptions,
-    results: Result<Vec<SearchResult>>,
-    complete: bool,
-    live_backfill: bool,
+struct QueuedSearchRequest {
+    request_id: u64,
+    request: SearchRequest,
 }
 
+enum SearchUpdate {
+    Reset {
+        request_id: u64,
+        options: SearchOptions,
+    },
+    Append {
+        request_id: u64,
+        options: SearchOptions,
+        results: Vec<SearchResult>,
+        count: usize,
+    },
+    Complete {
+        request_id: u64,
+        options: SearchOptions,
+        count: usize,
+        final_results: Option<Vec<SearchResult>>,
+        live_backfill: bool,
+    },
+    Error {
+        request_id: u64,
+        options: SearchOptions,
+        error: String,
+    },
+}
+
+type SearchResponse = SearchUpdate;
+
+fn search_worker_loop(
+    search_backend: SearchBackend,
+    query_rx: Receiver<QueuedSearchRequest>,
+    result_tx: Sender<SearchUpdate>,
+) {
+    match search_backend {
+        SearchBackend::Indexed { db_path, .. } => {
+            while let Ok(request) = query_rx.recv() {
+                let mut request = latest_queued_request(request, &query_rx);
+                loop {
+                    let request_id = request.request_id;
+                    let options = request.request.options.clone();
+                    if result_tx
+                        .send(SearchUpdate::Reset {
+                            request_id,
+                            options: options.clone(),
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+
+                    let mut next_request = None;
+                    let outcome = open_search_database(&db_path).and_then(|db| {
+                        db.search_streaming_with_options(
+                            &options,
+                            || {
+                                while let Ok(newer_request) = query_rx.try_recv() {
+                                    next_request = Some(newer_request);
+                                }
+                                next_request.is_some()
+                            },
+                            |batch| {
+                                result_tx
+                                    .send(SearchUpdate::Append {
+                                        request_id,
+                                        options: options.clone(),
+                                        results: batch.results,
+                                        count: batch.count,
+                                    })
+                                    .context("send indexed search batch")
+                            },
+                        )
+                    });
+
+                    match outcome {
+                        Ok(SearchStreamStatus::Complete { count }) => {
+                            if result_tx
+                                .send(SearchUpdate::Complete {
+                                    request_id,
+                                    options,
+                                    count,
+                                    final_results: None,
+                                    live_backfill: false,
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        Ok(SearchStreamStatus::Cancelled) => {
+                            if let Some(newer_request) = next_request.take() {
+                                request = newer_request;
+                                continue;
+                            }
+                        }
+                        Err(error) => {
+                            if result_tx
+                                .send(SearchUpdate::Error {
+                                    request_id,
+                                    options,
+                                    error: error.to_string(),
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        SearchBackend::Live { root } => {
+            while let Ok(request) = query_rx.recv() {
+                let mut request = latest_queued_request(request, &query_rx);
+                loop {
+                    let request_id = request.request_id;
+                    let options = request.request.options.clone();
+                    if result_tx
+                        .send(SearchUpdate::Reset {
+                            request_id,
+                            options: options.clone(),
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+
+                    let mut next_request = None;
+                    let outcome = search_live_streaming_batches_with_options(
+                        &root,
+                        &options,
+                        || {
+                            while let Ok(newer_request) = query_rx.try_recv() {
+                                next_request = Some(newer_request);
+                            }
+                            next_request.is_some()
+                        },
+                        |batch| {
+                            result_tx
+                                .send(SearchUpdate::Append {
+                                    request_id,
+                                    options: options.clone(),
+                                    results: batch.results,
+                                    count: batch.count,
+                                })
+                                .context("send live search batch")
+                        },
+                    );
+
+                    match outcome {
+                        Ok((LiveSearchStatus::Complete, final_results)) => {
+                            let count = final_results.len();
+                            if result_tx
+                                .send(SearchUpdate::Complete {
+                                    request_id,
+                                    options,
+                                    count,
+                                    final_results: Some(final_results),
+                                    live_backfill: true,
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        Ok((LiveSearchStatus::Cancelled, _)) => {
+                            if let Some(newer_request) = next_request.take() {
+                                request = newer_request;
+                                continue;
+                            }
+                        }
+                        Err(error) => {
+                            if result_tx
+                                .send(SearchUpdate::Error {
+                                    request_id,
+                                    options,
+                                    error: error.to_string(),
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        SearchBackend::Hybrid { db_path, root } => {
+            while let Ok(request) = query_rx.recv() {
+                let mut request = latest_queued_request(request, &query_rx);
+                loop {
+                    let request_id = request.request_id;
+                    let options = request.request.options.clone();
+                    if result_tx
+                        .send(SearchUpdate::Reset {
+                            request_id,
+                            options: options.clone(),
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+
+                    let mut next_request = None;
+                    let mut seen_paths = HashSet::new();
+                    let mut final_results = Vec::new();
+                    let indexed_outcome = open_search_database(&db_path).and_then(|db| {
+                        db.search_streaming_with_options(
+                            &options,
+                            || {
+                                while let Ok(newer_request) = query_rx.try_recv() {
+                                    next_request = Some(newer_request);
+                                }
+                                next_request.is_some()
+                            },
+                            |batch| {
+                                for result in &batch.results {
+                                    seen_paths.insert(result.path.clone());
+                                    final_results.push(result.clone());
+                                }
+                                result_tx
+                                    .send(SearchUpdate::Append {
+                                        request_id,
+                                        options: options.clone(),
+                                        results: batch.results,
+                                        count: batch.count,
+                                    })
+                                    .context("send hybrid indexed batch")
+                            },
+                        )
+                    });
+
+                    match indexed_outcome {
+                        Ok(SearchStreamStatus::Cancelled) => {
+                            if let Some(newer_request) = next_request.take() {
+                                request = newer_request;
+                                continue;
+                            }
+                            break;
+                        }
+                        Err(error) => {
+                            if result_tx
+                                .send(SearchUpdate::Error {
+                                    request_id,
+                                    options,
+                                    error: error.to_string(),
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
+                            break;
+                        }
+                        Ok(SearchStreamStatus::Complete { .. }) => {}
+                    }
+
+                    let mut live_pending = Vec::with_capacity(SEARCH_BATCH_SIZE);
+                    let mut count = final_results.len();
+                    let live_outcome = search_live_streaming_batches_with_options(
+                        &root,
+                        &options,
+                        || {
+                            while let Ok(newer_request) = query_rx.try_recv() {
+                                next_request = Some(newer_request);
+                            }
+                            next_request.is_some()
+                        },
+                        |batch| {
+                            for result in batch.results {
+                                if seen_paths.insert(result.path.clone()) {
+                                    count += 1;
+                                    live_pending.push(result.clone());
+                                    final_results.push(result);
+                                    if live_pending.len() == SEARCH_BATCH_SIZE {
+                                        let delta = std::mem::replace(
+                                            &mut live_pending,
+                                            Vec::with_capacity(SEARCH_BATCH_SIZE),
+                                        );
+                                        result_tx
+                                            .send(SearchUpdate::Append {
+                                                request_id,
+                                                options: options.clone(),
+                                                results: delta,
+                                                count,
+                                            })
+                                            .context("send hybrid live batch")?;
+                                    }
+                                }
+                            }
+                            Ok(())
+                        },
+                    );
+
+                    match live_outcome {
+                        Ok((LiveSearchStatus::Cancelled, _)) => {
+                            if let Some(newer_request) = next_request.take() {
+                                request = newer_request;
+                                continue;
+                            }
+                        }
+                        Ok((LiveSearchStatus::Complete, _)) => {
+                            if !live_pending.is_empty()
+                                && result_tx
+                                    .send(SearchUpdate::Append {
+                                        request_id,
+                                        options: options.clone(),
+                                        results: live_pending,
+                                        count,
+                                    })
+                                    .is_err()
+                            {
+                                return;
+                            }
+
+                            if let Ok(compiled) =
+                                CompiledQuery::compile(options.mode, &options.query)
+                            {
+                                let mut scorer = QueryScorer::new();
+                                sort_results_compiled(
+                                    &mut final_results,
+                                    &options,
+                                    &compiled,
+                                    &mut scorer,
+                                    &HashMap::new(),
+                                );
+                            }
+                            let count = final_results.len();
+                            if result_tx
+                                .send(SearchUpdate::Complete {
+                                    request_id,
+                                    options,
+                                    count,
+                                    final_results: Some(final_results),
+                                    live_backfill: true,
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        Err(error) => {
+                            if result_tx
+                                .send(SearchUpdate::Error {
+                                    request_id,
+                                    options,
+                                    error: error.to_string(),
+                                })
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn latest_queued_request(
+    mut request: QueuedSearchRequest,
+    query_rx: &Receiver<QueuedSearchRequest>,
+) -> QueuedSearchRequest {
+    while let Ok(newer_request) = query_rx.try_recv() {
+        request = newer_request;
+    }
+    request
+}
+
+#[cfg(test)]
 fn merge_results(
     mut indexed: Vec<SearchResult>,
     live: Vec<SearchResult>,
@@ -1475,6 +1986,7 @@ struct SearchState {
     dirty: bool,
     last_submitted: Option<SearchOptions>,
     last_live_query: Option<String>,
+    active_request_id: Option<u64>,
 }
 
 impl SearchState {
@@ -1493,22 +2005,39 @@ impl SearchState {
     }
 
     fn should_auto_submit(&self, query: &str, backend_label: &str, elapsed: Duration) -> bool {
-        backend_label != "live"
+        (backend_label != "live" || self.last_submitted.is_some())
             && self.should_submit(query)
             && elapsed >= Duration::from_millis(150)
     }
 
+    #[cfg(test)]
     fn mark_submitted(&mut self, options: SearchOptions, live_backfill: bool) {
+        self.mark_submitted_with_id(options, live_backfill, 0);
+    }
+
+    fn mark_submitted_with_id(
+        &mut self,
+        options: SearchOptions,
+        live_backfill: bool,
+        request_id: u64,
+    ) {
         if live_backfill {
             self.last_live_query = None;
         }
         self.last_submitted = Some(options);
+        self.active_request_id = Some(request_id);
         self.dirty = false;
     }
 
-    fn accepts_response(&self, current_query: &str, response_options: &SearchOptions) -> bool {
+    fn accepts_update(
+        &self,
+        request_id: u64,
+        current_query: &str,
+        response_options: &SearchOptions,
+    ) -> bool {
         !self.dirty
             && current_query == response_options.query
+            && self.active_request_id == Some(request_id)
             && self
                 .last_submitted
                 .as_ref()
@@ -1746,6 +2275,8 @@ struct RowCache {
     query: String,
     mode: QueryMode,
     results_stamp: u64,
+    viewport_start: usize,
+    viewport_end: usize,
     rows: Vec<RowData>,
 }
 
@@ -1755,6 +2286,8 @@ impl RowCache {
             query: String::new(),
             mode: QueryMode::Contains,
             results_stamp: u64::MAX,
+            viewport_start: 0,
+            viewport_end: 0,
             rows: Vec::new(),
         }
     }
@@ -1764,15 +2297,52 @@ fn cache_stale(cache: &RowCache, query: &str, mode: QueryMode, stamp: u64) -> bo
     cache.query != query || cache.mode != mode || cache.results_stamp != stamp
 }
 
+fn cache_stale_for_viewport(
+    cache: &RowCache,
+    query: &str,
+    mode: QueryMode,
+    stamp: u64,
+    viewport_start: usize,
+    viewport_end: usize,
+) -> bool {
+    cache_stale(cache, query, mode, stamp)
+        || cache.viewport_start != viewport_start
+        || cache.viewport_end != viewport_end
+}
+
+fn viewport_range(len: usize, selected: Option<usize>, capacity: usize) -> (usize, usize) {
+    if len == 0 {
+        return (0, 0);
+    }
+    let capacity = capacity.max(1).min(len);
+    let selected = selected.unwrap_or(0).min(len - 1);
+    let start = selected.saturating_sub(capacity - 1);
+    (start, (start + capacity).min(len))
+}
+
+#[cfg(test)]
 fn rebuild_row_cache(
     results: &[SearchResult],
     query: &str,
     mode: QueryMode,
     stamp: u64,
 ) -> RowCache {
+    rebuild_viewport_row_cache(results, query, mode, stamp, 0, results.len())
+}
+
+fn rebuild_viewport_row_cache(
+    results: &[SearchResult],
+    query: &str,
+    mode: QueryMode,
+    stamp: u64,
+    viewport_start: usize,
+    viewport_end: usize,
+) -> RowCache {
     let compiled = CompiledQuery::compile(mode, query).ok();
     let mut scorer = QueryScorer::new();
-    let rows = results
+    let viewport_start = viewport_start.min(results.len());
+    let viewport_end = viewport_end.min(results.len()).max(viewport_start);
+    let rows = results[viewport_start..viewport_end]
         .iter()
         .map(|result| {
             let (name_positions, path_positions) = if let Some(ref c) = compiled {
@@ -1796,6 +2366,8 @@ fn rebuild_row_cache(
         query: query.to_string(),
         mode,
         results_stamp: stamp,
+        viewport_start,
+        viewport_end,
         rows,
     }
 }
@@ -1903,7 +2475,7 @@ fn top_status_line(args: &TopPanelArgs<'_>) -> Line<'static> {
         ),
         Span::raw("  "),
         Span::styled(
-            format!("{} results", args.result_count),
+            format!("{} results", format_count(args.result_count)),
             Style::default().fg(args.theme.ok),
         ),
         Span::raw("  "),
@@ -2068,6 +2640,47 @@ fn normalize_selection(state: &mut TableState, len: usize) {
     state.select(Some(next));
 }
 
+fn clear_results(
+    results: &mut Vec<SearchResult>,
+    result_paths: &mut HashSet<String>,
+    selected: &mut TableState,
+) {
+    results.clear();
+    result_paths.clear();
+    selected.select(None);
+}
+
+fn restore_selection_by_path(
+    state: &mut TableState,
+    results: &[SearchResult],
+    anchor: Option<&str>,
+) {
+    if let Some(path) = anchor {
+        if let Some(index) = results.iter().position(|result| result.path == path) {
+            state.select(Some(index));
+            return;
+        }
+    }
+    normalize_selection(state, results.len());
+}
+
+fn format_count(count: usize) -> String {
+    let raw = count.to_string();
+    let first_group_len = raw.len() % 3;
+    let first_group_len = if first_group_len == 0 {
+        3
+    } else {
+        first_group_len
+    };
+    let mut formatted = String::with_capacity(raw.len() + raw.len() / 3);
+    formatted.push_str(&raw[..first_group_len]);
+    for chunk in raw.as_bytes()[first_group_len..].chunks(3) {
+        formatted.push(',');
+        formatted.push_str(std::str::from_utf8(chunk).expect("count is ASCII"));
+    }
+    formatted
+}
+
 fn move_selection(state: &mut TableState, len: usize, delta: isize) {
     if len == 0 {
         state.select(None);
@@ -2111,6 +2724,7 @@ fn selected_detail(state: &TableState, results: &[SearchResult], theme: &Theme) 
     }
 }
 
+#[cfg(test)]
 fn apply_local_result_options(
     results: &[SearchResult],
     options: &SearchOptions,
@@ -2141,6 +2755,7 @@ fn apply_local_result_options(
     visible
 }
 
+#[cfg(test)]
 fn local_filter_matches(result: &SearchResult, filters: &SearchFilters) -> bool {
     if let Some(kind) = &filters.kind {
         if result.kind != kind.as_str() {
@@ -2184,6 +2799,18 @@ pub(crate) fn footer_hint(focus: Focus) -> &'static str {
         Focus::Search => "type to filter \u{00b7} \u{2193}/\u{21e5} results \u{00b7} \u{23ce} open \u{00b7} esc clear",
         Focus::Results => "j/k move \u{00b7} o open \u{00b7} r reveal \u{00b7} y copy \u{00b7} m/f/s mode/filter/sort \u{00b7} / search",
     }
+}
+
+fn footer_with_position(focus: Focus, selected: Option<usize>, total: usize) -> String {
+    let position = selected
+        .filter(|index| *index < total)
+        .map_or(0, |index| index + 1);
+    format!(
+        "{}/{} \u{00b7} {}",
+        format_count(position),
+        format_count(total),
+        footer_hint(focus)
+    )
 }
 
 /// Lines shown in the empty-state onboarding card when query is empty.
@@ -2245,6 +2872,7 @@ fn cycle_kind_filter(filters: SearchFilters) -> SearchFilters {
 mod tests {
     use chrono::{TimeZone, Utc};
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use std::collections::HashSet;
     use tempfile::tempdir;
 
     use crate::db::{local_db_path_for_root, Database, FileRecord, SearchResult};
@@ -2254,14 +2882,16 @@ mod tests {
     use crate::tui::theme::Theme;
     use crate::tui::{
         apply_local_result_options, cache_stale, empty_state_lines, footer_hint,
-        format_result_summary, header_segments, rebuild_row_cache, search_backend_for_directory,
+        footer_with_position, format_count, format_result_summary, header_segments,
+        rebuild_row_cache, restore_selection_by_path, search_backend_for_directory,
         search_bar_line, search_hybrid, should_show_results, sort_label, spinner_glyph,
         toggle_sort_order, top_chrome_height, top_controls_line, top_status_line,
-        tui_search_options, Focus, InputNormalizer, NavigationBurst, RowCache, SearchBackend,
-        SearchInput, SearchRequest, SearchState, SearchWorker, TopPanelArgs,
+        tui_search_options, viewport_range, Focus, InputNormalizer, NavigationBurst, RowCache,
+        SearchBackend, SearchInput, SearchRequest, SearchState, SearchWorker, TopPanelArgs,
         FRAGMENTED_ESCAPE_WINDOW, TUI_RESULT_LIMIT,
     };
     use ratatui::text::Line;
+    use ratatui::widgets::TableState;
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -2395,6 +3025,52 @@ mod tests {
     }
 
     #[test]
+    fn search_state_rejects_late_updates_by_request_id() {
+        let mut state = SearchState::default();
+        let options = SearchOptions::new("archive");
+        state.mark_submitted_with_id(options.clone(), false, 7);
+
+        assert!(state.accepts_update(7, "archive", &options));
+        assert!(!state.accepts_update(6, "archive", &options));
+
+        state.mark_submitted_with_id(options.clone(), false, 8);
+        assert!(!state.accepts_update(7, "archive", &options));
+        assert!(state.accepts_update(8, "archive", &options));
+    }
+
+    #[test]
+    fn viewport_range_limits_row_work_and_keeps_selection_visible() {
+        let (start, end) = viewport_range(10_000, Some(9_999), 20);
+        assert_eq!(end - start, 20);
+        assert_eq!(start, 9_980);
+        assert!(start <= 9_999 && 9_999 < end);
+
+        let (start, end) = viewport_range(10_000, Some(5), 20);
+        assert_eq!((start, end), (0, 20));
+    }
+
+    #[test]
+    fn result_counts_are_grouped_for_progress_statuses() {
+        assert_eq!(format_count(0), "0");
+        assert_eq!(format_count(500), "500");
+        assert_eq!(format_count(12_438), "12,438");
+    }
+
+    #[test]
+    fn selection_restores_by_path_after_final_reorder() {
+        let mut state = TableState::default();
+        state.select(Some(1));
+        let results = vec![
+            test_result("new.txt", "text", Some("txt"), 1),
+            test_result("selected.txt", "text", Some("txt"), 1),
+        ];
+
+        restore_selection_by_path(&mut state, &results, Some("/tmp/selected.txt"));
+
+        assert_eq!(state.selected(), Some(1));
+    }
+
+    #[test]
     fn local_result_options_sort_without_worker_round_trip() {
         let results = vec![
             test_result("beta.txt", "text", Some("txt"), 200),
@@ -2475,20 +3151,159 @@ mod tests {
         worker
             .submit(SearchRequest {
                 options: SearchOptions::new("archive"),
-                live_backfill: false,
             })
             .expect("request sends");
 
         let response = (0..20)
             .find_map(|_| {
                 thread::sleep(Duration::from_millis(10));
-                worker.try_recv()
+                match worker.try_recv() {
+                    Some(super::SearchUpdate::Error { options, error, .. }) => {
+                        Some((options, error))
+                    }
+                    Some(_) | None => None,
+                }
             })
             .expect("worker returns open error");
 
-        assert_eq!(response.options.query, "archive");
-        assert!(response.results.is_err());
-        assert!(response.complete);
+        assert_eq!(response.0.query, "archive");
+        assert!(!response.1.is_empty());
+    }
+
+    #[test]
+    fn live_worker_emits_all_result_deltas_before_completion() {
+        let dir = tempdir().expect("temp dir");
+        for index in 0..1_001 {
+            std::fs::write(dir.path().join(format!("needle-{index:04}.txt")), b"match")
+                .expect("write match");
+        }
+        let mut worker = SearchWorker::spawn(SearchBackend::Live {
+            root: dir.path().to_path_buf(),
+        })
+        .expect("worker spawns");
+        let request_id = worker
+            .submit(SearchRequest {
+                options: SearchOptions::new("needle").with_sort(SortField::Name),
+            })
+            .expect("request sends");
+
+        let mut batch_sizes = Vec::new();
+        let mut final_count = None;
+        for _ in 0..200 {
+            if let Some(update) = worker.try_recv() {
+                match update {
+                    super::SearchUpdate::Reset { request_id: id, .. } => {
+                        assert_eq!(id, request_id);
+                    }
+                    super::SearchUpdate::Append {
+                        request_id: id,
+                        results,
+                        ..
+                    } => {
+                        assert_eq!(id, request_id);
+                        batch_sizes.push(results.len());
+                    }
+                    super::SearchUpdate::Complete {
+                        request_id: id,
+                        count,
+                        final_results: Some(results),
+                        ..
+                    } => {
+                        assert_eq!(id, request_id);
+                        assert_eq!(results.len(), 1_001);
+                        final_count = Some(count);
+                        break;
+                    }
+                    super::SearchUpdate::Complete { .. } => panic!("missing final ordering"),
+                    super::SearchUpdate::Error { error, .. } => panic!("search failed: {error}"),
+                }
+            } else {
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        assert_eq!(batch_sizes, vec![500, 500, 1]);
+        assert_eq!(final_count, Some(1_001));
+    }
+
+    #[test]
+    fn hybrid_worker_deduplicates_indexed_paths_from_live_backfill() {
+        let dir = tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonical root");
+        let db_path = root.join("index.sqlite");
+        let indexed_path = root.join("needle-indexed.txt");
+        std::fs::write(&indexed_path, b"indexed").expect("write indexed match");
+        let db = Database::open(&db_path).expect("open database");
+        db.upsert_file(&FileRecord {
+            path: indexed_path.to_string_lossy().to_string(),
+            name: "needle-indexed.txt".to_string(),
+            parent: root.to_string_lossy().to_string(),
+            extension: Some("txt".to_string()),
+            root: root.to_string_lossy().to_string(),
+            volume: "local".to_string(),
+            kind: "text".to_string(),
+            size_bytes: 7,
+            created_at: None,
+            modified_at: None,
+        })
+        .expect("insert indexed match");
+        drop(db);
+        for index in 0..1_001 {
+            std::fs::write(root.join(format!("needle-live-{index:04}.txt")), b"live")
+                .expect("write live match");
+        }
+
+        let mut worker =
+            SearchWorker::spawn(SearchBackend::Hybrid { db_path, root }).expect("worker spawns");
+        worker
+            .submit(SearchRequest {
+                options: SearchOptions::new("needle").with_sort(SortField::Name),
+            })
+            .expect("request sends");
+
+        let mut batch_paths = Vec::new();
+        let mut final_results = None;
+        for _ in 0..300 {
+            if let Some(update) = worker.try_recv() {
+                match update {
+                    super::SearchUpdate::Append { results, .. } => {
+                        batch_paths.extend(results.into_iter().map(|result| result.path));
+                    }
+                    super::SearchUpdate::Complete {
+                        final_results: Some(results),
+                        ..
+                    } => {
+                        final_results = Some(results);
+                        break;
+                    }
+                    super::SearchUpdate::Complete { .. } => panic!("missing final ordering"),
+                    super::SearchUpdate::Reset { .. } => {}
+                    super::SearchUpdate::Error { error, .. } => {
+                        panic!("hybrid search failed: {error}")
+                    }
+                }
+            } else {
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+
+        let final_results = final_results.expect("hybrid worker completes");
+        assert_eq!(final_results.len(), 1_002);
+        assert_eq!(
+            final_results
+                .iter()
+                .map(|result| result.path.as_str())
+                .collect::<HashSet<_>>()
+                .len(),
+            1_002
+        );
+        assert_eq!(
+            batch_paths
+                .iter()
+                .filter(|path| path.as_str() == indexed_path.to_string_lossy())
+                .count(),
+            1
+        );
     }
 
     #[test]
@@ -2539,6 +3354,61 @@ mod tests {
             normalizer.pop_ready(),
             Some(Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)))
         );
+        assert!(normalizer.pop_ready().is_none());
+    }
+
+    #[test]
+    fn input_normalizer_reassembles_fragmented_sgr_wheel_packet() {
+        let start = Instant::now();
+        let mut normalizer = InputNormalizer::default();
+        let fragments = [
+            '\u{1b}', '[', '<', '6', '5', ';', '1', '1', '9', ';', '4', '5', 'M',
+        ];
+
+        for (offset, ch) in fragments.into_iter().enumerate() {
+            let code = if ch == '\u{1b}' {
+                KeyCode::Esc
+            } else {
+                KeyCode::Char(ch)
+            };
+            normalizer.push(
+                Event::Key(KeyEvent::new(code, KeyModifiers::NONE)),
+                start + Duration::from_millis(offset as u64),
+            );
+        }
+
+        assert!(matches!(
+            normalizer.pop_ready(),
+            Some(Event::Mouse(crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::ScrollDown,
+                column: 118,
+                row: 44,
+                modifiers: KeyModifiers::NONE,
+            }))
+        ));
+        assert!(normalizer.pop_ready().is_none());
+    }
+
+    #[test]
+    fn input_normalizer_discards_fragmented_sgr_motion_packet() {
+        let start = Instant::now();
+        let mut normalizer = InputNormalizer::default();
+        let fragments = [
+            '\u{1b}', '[', '<', '3', '5', ';', '1', '1', '9', ';', '4', '5', 'M',
+        ];
+
+        for (offset, ch) in fragments.into_iter().enumerate() {
+            let code = if ch == '\u{1b}' {
+                KeyCode::Esc
+            } else {
+                KeyCode::Char(ch)
+            };
+            normalizer.push(
+                Event::Key(KeyEvent::new(code, KeyModifiers::NONE)),
+                start + Duration::from_millis(offset as u64),
+            );
+        }
+
         assert!(normalizer.pop_ready().is_none());
     }
 
@@ -2702,6 +3572,8 @@ mod tests {
             query: "foo".to_string(),
             mode: QueryMode::Contains,
             results_stamp: 1,
+            viewport_start: 0,
+            viewport_end: 0,
             rows: Vec::new(),
         };
         assert!(!cache_stale(&cache, "foo", QueryMode::Contains, 1));
@@ -2763,6 +3635,12 @@ mod tests {
         assert!(results_hint.contains("move"));
         assert!(results_hint.contains("open"));
         assert!(results_hint.contains("search"));
+    }
+
+    #[test]
+    fn footer_position_is_one_based_and_formats_total() {
+        assert!(footer_with_position(Focus::Results, Some(24), 2_049).starts_with("25/2,049 ·"));
+        assert!(footer_with_position(Focus::Search, None, 0).starts_with("0/0 ·"));
     }
 
     #[test]
