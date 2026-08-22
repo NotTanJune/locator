@@ -173,6 +173,11 @@ struct FindArgs {
 }
 
 fn main() -> Result<()> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("__finder-helper")) {
+        return locator::open::run_finder_helper();
+    }
+
     let cli = Cli::parse();
 
     match cli.command {

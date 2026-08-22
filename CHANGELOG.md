@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.5
+
+- Moved Apple-silicon Finder automation into a persistent helper process so `NSAppleScript` always executes on the helper's main thread.
+- Preserved asynchronous TUI completion, one reusable lctr-owned Finder window, item selection, window raising, and session-owned cleanup.
+- Added a five-second recovery boundary that terminates a wedged helper and recreates it for pending or subsequent reveals.
+- Added helper protocol coverage for arbitrary text paths and error responses.
+
 ## 0.3.4
 
 - Removed the interactive 1,000-result ceiling and stream all valid indexed, live, and hybrid matches in 500-result batches.

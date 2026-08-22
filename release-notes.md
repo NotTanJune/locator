@@ -1,3 +1,20 @@
+# lctr v0.3.5
+
+A reliability release for Finder reveal on Apple silicon.
+
+## Finder reveal
+
+- Finder automation now runs in a persistent helper process whose compiled `NSAppleScript` stays on its required main thread.
+- Reveals remain asynchronous and continue to reuse one lctr-owned Finder window, raise it, and select the requested item.
+- If Finder automation stops responding for five seconds, lctr terminates the wedged helper and recreates it for the pending or next reveal instead of leaving the shortcut permanently stuck.
+- The helper uses a structured protocol that safely preserves spaces, quotes, newlines, and Unicode in paths.
+
+## Performance and compatibility
+
+- A 500-reveal release soak reused one Finder window with stable early-to-late latency and no failures.
+- No database migration, configuration change, or new dependency is required.
+- The macOS arm64 binary remains M1-compatible.
+
 # lctr v0.3.4
 
 A responsiveness and scale release for large searches, Apple-silicon input, and Finder reveal.

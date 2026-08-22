@@ -7,10 +7,22 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 #[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
 use std::time::Duration;
+#[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+use std::{
+    io::{BufRead, BufReader, Write},
+    process::{Child, ChildStdin, Stdio},
+};
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
 use anyhow::anyhow;
 use anyhow::{bail, Context, Result};
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+use serde::{Deserialize, Serialize};
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+const FINDER_HELPER_ARG: &str = "__finder-helper";
+#[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+const FINDER_HELPER_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub fn open_file(path: &Path) -> Result<()> {
     std::process::Command::new("open")
@@ -201,6 +213,135 @@ enum AppleFinderReply {
     },
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Deserialize, Serialize)]
+struct FinderHelperRequest {
+    operation: i32,
+    window_id: Option<u64>,
+    path: Option<String>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug, Deserialize, Serialize)]
+struct FinderHelperResponse {
+    result: std::result::Result<u64, String>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+struct FinderHelperProcess {
+    child: Child,
+    stdin: ChildStdin,
+    reply_rx: Receiver<std::result::Result<FinderHelperResponse, String>>,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+impl FinderHelperProcess {
+    fn spawn() -> std::result::Result<Self, String> {
+        let executable = std::env::current_exe()
+            .map_err(|error| format!("locate Finder helper executable: {error}"))?;
+        let mut child = std::process::Command::new(executable)
+            .arg(FINDER_HELPER_ARG)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|error| format!("launch Finder helper: {error}"))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| "open Finder helper stdin".to_string())?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| "open Finder helper stdout".to_string())?;
+        let (reply_tx, reply_rx) = mpsc::channel();
+        thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let response = line
+                    .map_err(|error| format!("read Finder helper response: {error}"))
+                    .and_then(|line| {
+                        serde_json::from_str(&line)
+                            .map_err(|error| format!("decode Finder helper response: {error}"))
+                    });
+                let failed = response.is_err();
+                if reply_tx.send(response).is_err() || failed {
+                    return;
+                }
+            }
+            let _ = reply_tx.send(Err("Finder helper exited before replying".to_string()));
+        });
+        Ok(Self {
+            child,
+            stdin,
+            reply_rx,
+        })
+    }
+
+    fn execute(
+        &mut self,
+        request: &FinderHelperRequest,
+    ) -> std::result::Result<FinderHelperResponse, String> {
+        serde_json::to_writer(&mut self.stdin, request)
+            .map_err(|error| format!("encode Finder helper request: {error}"))?;
+        self.stdin
+            .write_all(b"\n")
+            .and_then(|_| self.stdin.flush())
+            .map_err(|error| format!("send Finder helper request: {error}"))?;
+        match self.reply_rx.recv_timeout(FINDER_HELPER_TIMEOUT) {
+            Ok(response) => response,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                Err(format!(
+                    "Finder reveal exceeded {} seconds; helper was stopped for recovery",
+                    FINDER_HELPER_TIMEOUT.as_secs()
+                ))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err("Finder helper response channel disconnected".to_string())
+            }
+        }
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+impl Drop for FinderHelperProcess {
+    fn drop(&mut self) {
+        if self.child.try_wait().ok().flatten().is_none() {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+fn run_finder_helper_command(
+    helper: &mut Option<FinderHelperProcess>,
+    operation: i32,
+    window_id: Option<u64>,
+    path: Option<&Path>,
+) -> std::result::Result<u64, String> {
+    if helper.is_none() {
+        *helper = Some(FinderHelperProcess::spawn()?);
+    }
+    let request = FinderHelperRequest {
+        operation,
+        window_id,
+        path: path.map(|path| path.to_string_lossy().into_owned()),
+    };
+    let response = helper
+        .as_mut()
+        .expect("Finder helper initialized")
+        .execute(&request);
+    match response {
+        Ok(response) => response.result,
+        Err(error) => {
+            *helper = None;
+            Err(error)
+        }
+    }
+}
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
 struct AppleFinderSession {
     command_tx: Sender<AppleFinderCommand>,
@@ -213,27 +354,21 @@ struct AppleFinderSession {
 #[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
 impl AppleFinderSession {
     fn new() -> Self {
-        initialize_apple_event_runtime();
         let (command_tx, command_rx) = mpsc::channel();
         let (reply_tx, reply_rx) = mpsc::channel();
         thread::spawn(move || {
-            let script = compile_finder_script();
+            let mut helper = None;
             while let Ok(command) = command_rx.recv() {
                 let reply = match command {
                     AppleFinderCommand::Reveal { path, window_id } => {
-                        let result = match &script {
-                            Ok(script) => run_finder_script(script, 1, window_id, Some(&path)),
-                            Err(error) => Err(error.clone()),
-                        };
+                        let result =
+                            run_finder_helper_command(&mut helper, 1, window_id, Some(&path));
                         AppleFinderReply::Reveal { path, result }
                     }
                     AppleFinderCommand::Close { window_id } => {
-                        let result = match &script {
-                            Ok(script) => {
-                                run_finder_script(script, 2, Some(window_id), None).map(|_| ())
-                            }
-                            Err(error) => Err(error.clone()),
-                        };
+                        let result =
+                            run_finder_helper_command(&mut helper, 2, Some(window_id), None)
+                                .map(|_| ());
                         AppleFinderReply::Close { result }
                     }
                 };
@@ -337,6 +472,57 @@ fn initialize_apple_event_runtime() {
     autoreleasepool(|_| {
         let _ = NSAppleEventDescriptor::nullDescriptor();
     });
+}
+
+/// Runs the private Finder automation helper on this process's main thread.
+///
+/// The parent `lctr` process keeps this helper alive for the TUI session and
+/// communicates over newline-delimited JSON. `NSAppleScript` is main-thread
+/// only, so neither the compiled script nor its descriptors leave this loop.
+#[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
+pub fn run_finder_helper() -> Result<()> {
+    initialize_apple_event_runtime();
+    let script = compile_finder_script();
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout().lock();
+
+    for line in stdin.lock().lines() {
+        let response = match line {
+            Ok(line) => match serde_json::from_str::<FinderHelperRequest>(&line) {
+                Ok(request) if request.operation == 1 || request.operation == 2 => {
+                    let path = request.path.map(PathBuf::from);
+                    let result = match &script {
+                        Ok(script) => run_finder_script(
+                            script,
+                            request.operation,
+                            request.window_id,
+                            path.as_deref(),
+                        ),
+                        Err(error) => Err(error.clone()),
+                    };
+                    FinderHelperResponse { result }
+                }
+                Ok(request) => FinderHelperResponse {
+                    result: Err(format!(
+                        "unsupported Finder helper operation {}",
+                        request.operation
+                    )),
+                },
+                Err(error) => FinderHelperResponse {
+                    result: Err(format!("decode Finder helper request: {error}")),
+                },
+            },
+            Err(error) => {
+                return Err(error).context("read Finder helper request");
+            }
+        };
+        serde_json::to_writer(&mut stdout, &response).context("encode Finder helper response")?;
+        stdout
+            .write_all(b"\n")
+            .and_then(|_| stdout.flush())
+            .context("send Finder helper response")?;
+    }
+    Ok(())
 }
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
@@ -646,6 +832,8 @@ mod tests {
         AutomationOutput, FinderAutomation, FinderRevealSession, CLOSE_WINDOW_SCRIPT,
         CREATE_WINDOW_SCRIPT, RETARGET_WINDOW_SCRIPT,
     };
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    use super::{FinderHelperRequest, FinderHelperResponse};
 
     type Calls = Arc<Mutex<Vec<(String, Vec<OsString>)>>>;
 
@@ -843,5 +1031,36 @@ mod tests {
             assert!(!script.contains("set selection of finderWindow"));
         }
         assert!(CREATE_WINDOW_SCRIPT.contains("open parentRef"));
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn finder_helper_request_protocol_round_trips_arbitrary_text_paths() {
+        let request = FinderHelperRequest {
+            operation: 1,
+            window_id: Some(42),
+            path: Some("/tmp/quote \" newline\n snowman ☃.txt".to_string()),
+        };
+
+        let encoded = serde_json::to_string(&request).expect("encode request");
+        let decoded: FinderHelperRequest = serde_json::from_str(&encoded).expect("decode request");
+
+        assert_eq!(decoded.operation, request.operation);
+        assert_eq!(decoded.window_id, request.window_id);
+        assert_eq!(decoded.path, request.path);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn finder_helper_response_protocol_preserves_success_and_error() {
+        for result in [Ok(42), Err("Finder denied automation".to_string())] {
+            let encoded = serde_json::to_string(&FinderHelperResponse {
+                result: result.clone(),
+            })
+            .expect("encode response");
+            let decoded: FinderHelperResponse =
+                serde_json::from_str(&encoded).expect("decode response");
+            assert_eq!(decoded.result, result);
+        }
     }
 }
