@@ -1,6 +1,6 @@
 [package]
 name = "locator"
-version = "0.3.5"
+version = "0.3.6"
 edition = "2021"
 description = "Fast local file metadata search"
 repository = "https://github.com/NotTanJune/locator"

@@ -1,3 +1,25 @@
+# lctr v0.3.6
+
+A responsiveness and terminal cleanup release for interactive search.
+
+## Search interaction
+
+- The highlighted result now moves through the visible rows before the viewport scrolls at the top or bottom edge.
+- Upward and downward navigation stop at the first and last result instead of wrapping.
+- The selected path and current viewport position remain stable while progressive or live results refresh.
+
+## Startup and terminal cleanup
+
+- Search no longer waits for keyboard or graphics capability responses before drawing its first frame.
+- Image previews use the half-block renderer without a blocking terminal graphics probe.
+- Queued SGR mouse-motion reports are discarded during teardown, so exiting search leaves a clean parent-shell prompt.
+
+## Compatibility
+
+- No database migration or schema change is required.
+- No new dependency is required.
+- The macOS arm64 binary remains M1-compatible.
+
 # lctr v0.3.5
 
 A reliability release for Finder reveal on Apple silicon.

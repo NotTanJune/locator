@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.6
+
+- Fixed TUI result navigation so the highlighted row moves through the visible viewport before scrolling at its edge, in both directions.
+- Preserved the selected path and current viewport position across progressive and refreshed search results.
+- Removed blocking terminal capability probes from search startup.
+- Prevented queued SGR mouse-motion reports from leaking into the parent shell after exit.
+
 ## 0.3.5
 
 - Moved Apple-silicon Finder automation into a persistent helper process so `NSAppleScript` always executes on the helper's main thread.

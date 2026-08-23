@@ -15,8 +15,7 @@ use crossterm::event::{
 };
 use crossterm::execute;
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, supports_keyboard_enhancement, EnterAlternateScreen,
-    LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Position, Rect};
@@ -564,11 +563,12 @@ impl TerminalGuard {
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        if self.keyboard_enhanced {
-            let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
-        }
         if self.mouse_captured {
             let _ = execute!(io::stdout(), DisableMouseCapture);
+            discard_pending_terminal_input();
+        }
+        if self.keyboard_enhanced {
+            let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
         }
         let _ = disable_raw_mode();
         let _ = execute!(
@@ -580,19 +580,33 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// Turn on the kitty keyboard protocol's escape-code disambiguation when the
-/// terminal supports it. This makes a lone `Esc` register on the first press
-/// instead of being held back by the parser as the possible prefix of an arrow
-/// or function-key sequence. Returns whether the flags were pushed so the guard
-/// knows to pop them on teardown. No-op (and harmless) on terminals lacking
-/// support.
+#[cfg(unix)]
+fn discard_pending_terminal_input() {
+    // Mouse tracking reports can still be queued when the app exits. Clear
+    // them while raw mode is active so the parent shell cannot read them.
+    unsafe {
+        let _ = libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH);
+    }
+}
+
+#[cfg(not(unix))]
+fn discard_pending_terminal_input() {}
+
+/// Request the kitty keyboard protocol's escape-code disambiguation. This makes
+/// a lone `Esc` register on the first press instead of being held back by the
+/// parser as the possible prefix of an arrow or function-key sequence. The
+/// request is non-blocking, and unsupported terminals ignore the private CSI
+/// sequence. Returns whether the flags were pushed so the guard knows to pop
+/// them on teardown.
 fn enable_keyboard_enhancement() -> bool {
-    matches!(supports_keyboard_enhancement(), Ok(true))
-        && execute!(
-            io::stdout(),
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
-        )
-        .is_ok()
+    // crossterm's support probe waits for a terminal response for up to two
+    // seconds. The kitty keyboard sequence is a private CSI request, so
+    // unsupported terminals can ignore it without a blocking probe.
+    execute!(
+        io::stdout(),
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    )
+    .is_ok()
 }
 
 pub fn run_with_backend(search_backend: SearchBackend, update_check_disabled: bool) -> Result<()> {
@@ -615,6 +629,7 @@ fn run_loop(
     let mut results_stamp: u64 = 0;
     let mut row_cache = RowCache::empty();
     let mut selected = TableState::default();
+    let mut viewport_start = 0usize;
     let mut status = String::from("Type to search. Tab or Down to navigate results.");
     let mut search_state = SearchState::default();
     let backend_label = search_backend.label();
@@ -631,7 +646,12 @@ fn run_loop(
         .and_then(|(root, db_path)| LiveIndex::spawn(root.clone(), db_path.clone()).ok());
     let mut watch_enabled = live_index.is_some();
     let mut live_generation = live_index.as_ref().map_or(0, LiveIndex::generation);
-    let mut picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
+    // Do not probe terminal capabilities before the first frame. The probe
+    // waits for a response on stdin and can block for seconds in terminals
+    // that do not implement the graphics query, while also racing input
+    // handling after its timeout. Half-block rendering remains available for
+    // image previews without delaying TUI startup.
+    let mut picker = Picker::halfblocks();
     let mut preview_state: Option<PreviewState> = None;
     let mut preview_target: Option<String> = None;
     let mut preview_pending_since = Instant::now();
@@ -989,8 +1009,13 @@ fn run_loop(
 
                 if search_state.should_render_results(query) {
                     let capacity = results_area.height.saturating_sub(3).max(1) as usize;
-                    let (viewport_start, viewport_end) =
-                        viewport_range(results.len(), selected.selected(), capacity);
+                    let (next_viewport_start, viewport_end) = viewport_range(
+                        results.len(),
+                        selected.selected(),
+                        capacity,
+                        viewport_start,
+                    );
+                    viewport_start = next_viewport_start;
                     if cache_stale_for_viewport(
                         &row_cache,
                         input.as_str(),
@@ -2310,13 +2335,26 @@ fn cache_stale_for_viewport(
         || cache.viewport_end != viewport_end
 }
 
-fn viewport_range(len: usize, selected: Option<usize>, capacity: usize) -> (usize, usize) {
+fn viewport_range(
+    len: usize,
+    selected: Option<usize>,
+    capacity: usize,
+    current_start: usize,
+) -> (usize, usize) {
     if len == 0 {
         return (0, 0);
     }
     let capacity = capacity.max(1).min(len);
-    let selected = selected.unwrap_or(0).min(len - 1);
-    let start = selected.saturating_sub(capacity - 1);
+    let max_start = len - capacity;
+    let mut start = current_start.min(max_start);
+    if let Some(selected) = selected {
+        let selected = selected.min(len - 1);
+        if selected < start {
+            start = selected;
+        } else if selected >= start + capacity {
+            start = selected.saturating_sub(capacity - 1).min(max_start);
+        }
+    }
     (start, (start + capacity).min(len))
 }
 
@@ -3040,13 +3078,22 @@ mod tests {
 
     #[test]
     fn viewport_range_limits_row_work_and_keeps_selection_visible() {
-        let (start, end) = viewport_range(10_000, Some(9_999), 20);
+        let (start, end) = viewport_range(10_000, Some(9_999), 20, 0);
         assert_eq!(end - start, 20);
         assert_eq!(start, 9_980);
         assert!(start <= 9_999 && 9_999 < end);
 
-        let (start, end) = viewport_range(10_000, Some(5), 20);
+        let (start, end) = viewport_range(10_000, Some(5), 20, 0);
         assert_eq!((start, end), (0, 20));
+    }
+
+    #[test]
+    fn viewport_range_holds_window_until_selection_reaches_an_edge() {
+        assert_eq!(viewport_range(100, Some(50), 5, 46), (46, 51));
+        assert_eq!(viewport_range(100, Some(45), 5, 46), (45, 50));
+        assert_eq!(viewport_range(100, Some(51), 5, 46), (47, 52));
+        assert_eq!(viewport_range(100, Some(0), 5, 46), (0, 5));
+        assert_eq!(viewport_range(100, Some(99), 5, 46), (95, 100));
     }
 
     #[test]
