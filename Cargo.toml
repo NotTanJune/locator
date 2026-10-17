@@ -6,6 +6,8 @@ description = "Fast local file metadata search"
 repository = "https://github.com/NotTanJune/locator"
 homepage = "https://github.com/NotTanJune/locator"
 license = "GPL-3.0-only"
+# The README media is hosted on GitHub; keep the demo videos and GIFs out of the crate package.
+exclude = ["assets/"]
 
 [lib]
 name = "locator"
