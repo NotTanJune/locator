@@ -1,5 +1,5 @@
 {
-    "version": "0.3.6",
+    "version": "0.4.0",
     "description": "Fast local file metadata search from the terminal.",
     "homepage": "https://github.com/NotTanJune/locator",
     "license": "GPL-3.0-only",
@@ -11,8 +11,8 @@
     ],
     "architecture": {
         "64bit": {
-            "url": "https://github.com/NotTanJune/locator/releases/download/v0.3.6/lctr-x86_64-pc-windows-msvc.zip",
-            "hash": "9180016010f3e48d2299e709f93ac14b25d40f54d0f05d144f176b23226a55f6"
+            "url": "https://github.com/NotTanJune/locator/releases/download/v0.4.0/lctr-x86_64-pc-windows-msvc.zip",
+            "hash": "d5755a053e38c628dc60dfa5d1689ea42c6ee6dd983df11b5e2b0dfd19390110"
         }
     },
     "bin": "lctr.exe",

@@ -1,8 +1,8 @@
 class Lctr < Formula
   desc "Fast local file metadata search"
   homepage "https://github.com/NotTanJune/locator"
-  url "https://github.com/NotTanJune/locator/releases/download/v0.3.6/lctr-aarch64-apple-darwin.tar.gz"
-  sha256 "75414fba7d428375aa6b5256082f3db886a0e99da846fb96aa3db5fdc1d6ec32"
+  url "https://github.com/NotTanJune/locator/releases/download/v0.4.0/lctr-aarch64-apple-darwin.tar.gz"
+  sha256 "a6f3cd366ecfbdc674bfeade26d16935afe869383248a5ed1455151992368683"
   license "GPL-3.0-only"
 
   head do
@@ -46,6 +46,6 @@ class Lctr < Formula
   end
 
   test do
-    assert_match "lctr 0.3.6", shell_output("#{bin}/lctr --version")
+    assert_match "lctr 0.4.0", shell_output("#{bin}/lctr --version")
   end
 end
