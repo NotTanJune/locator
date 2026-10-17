@@ -4,7 +4,7 @@ Adds semantic search over file contents and fixes several issues in the search a
 
 ## Semantic search
 
-- `lctr scan <dir> --em` embeds the text of documents, code, and notes, and the pixels of images, with EmbeddingGemma 2 (Google DeepMind, Apache 2.0). The model runs locally through llama.cpp. Results are stored in a separate file next to the search index.
+- `lctr scan <dir> --em` embeds the text of documents, code, and notes, and the pixels of images, with EmbeddingGemma 2 (Google DeepMind, Apache 2.0). The model runs locally through llama.cpp. Results are stored in a separate file next to the search index. That file keeps a short plain-text snippet of each chunk, so lctr writes a `.gitignore` containing `*` into every `.locator` folder it writes an index to, and a scanned git project does not pick up the index.
 - Search by meaning in `lctr search` by pressing `m` until the mode reads `semantic`. In scripts, use `lctr find "<query>" --mode semantic`; `--output jsonl` adds a score and a snippet to each result.
 - Depth is set with `--depth quick|balanced|deep` or the `embed_depth` setting. The default is `quick`, which embeds the first 8 chunks of every file (pass 1). `balanced` adds chunks 9 to 32 (pass 2), and `deep` adds chunks up to 128 (pass 3). A deeper run embeds only the chunks that are missing.
 - Each pass makes search useful for more of each file. Search works after pass 1 finishes; the later passes add depth.
@@ -28,7 +28,7 @@ Adds semantic search over file contents and fixes several issues in the search a
 
 ## Open, reveal, and update
 
-- Open and reveal work on Linux (through `xdg-open`) and Windows (through Explorer). A failed action shows a message in the status line and no longer exits search.
+- Open and reveal are added for Linux (through `xdg-open`) and Windows (through Explorer). They have been tested on macOS only; please report problems on Linux or Windows. A failed action shows a message in the status line and no longer exits search.
 - `lctr update` on Windows detects Scoop installs and points them to `scoop update`. Direct installs update from the release asset. The WinGet instruction is removed because no WinGet package exists.
 
 ## Preview

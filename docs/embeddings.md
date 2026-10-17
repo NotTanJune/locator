@@ -101,7 +101,11 @@ printing their names.
 
 Everything runs on your machine. The model is downloaded once from Hugging Face and checked against a
 pinned SHA-256. After that, no file content leaves the machine. The embeddings file contains snippets of
-your text, so treat it like the files it came from.
+your text, so treat it like the files it came from. The file has mode 0600 on Unix. Whenever lctr
+opens an index in a `.locator` folder for writing (scan, watch, live index) and the folder has no `.gitignore`, it
+writes one containing `*`, so `git add .` in a scanned project does not pick up the index or the embeddings
+file. Folders from older versions get it on their next scan. An existing `.gitignore` is never changed. An
+index placed elsewhere with `LCTR_DB` has no such file; keep it out of version control yourself.
 
 ## Models and where they live
 

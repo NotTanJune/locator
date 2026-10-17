@@ -188,6 +188,8 @@ Indexes are local SQLite files. By default, a scan writes to the directory you s
 <ROOT>/.locator/index.sqlite
 ```
 
+When `lctr` writes an index into a `.locator` folder it also adds a `.gitignore` containing `*` there (older folders get it on the next scan), so a scanned git project never commits the index or the embeddings file (which holds short snippets of your text).
+
 If that location is not writable, `lctr` stores a fallback index in local app-support storage for your user account:
 
 ```bash

@@ -107,7 +107,7 @@ impl Database {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
+            create_index_dir(parent)
                 .with_context(|| format!("create database directory {}", parent.display()))?;
         }
         let conn =
@@ -136,7 +136,7 @@ impl Database {
     pub fn open_fresh_staged_scan(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
+            create_index_dir(parent)
                 .with_context(|| format!("create database directory {}", parent.display()))?;
         }
         let conn =
@@ -1262,6 +1262,21 @@ impl Database {
         }
         Ok(())
     }
+}
+
+/// Creates the directory that holds an index. A `.locator` directory also gets a `.gitignore`
+/// containing `*`, so a scanned git project never picks up the index or the embeddings sidecar
+/// (which stores short plain-text snippets of the scanned files).
+pub fn create_index_dir(dir: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dir)?;
+    if dir.file_name().is_some_and(|name| name == LOCAL_INDEX_DIR) {
+        let ignore = dir.join(".gitignore");
+        if !ignore.exists() {
+            // Best effort: a read-only or racing directory must not fail the scan.
+            let _ = fs::write(&ignore, "*\n");
+        }
+    }
+    Ok(())
 }
 
 pub fn delete_index_files(path: impl AsRef<Path>) -> Result<u64> {

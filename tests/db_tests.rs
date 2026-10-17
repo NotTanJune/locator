@@ -1101,3 +1101,44 @@ fn verified_search_drops_paths_whose_parent_became_a_file() {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].path, real_path.to_string_lossy());
 }
+
+#[test]
+fn local_index_dir_gets_a_self_ignoring_gitignore() {
+    let _env = env_guard();
+    let dir = tempdir().expect("tempdir");
+    let local = dir.path().join(".locator");
+    let other = dir.path().join("elsewhere");
+
+    Database::open(local.join("index.sqlite")).expect("open local index");
+    Database::open(other.join("index.sqlite")).expect("open other index");
+
+    assert_eq!(
+        std::fs::read_to_string(local.join(".gitignore")).expect("gitignore written"),
+        "*\n"
+    );
+    assert!(!other.join(".gitignore").exists());
+
+    // An existing file is never overwritten.
+    std::fs::write(local.join(".gitignore"), "custom\n").expect("write custom");
+    Database::open(local.join("index.sqlite")).expect("reopen local index");
+    assert_eq!(
+        std::fs::read_to_string(local.join(".gitignore")).expect("read gitignore"),
+        "custom\n"
+    );
+}
+
+#[test]
+fn embeddings_sidecar_in_a_local_index_dir_is_ignored_by_git() {
+    let _env = env_guard();
+    let dir = tempdir().expect("tempdir");
+    let local = dir.path().join(".locator");
+    let sidecar = locator::embed::store::sidecar_path_for_index(&local.join("index.sqlite"));
+
+    locator::embed::store::EmbedStore::open(&sidecar).expect("open sidecar");
+
+    assert!(sidecar.exists());
+    assert_eq!(
+        std::fs::read_to_string(local.join(".gitignore")).expect("gitignore written"),
+        "*\n"
+    );
+}

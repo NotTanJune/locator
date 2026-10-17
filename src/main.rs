@@ -592,7 +592,7 @@ fn handle_embed(action: EmbedCommand) -> Result<()> {
 
 fn copy_finished_index(source: &Path, target: &Path) -> Result<()> {
     if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent)?;
+        locator::db::create_index_dir(parent)?;
     }
     // Copy into the target's directory first so the final install is a
     // same-filesystem rename, which is atomic. The staging DB may live on a
@@ -611,7 +611,7 @@ fn copy_finished_index(source: &Path, target: &Path) -> Result<()> {
 fn staged_target_path_for_root(root: &Path) -> Result<PathBuf> {
     let local_target = local_db_path_for_root(root)?;
     if let Some(parent) = local_target.parent() {
-        match fs::create_dir_all(parent) {
+        match locator::db::create_index_dir(parent) {
             Ok(()) => return Ok(local_target),
             Err(error) if is_readonly_or_permission_error(&error) => {
                 let fallback = fallback_db_path_for_root(root)?;

@@ -119,7 +119,7 @@ impl EmbedStore {
     pub fn open(path: &Path) -> Result<EmbedStore> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)
+                crate::db::create_index_dir(parent)
                     .with_context(|| format!("create {}", parent.display()))?;
             }
         }
