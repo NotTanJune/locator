@@ -19,6 +19,12 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      # The llama.cpp submodule inside the llama-cpp-rs checkout has paths longer than the 260
+      # character Windows limit. Without this, cargo fails with "path too long" while fetching it.
+      - name: Allow long paths (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: git config --system core.longpaths true
       # bindgen (used by llama-cpp-sys-2) needs libclang. The Windows runner has LLVM installed at
       # C:\Program Files\LLVM but does not put it on the search path. Windows-only, so Linux and
       # macOS keep their own libclang.
@@ -49,8 +55,9 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV -Value "LCTR_BUNDLED_MODEL=$path"
       - name: Check the bundled-model build
         run: cargo check --features bundled-model
+      # dummy.gguf from the step above is intentionally untracked, so allow a dirty tree.
       - name: Package
-        run: cargo package --no-verify
+        run: cargo package --no-verify --allow-dirty
       - name: Release manifest updater
         if: runner.os != 'Windows'
         run: scripts/test-update-release-manifests.sh

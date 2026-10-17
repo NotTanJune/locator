@@ -16,7 +16,7 @@ use llama_cpp_2::mtmd::{
     mtmd_default_marker, MtmdBitmap, MtmdContext, MtmdContextParams, MtmdInputText,
 };
 use llama_cpp_2::token::LlamaToken;
-use llama_cpp_2::{list_llama_ggml_backend_devices, send_logs_to_tracing, LogOptions};
+use llama_cpp_2::{send_logs_to_tracing, LogOptions};
 
 use super::fake::HashEmbedder;
 use super::image_sizing::resize_for_budget;
@@ -211,10 +211,12 @@ fn guard_backend(backend: &LlamaBackend) -> Result<&'static str> {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
         // ggml names its Metal backend "MTL" (device "MTL0"); accept "Metal" as well.
-        let metal_device = list_llama_ggml_backend_devices().iter().any(|device| {
-            device.backend.eq_ignore_ascii_case("mtl")
-                || device.backend.eq_ignore_ascii_case("metal")
-        });
+        let metal_device = llama_cpp_2::list_llama_ggml_backend_devices()
+            .iter()
+            .any(|device| {
+                device.backend.eq_ignore_ascii_case("mtl")
+                    || device.backend.eq_ignore_ascii_case("metal")
+            });
         if !backend.supports_gpu_offload() || !metal_device {
             bail!("Metal backend unavailable on Apple Silicon; refusing to fall back to CPU");
         }

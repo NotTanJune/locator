@@ -30,6 +30,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      # The llama.cpp submodule inside the llama-cpp-rs checkout has paths longer than the 260
+      # character Windows limit. Without this, cargo fails with "path too long" while fetching it.
+      - name: Allow long paths (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: git config --system core.longpaths true
       # bindgen (used by llama-cpp-sys-2) needs libclang. The Windows runner has LLVM installed at
       # C:\Program Files\LLVM but does not put it on the search path. Set through GITHUB_ENV in a
       # Windows-only step, because a job-level value would also reach the Linux and macOS builds.
