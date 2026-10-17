@@ -130,3 +130,50 @@ fn fuzzy_rank_orders_better_matches_higher() {
     assert!(tight.is_some() && loose.is_some());
     assert!(tight.unwrap() >= loose.unwrap());
 }
+
+#[test]
+fn semantic_mode_joins_the_cycle_after_glob() {
+    use locator::query::QueryMode;
+    assert_eq!(QueryMode::Glob.next(), QueryMode::Semantic);
+    assert_eq!(QueryMode::Semantic.next(), QueryMode::Contains);
+    assert_eq!(QueryMode::Semantic.label(), "semantic");
+}
+
+#[test]
+fn next_available_skips_semantic_when_unavailable() {
+    use locator::query::QueryMode;
+    let mut mode = QueryMode::Contains;
+    for _ in 0..12 {
+        mode = mode.next_available(false);
+        assert_ne!(mode, QueryMode::Semantic);
+    }
+    assert_eq!(QueryMode::Glob.next_available(false), QueryMode::Contains);
+    assert_eq!(QueryMode::Glob.next_available(true), QueryMode::Semantic);
+    assert_eq!(
+        QueryMode::Semantic.next_available(true),
+        QueryMode::Contains
+    );
+}
+
+#[test]
+fn compiling_semantic_mode_is_an_error() {
+    use locator::query::{CompiledQuery, QueryMode};
+    let error = match CompiledQuery::compile(QueryMode::Semantic, "x") {
+        Ok(_) => panic!("semantic mode must not compile"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("--em"), "{error}");
+}
+
+#[test]
+fn database_search_rejects_semantic_mode_loudly() {
+    use locator::db::Database;
+    use locator::query::{QueryMode, SearchOptions};
+    let db = Database::open_in_memory().expect("db");
+    let mut options = SearchOptions::new("x");
+    options.mode = QueryMode::Semantic;
+    let error = db
+        .search_with_options(&options)
+        .expect_err("semantic is not a SQL mode");
+    assert!(error.to_string().contains("embed::search"), "{error}");
+}

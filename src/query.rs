@@ -14,6 +14,8 @@ pub enum QueryMode {
     Fuzzy,
     Regex,
     Glob,
+    /// Natural-language search over embedded file contents (see `embed::search`).
+    Semantic,
 }
 
 impl QueryMode {
@@ -26,6 +28,7 @@ impl QueryMode {
             Self::Fuzzy => "fuzzy",
             Self::Regex => "regex",
             Self::Glob => "glob",
+            Self::Semantic => "semantic",
         }
     }
 
@@ -37,8 +40,23 @@ impl QueryMode {
             Self::Suffix => Self::Fuzzy,
             Self::Fuzzy => Self::Regex,
             Self::Regex => Self::Glob,
-            Self::Glob => Self::Contains,
+            Self::Glob => Self::Semantic,
+            Self::Semantic => Self::Contains,
         }
+    }
+
+    /// Next mode in the cycle, skipping `Semantic` when no embeddings exist.
+    pub fn next_available(self, semantic_available: bool) -> Self {
+        let mut candidate = self.next();
+        if !semantic_available {
+            for _ in 0..7 {
+                if candidate != Self::Semantic {
+                    break;
+                }
+                candidate = candidate.next();
+            }
+        }
+        candidate
     }
 
     /// Convenience one-shot match. Compiles the query and matches a single
@@ -138,6 +156,11 @@ impl CompiledQuery {
                     .map_err(|error| anyhow!("invalid regex '{trimmed}': {error}"))?,
             ),
             QueryMode::Glob => Self::Glob(glob_regex(trimmed)?),
+            QueryMode::Semantic => {
+                return Err(anyhow!(
+                    "semantic mode needs embeddings; run `lctr scan <dir> --em`"
+                ))
+            }
         })
     }
 

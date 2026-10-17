@@ -13,6 +13,17 @@ use tempfile::tempdir;
 
 static LCTR_ENV_LOCK: Mutex<()> = Mutex::new(());
 
+/// Every test in this file holds this lock. Opening a database reads the global user config
+/// (`Config::load`, through `fts_index_paths`), and the tests that point `LCTR_CONFIG_DIR` or
+/// `LCTR_DATA_DIR` at a temporary folder change what that read returns. A test that does not hold
+/// the lock can see the setting flip in the middle of a write. A poisoned lock (an earlier test
+/// panicked) is still taken, so one failure does not cascade into the rest.
+fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+    LCTR_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
 fn record(path: &str, name: &str, ext: Option<&str>, size: u64, modified_year: i32) -> FileRecord {
     FileRecord {
         path: path.into(),
@@ -53,6 +64,7 @@ fn record_for_path(path: &Path, ext: Option<&str>, size: u64, modified_year: i32
 
 #[test]
 fn finds_records_by_keyword_and_filters() {
+    let _guard = env_guard();
     let db = Database::open_in_memory().expect("db opens");
     db.upsert_file(&record(
         "/tmp/invoice.pdf",
@@ -96,6 +108,7 @@ fn finds_records_by_keyword_and_filters() {
 #[test]
 #[cfg(unix)]
 fn readonly_existing_database_can_be_searched_without_migration() {
+    let _guard = env_guard();
     let dir = tempdir().expect("temp dir");
     let db_path = dir.path().join("index.sqlite");
     {
@@ -124,6 +137,7 @@ fn readonly_existing_database_can_be_searched_without_migration() {
 
 #[test]
 fn searches_with_query_modes_metadata_filters_and_sorting() {
+    let _guard = env_guard();
     let db = Database::open_in_memory().expect("db opens");
     db.upsert_file(&record(
         "/tmp/alpha-report.pdf",
@@ -171,6 +185,7 @@ fn searches_with_query_modes_metadata_filters_and_sorting() {
 
 #[test]
 fn option_search_uses_contains_mode_for_infix_filename_matches() {
+    let _guard = env_guard();
     let db = Database::open_in_memory().expect("db opens");
     db.upsert_file(&record(
         "/tmp/my-archive-file.zip",
@@ -191,7 +206,7 @@ fn option_search_uses_contains_mode_for_infix_filename_matches() {
 
 #[test]
 fn marks_missing_root_records_deleted() {
-    let _lock = LCTR_ENV_LOCK.lock().unwrap();
+    let _guard = env_guard();
     let db = Database::open_in_memory().expect("db opens");
     db.upsert_file(&record("/tmp/old.pdf", "old.pdf", Some("pdf"), 10, 2024))
         .expect("insert");
@@ -207,6 +222,7 @@ fn marks_missing_root_records_deleted() {
 
 #[test]
 fn batch_upsert_indexes_multiple_records() {
+    let _guard = env_guard();
     let db = Database::open_in_memory().expect("db opens");
     let records = vec![
         record("/tmp/a.pdf", "a.pdf", Some("pdf"), 10, 2024),
@@ -223,6 +239,7 @@ fn batch_upsert_indexes_multiple_records() {
 
 #[test]
 fn stores_large_sizes_as_sqlite_safe_values() {
+    let _guard = env_guard();
     let db = Database::open_in_memory().expect("db opens");
     db.upsert_file(&record(
         "/tmp/huge.bin",
@@ -243,7 +260,7 @@ fn stores_large_sizes_as_sqlite_safe_values() {
 
 #[test]
 fn light_bulk_upsert_writes_searchable_name_path_rows() {
-    let _lock = LCTR_ENV_LOCK.lock().unwrap();
+    let _guard = env_guard();
     let db = Database::open_in_memory().expect("db opens");
     let records = vec![
         record("/tmp/a.pdf", "a.pdf", Some("pdf"), 42, 2024),
@@ -267,7 +284,7 @@ fn light_bulk_upsert_writes_searchable_name_path_rows() {
 
 #[test]
 fn light_bulk_insert_writes_searchable_name_path_rows() {
-    let _lock = LCTR_ENV_LOCK.lock().unwrap();
+    let _guard = env_guard();
     let db = Database::open_in_memory().expect("db opens");
     let records = vec![
         record("/tmp/a.pdf", "a.pdf", Some("pdf"), 42, 2024),
@@ -288,6 +305,7 @@ fn light_bulk_insert_writes_searchable_name_path_rows() {
 
 #[test]
 fn fresh_staged_scan_defers_indexes_until_finish() {
+    let _guard = env_guard();
     let dir = tempdir().expect("temp dir");
     let db_path = dir.path().join("index.sqlite");
     let db = Database::open_fresh_staged_scan(&db_path).expect("db opens");
@@ -331,6 +349,7 @@ fn fresh_staged_scan_defers_indexes_until_finish() {
 
 #[test]
 fn bulk_scan_keeps_secondary_indexes_by_default() {
+    let _guard = env_guard();
     let dir = tempdir().expect("temp dir");
     let db_path = dir.path().join("index.sqlite");
     let db = Database::open(&db_path).expect("db opens");
@@ -349,6 +368,7 @@ fn bulk_scan_keeps_secondary_indexes_by_default() {
 
 #[test]
 fn bulk_scan_defers_fts_until_rebuild() {
+    let _guard = env_guard();
     let db = Database::open_in_memory().expect("db opens");
 
     db.begin_bulk_scan().expect("begin bulk scan");
@@ -386,7 +406,7 @@ fn sqlite_index_exists(db_path: &std::path::Path, name: &str) -> bool {
 
 #[test]
 fn mark_missing_handles_large_seen_path_lists() {
-    let _lock = LCTR_ENV_LOCK.lock().unwrap();
+    let _guard = env_guard();
     let db = Database::open_in_memory().expect("db opens");
     let seen_paths = (0..40_000)
         .map(|index| format!("/tmp/file-{index}.txt"))
@@ -398,6 +418,7 @@ fn mark_missing_handles_large_seen_path_lists() {
 
 #[test]
 fn opening_legacy_contentless_fts_database_migrates_to_deletable_fts() {
+    let _guard = env_guard();
     let dir = tempdir().expect("temp dir");
     let db_path = dir.path().join("legacy.sqlite");
     {
@@ -438,6 +459,7 @@ fn opening_legacy_contentless_fts_database_migrates_to_deletable_fts() {
 
 #[test]
 fn punctuation_only_search_returns_empty_without_fts_error() {
+    let _guard = env_guard();
     let db = Database::open_in_memory().expect("db opens");
     db.upsert_file(&record(
         "/tmp/report.pdf",
@@ -457,7 +479,7 @@ fn punctuation_only_search_returns_empty_without_fts_error() {
 
 #[test]
 fn interactive_search_prioritizes_filename_matches() {
-    let _lock = LCTR_ENV_LOCK.lock().unwrap();
+    let _guard = env_guard();
     let db = Database::open_in_memory().expect("db opens");
     db.upsert_files(&[
         record("/tmp/archive/report", "notes.txt", Some("txt"), 10, 2024),
@@ -486,6 +508,7 @@ fn interactive_search_prioritizes_filename_matches() {
 
 #[test]
 fn interactive_search_finds_case_insensitive_filename_prefixes() {
+    let _guard = env_guard();
     let db = Database::open_in_memory().expect("db opens");
     db.upsert_file(&record(
         "/tmp/QuarterlyBudget.xlsx",
@@ -506,6 +529,7 @@ fn interactive_search_finds_case_insensitive_filename_prefixes() {
 
 #[test]
 fn interactive_search_handles_missing_filename_match_without_error() {
+    let _guard = env_guard();
     let db = Database::open_in_memory().expect("db opens");
     db.upsert_file(&record(
         "/tmp/report-final.pdf",
@@ -525,6 +549,7 @@ fn interactive_search_handles_missing_filename_match_without_error() {
 
 #[test]
 fn verified_search_drops_missing_persistent_paths() {
+    let _guard = env_guard();
     let dir = tempdir().expect("temp dir");
     let db_path = dir.path().join("index.sqlite");
     let existing_path = dir.path().join("report-existing.pdf");
@@ -564,7 +589,7 @@ fn verified_search_drops_missing_persistent_paths() {
 
 #[test]
 fn default_db_path_is_available_for_background_workers() {
-    let _guard = LCTR_ENV_LOCK.lock().expect("env lock");
+    let _guard = env_guard();
     let path = default_db_path().expect("path resolves");
 
     assert_eq!(
@@ -575,6 +600,7 @@ fn default_db_path_is_available_for_background_workers() {
 
 #[test]
 fn working_dir_db_path_uses_nearest_local_index() {
+    let _guard = env_guard();
     let dir = tempdir().expect("temp dir");
     let parent = dir.path().join("project");
     let child = parent.join("nested");
@@ -589,6 +615,7 @@ fn working_dir_db_path_uses_nearest_local_index() {
 
 #[test]
 fn existing_db_path_returns_none_when_directory_is_unindexed() {
+    let _guard = env_guard();
     let dir = tempdir().expect("temp dir");
 
     let resolved = existing_db_path_for_working_dir(dir.path()).expect("resolve existing db");
@@ -598,6 +625,7 @@ fn existing_db_path_returns_none_when_directory_is_unindexed() {
 
 #[test]
 fn scan_completion_tracks_incomplete_and_complete_roots() {
+    let _guard = env_guard();
     let db = Database::open_in_memory().expect("db opens");
 
     assert_eq!(
@@ -620,7 +648,7 @@ fn scan_completion_tracks_incomplete_and_complete_roots() {
 
 #[test]
 fn working_dir_db_path_uses_root_fallback_index_when_local_index_is_absent() {
-    let _guard = LCTR_ENV_LOCK.lock().expect("env lock");
+    let _guard = env_guard();
     let dir = tempdir().expect("temp dir");
     std::env::set_var("LCTR_DATA_DIR", dir.path().join("data"));
     let parent = dir.path().join("readonly-drive");
@@ -637,6 +665,7 @@ fn working_dir_db_path_uses_root_fallback_index_when_local_index_is_absent() {
 
 #[test]
 fn fallback_db_path_for_root_is_stable_and_root_specific() {
+    let _guard = env_guard();
     let dir = tempdir().expect("temp dir");
     let one = dir.path().join("one");
     let two = dir.path().join("two");
@@ -654,7 +683,7 @@ fn fallback_db_path_for_root_is_stable_and_root_specific() {
 
 #[test]
 fn fts_rebuilds_when_index_paths_toggles() {
-    let _lock = LCTR_ENV_LOCK.lock().unwrap();
+    let _guard = env_guard();
 
     // Use LCTR_CONFIG_DIR to redirect Config::path() to a temp directory.
     // This is much narrower than redirecting HOME (which would affect dirs::
@@ -750,12 +779,12 @@ fn fts_rebuilds_when_index_paths_toggles() {
 
 #[test]
 fn fts_detail_none_rejects_non_contiguous_trigram_false_positive() {
+    let _guard = env_guard();
     // "abczzzbcdzzzcde.txt" contains all trigrams of "abcd" (abc, bcd) but
     // non-contiguously. "abcde.txt" contains "abcd" as a contiguous substring.
     // The Rust post-filter must eliminate the false positive.
     // Lock: a sibling test mutates LCTR_CONFIG_DIR (index_paths) globally; the
     // shared lock serializes against it so the FTS schema stays stable here.
-    let _lock = LCTR_ENV_LOCK.lock().unwrap();
     let db = Database::open_in_memory().expect("db opens");
     db.upsert_file(&record(
         "/tmp/abczzzbcdzzzcde.txt",
@@ -785,7 +814,7 @@ fn fts_detail_none_rejects_non_contiguous_trigram_false_positive() {
 #[test]
 fn legacy_search_filters_fts_false_positives() {
     // Same fixture as above but through the legacy pub fn search path.
-    let _lock = LCTR_ENV_LOCK.lock().unwrap();
+    let _guard = env_guard();
     let db = Database::open_in_memory().expect("db opens");
     db.upsert_file(&record(
         "/tmp/abczzzbcdzzzcde.txt",
@@ -814,11 +843,11 @@ fn legacy_search_filters_fts_false_positives() {
 
 #[test]
 fn fts_upgrades_from_detail_full_on_open() {
+    let _guard = env_guard();
     // Create a DB file, then use a raw rusqlite connection to drop files_fts
     // and recreate it with the OLD detail=full shape (no detail=none).
     // Repopulate, close, reopen via Database::open, and assert a Contains
     // search still works -- proving the auto-rebuild on open fired.
-    let _lock = LCTR_ENV_LOCK.lock().unwrap();
     let dir = tempdir().expect("temp dir");
     let db_path = dir.path().join("upgrade_test.sqlite");
 
@@ -876,6 +905,7 @@ fn fts_upgrades_from_detail_full_on_open() {
 
 #[test]
 fn import_access_from_copies_previous_history() {
+    let _guard = env_guard();
     let tmp = tempdir().expect("tmp");
     let old_path = tmp.path().join("old.sqlite");
     let new_path = tmp.path().join("new.sqlite");
@@ -907,6 +937,7 @@ fn import_access_from_copies_previous_history() {
 
 #[test]
 fn import_access_from_missing_or_legacy_previous_is_noop() {
+    let _guard = env_guard();
     let tmp = tempdir().expect("tmp");
     let new_db =
         Database::open_fresh_staged_scan(tmp.path().join("new.sqlite")).expect("open staged");
@@ -928,6 +959,7 @@ fn import_access_from_missing_or_legacy_previous_is_noop() {
 
 #[test]
 fn mark_path_deleted_only_removes_exact_subtree() {
+    let _guard = env_guard();
     let db = Database::open_in_memory().expect("open db");
     let sep = std::path::MAIN_SEPARATOR;
     let p = |parts: &[&str]| format!("{sep}{}", parts.join(&sep.to_string()));
@@ -973,6 +1005,7 @@ fn mark_path_deleted_only_removes_exact_subtree() {
 
 #[test]
 fn mark_path_deleted_handles_a_single_file() {
+    let _guard = env_guard();
     let db = Database::open_in_memory().expect("open db");
     let sep = std::path::MAIN_SEPARATOR;
     let path = format!("{sep}proj{sep}only.txt");
@@ -986,6 +1019,7 @@ fn mark_path_deleted_handles_a_single_file() {
 #[cfg(unix)]
 #[test]
 fn verified_search_keeps_unreadable_paths() {
+    let _guard = env_guard();
     let dir = tempdir().expect("temp dir");
     let db_path = dir.path().join("index.sqlite");
     let locked_dir = dir.path().join("locked");
@@ -1040,6 +1074,7 @@ fn verified_search_keeps_unreadable_paths() {
 
 #[test]
 fn verified_search_drops_paths_whose_parent_became_a_file() {
+    let _guard = env_guard();
     let dir = tempdir().expect("temp dir");
     let db_path = dir.path().join("index.sqlite");
     let parent_file = dir.path().join("report-parent");

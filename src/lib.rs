@@ -1,6 +1,8 @@
 pub mod config;
 pub mod config_ui;
 pub mod db;
+pub mod embed;
+pub mod embed_ui;
 pub mod live_index;
 pub mod live_search;
 pub mod open;

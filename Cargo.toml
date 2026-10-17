@@ -1,6 +1,6 @@
 [package]
 name = "locator"
-version = "0.3.6"
+version = "0.4.0"
 edition = "2021"
 description = "Fast local file metadata search"
 repository = "https://github.com/NotTanJune/locator"
@@ -23,11 +23,14 @@ clap = { version = "4.5", features = ["derive"] }
 clap_complete = "4.5"
 crossterm = "0.29"
 dirs = "6.0"
+half = "2"
 humansize = "2.1"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff"] }
 indicatif = "0.18"
 jwalk = "0.8"
 libc = "0.2"
+llama-cpp-sys-2 = "0.1.160"
+llama-cpp-2 = { version = "0.1.160", default-features = false, features = ["mtmd"] }
 notify = "6"
 nucleo-matcher = "0.3"
 pdf-extract = "0.10.0"
@@ -37,10 +40,17 @@ regex = "1.12"
 rusqlite = { version = "0.39", features = ["bundled", "chrono"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0"
+sha2 = "0.10"
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
 tempfile = "3.13"
 toml = "1.1.2"
 ureq = "2.10"
+
+[features]
+default = []
+# Embeds the text GGUF into the binary. Requires LCTR_BUNDLED_MODEL=<abs path to
+# embeddinggemma-2-Q8_0.gguf> at build time. Used only by the release workflow.
+bundled-model = []
 
 [dev-dependencies]
 assert_cmd = "2.0"
@@ -54,3 +64,11 @@ objc2-foundation = {
     version = "=0.3.2",
     features = ["NSAppleEventDescriptor", "NSAppleScript", "NSDictionary", "NSString"],
 }
+
+# The fork pins a llama.cpp commit (9cf967a04) that supports the EmbeddingGemma 2 architecture,
+# adds three raw pointer accessors for the mixed text and image batch (src/embed/mixed_batch.rs),
+# and fixes a timing struct for the newer llama.cpp. Drop this section once a llama-cpp-2 release
+# includes all three.
+[patch.crates-io]
+llama-cpp-2 = { git = "https://github.com/NotTanJune/llama-cpp-rs", rev = "ce4339952a272a9ca306ad718c09dc5c055e9049" }
+llama-cpp-sys-2 = { git = "https://github.com/NotTanJune/llama-cpp-rs", rev = "ce4339952a272a9ca306ad718c09dc5c055e9049" }

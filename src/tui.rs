@@ -2,6 +2,10 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{Arc, Mutex};
+
+use crate::embed::runtime::{with_embedder, Embedder};
+use crate::embed::search::{embedder_config_for_search, SemanticHit, SemanticSearcher};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -641,6 +645,10 @@ fn run_loop(
     let mut reverse = matches!(sort, SortField::Modified);
     let mut filters = SearchFilters::new();
     let watch_target = search_backend.watch_target();
+    let semantic_available = watch_target
+        .as_ref()
+        .is_some_and(|(_, db_path)| crate::embed::semantic_available(db_path));
+    let mut semantic_loaded = false;
     let mut live_index = watch_target
         .as_ref()
         .and_then(|(root, db_path)| LiveIndex::spawn(root.clone(), db_path.clone()).ok());
@@ -758,6 +766,9 @@ fn run_loop(
                     results_stamp = results_stamp.wrapping_add(1);
                     loading_query = None;
                     next_spinner_deadline = Instant::now();
+                    if options.mode == QueryMode::Semantic {
+                        semantic_loaded = true;
+                    }
                     if live_backfill {
                         search_state.mark_live_complete(options.query.clone());
                     }
@@ -872,6 +883,18 @@ fn run_loop(
 
                 let query = input.as_str();
                 let has_detail = frame.area().height >= 20;
+                let detail_rows = {
+                    let semantic_details = search_worker.semantic_details();
+                    let semantic_map = semantic_details
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner());
+                    let selected_path = selected
+                        .selected()
+                        .and_then(|index| results.get(index))
+                        .map(|result| result.path.as_str());
+                    let has_hit = selected_has_semantic_hit(&semantic_map, selected_path);
+                    detail_height(frame.area().height, has_hit)
+                };
                 let top_args = TopPanelArgs {
                     query,
                     root_label: &root_label,
@@ -894,7 +917,7 @@ fn run_loop(
                             Constraint::Length(1),
                             Constraint::Length(top_chrome_height(&top_args)),
                             Constraint::Min(6),
-                            Constraint::Length(if has_detail { 4 } else { 0 }),
+                            Constraint::Length(detail_rows),
                         ])
                         .split(frame.area())
                 } else {
@@ -903,7 +926,7 @@ fn run_loop(
                         .constraints([
                             Constraint::Length(top_chrome_height(&top_args)),
                             Constraint::Min(6),
-                            Constraint::Length(if has_detail { 4 } else { 0 }),
+                            Constraint::Length(detail_rows),
                         ])
                         .split(frame.area())
                 };
@@ -1160,6 +1183,18 @@ fn run_loop(
                     for line in detail_text.lines {
                         detail_lines.push(line);
                     }
+                    let semantic_details = search_worker.semantic_details();
+                    let semantic_map = semantic_details
+                        .lock()
+                        .unwrap_or_else(|poison| poison.into_inner());
+                    if let Some(result) = selected.selected().and_then(|index| results.get(index)) {
+                        detail_lines.extend(semantic_detail_lines(
+                            &result.path,
+                            &semantic_map,
+                            &theme,
+                            usize::from(chunks[2].width),
+                        ));
+                    }
                     let detail = Paragraph::new(detail_lines)
                         .style(Style::default().fg(theme.muted))
                         .wrap(Wrap { trim: false })
@@ -1409,10 +1444,14 @@ fn run_loop(
                         }
                     }
                     KeyCode::Char('m') => {
-                        mode = mode.next();
+                        mode = mode.next_available(semantic_available);
                         search_state.mark_dirty();
                         last_edit = Instant::now();
                         status = format!("mode: {}", mode.label());
+                        if mode == QueryMode::Semantic && !semantic_loaded {
+                            status =
+                                "mode: semantic (loads the model on the first search)".to_string();
+                        }
                     }
                     KeyCode::Char('f') => {
                         filters = cycle_kind_filter(filters);
@@ -1526,16 +1565,25 @@ fn search_hybrid(db: &Database, root: &Path, options: &SearchOptions) -> Result<
     Ok(merge_results(indexed, live, options.limit))
 }
 
+/// Latest semantic hits keyed by path: (similarity, snippet). Shared with the semantic thread.
+type SemanticDetails = Arc<Mutex<HashMap<String, (f32, String)>>>;
+
 struct SearchWorker {
     tx: Sender<QueuedSearchRequest>,
     rx: Receiver<SearchUpdate>,
     next_request_id: u64,
+    result_tx: Sender<SearchUpdate>,
+    semantic_index: Option<PathBuf>,
+    semantic_tx: Option<Sender<QueuedSearchRequest>>,
+    semantic_details: SemanticDetails,
 }
 
 impl SearchWorker {
     fn spawn(search_backend: SearchBackend) -> Result<Self> {
         let (query_tx, query_rx) = mpsc::channel::<QueuedSearchRequest>();
         let (result_tx, result_rx) = mpsc::channel::<SearchUpdate>();
+        let semantic_index = search_backend.watch_target().map(|(_, db_path)| db_path);
+        let semantic_result_tx = result_tx.clone();
 
         thread::spawn(move || search_worker_loop(search_backend, query_rx, result_tx));
 
@@ -1543,12 +1591,23 @@ impl SearchWorker {
             tx: query_tx,
             rx: result_rx,
             next_request_id: 1,
+            result_tx: semantic_result_tx,
+            semantic_index,
+            semantic_tx: None,
+            semantic_details: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
     fn submit(&mut self, request: SearchRequest) -> Result<u64> {
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
+        if request_is_semantic(&request.options) {
+            self.submit_semantic(QueuedSearchRequest {
+                request_id,
+                request,
+            })?;
+            return Ok(request_id);
+        }
         self.tx
             .send(QueuedSearchRequest {
                 request_id,
@@ -1556,6 +1615,30 @@ impl SearchWorker {
             })
             .context("send search request")?;
         Ok(request_id)
+    }
+
+    /// Sends a semantic request to the semantic thread, starting that thread on first use.
+    fn submit_semantic(&mut self, request: QueuedSearchRequest) -> Result<()> {
+        if self.semantic_tx.is_none() {
+            let index = self
+                .semantic_index
+                .clone()
+                .context("semantic search needs an index")?;
+            let (tx, rx) = mpsc::channel::<QueuedSearchRequest>();
+            let result_tx = self.result_tx.clone();
+            let details = Arc::clone(&self.semantic_details);
+            thread::spawn(move || semantic_worker_loop(index, rx, result_tx, details));
+            self.semantic_tx = Some(tx);
+        }
+        match self.semantic_tx.as_ref() {
+            Some(tx) => tx.send(request).context("send semantic search request"),
+            None => Err(anyhow::anyhow!("semantic search worker is not running")),
+        }
+    }
+
+    /// Shared map of the latest semantic hits, read by the detail panel.
+    fn semantic_details(&self) -> SemanticDetails {
+        Arc::clone(&self.semantic_details)
     }
 
     fn try_recv(&mut self) -> Option<SearchResponse> {
@@ -1933,6 +2016,179 @@ fn search_worker_loop(
     }
 }
 
+/// True for requests that go to the semantic thread instead of the filename worker.
+fn request_is_semantic(options: &SearchOptions) -> bool {
+    options.mode == QueryMode::Semantic
+}
+
+/// Map the detail panel reads: path to (similarity, snippet).
+fn semantic_detail_map(hits: &[SemanticHit]) -> HashMap<String, (f32, String)> {
+    hits.iter()
+        .map(|hit| (hit.result.path.clone(), (hit.score, hit.snippet.clone())))
+        .collect()
+}
+
+/// Two detail lines for a file that has a semantic hit. Nothing for other files.
+fn semantic_detail_lines(
+    path: &str,
+    details: &HashMap<String, (f32, String)>,
+    theme: &Theme,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let Some((score, snippet)) = details.get(path) else {
+        return Vec::new();
+    };
+    let label = "match ";
+    let room = width.saturating_sub(label.chars().count()).max(1);
+    let snippet = fit_one_line(snippet, room);
+    vec![
+        Line::from(vec![
+            Span::styled("similarity ", Style::default().fg(theme.muted)),
+            Span::styled(format!("{score:.2}"), Style::default().fg(theme.text)),
+        ]),
+        Line::from(vec![
+            Span::styled(label, Style::default().fg(theme.muted)),
+            Span::styled(snippet, Style::default().fg(theme.text)),
+        ]),
+    ]
+}
+
+/// Rows for the bottom detail pane. Filename results keep the original 4 rows. A selected semantic
+/// hit needs 2 more for its similarity and match lines. Terminals under 20 rows hide the pane.
+fn detail_height(frame_height: u16, has_semantic_hit: bool) -> u16 {
+    if frame_height < 20 {
+        0
+    } else if has_semantic_hit {
+        6
+    } else {
+        4
+    }
+}
+
+/// True when the selected path has a semantic hit entry.
+fn selected_has_semantic_hit(
+    details: &HashMap<String, (f32, String)>,
+    selected_path: Option<&str>,
+) -> bool {
+    selected_path.is_some_and(|path| details.contains_key(path))
+}
+
+/// Collapses whitespace and cuts to `max_chars` characters, ending with an ellipsis when cut.
+fn fit_one_line(text: &str, max_chars: usize) -> String {
+    let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() <= max_chars {
+        return collapsed;
+    }
+    let keep = max_chars.saturating_sub(1);
+    let mut out: String = collapsed.chars().take(keep).collect();
+    out.push('\u{2026}');
+    out
+}
+
+/// Owns the embedder for the life of the semantic thread. The index and model load on the first
+/// request. Queued requests are coalesced to the newest, as the filename worker does.
+fn semantic_worker_loop(
+    index_path: PathBuf,
+    query_rx: Receiver<QueuedSearchRequest>,
+    result_tx: Sender<SearchUpdate>,
+    details: SemanticDetails,
+) {
+    let mut pending = match query_rx.recv() {
+        Ok(request) => Some(request),
+        Err(_) => return,
+    };
+    if let Err(error) =
+        serve_semantic_requests(&index_path, &mut pending, &query_rx, &result_tx, &details)
+    {
+        // The index or model could not be loaded. Report that for every request that arrives.
+        let message = format!("{error:#}");
+        while let Some(request) = pending.take() {
+            let request = latest_queued_request(request, &query_rx);
+            let _ = result_tx.send(SearchUpdate::Error {
+                request_id: request.request_id,
+                options: request.request.options,
+                error: message.clone(),
+            });
+            pending = query_rx.recv().ok();
+        }
+    }
+}
+
+fn serve_semantic_requests(
+    index_path: &Path,
+    pending: &mut Option<QueuedSearchRequest>,
+    query_rx: &Receiver<QueuedSearchRequest>,
+    result_tx: &Sender<SearchUpdate>,
+    details: &SemanticDetails,
+) -> Result<()> {
+    // Open the index before the model, so a missing index never loads the model.
+    let mut searcher = SemanticSearcher::open(index_path)?
+        .ok_or_else(|| anyhow::anyhow!("no embeddings yet; run lctr scan <dir> --em"))?;
+    let config = embedder_config_for_search()?;
+    with_embedder(&config, |embedder| {
+        while let Some(request) = pending.take() {
+            let request = latest_queued_request(request, query_rx);
+            run_semantic_request(&mut searcher, embedder, request, result_tx, details);
+            *pending = query_rx.recv().ok();
+        }
+        Ok(())
+    })
+}
+
+fn run_semantic_request(
+    searcher: &mut SemanticSearcher,
+    embedder: &mut dyn Embedder,
+    request: QueuedSearchRequest,
+    result_tx: &Sender<SearchUpdate>,
+    details: &SemanticDetails,
+) {
+    let QueuedSearchRequest {
+        request_id,
+        request,
+    } = request;
+    let options = request.options;
+    if let Ok(mut shared) = details.lock() {
+        shared.clear();
+    }
+    let _ = result_tx.send(SearchUpdate::Reset {
+        request_id,
+        options: options.clone(),
+    });
+    match searcher.search(embedder, &options) {
+        Ok(hits) => {
+            if let Ok(mut shared) = details.lock() {
+                *shared = semantic_detail_map(&hits);
+            }
+            let mut results: Vec<SearchResult> = hits.into_iter().map(|hit| hit.result).collect();
+            // Relevance order is the score order the searcher returned. Other sorts reorder it.
+            if options.sort != SortField::Relevance {
+                crate::db::sort_results(&mut results, &options);
+            }
+            let count = results.len();
+            let _ = result_tx.send(SearchUpdate::Append {
+                request_id,
+                options: options.clone(),
+                results,
+                count,
+            });
+            let _ = result_tx.send(SearchUpdate::Complete {
+                request_id,
+                options,
+                count,
+                final_results: None,
+                live_backfill: false,
+            });
+        }
+        Err(error) => {
+            let _ = result_tx.send(SearchUpdate::Error {
+                request_id,
+                options,
+                error: format!("{error:#}"),
+            });
+        }
+    }
+}
+
 fn latest_queued_request(
     mut request: QueuedSearchRequest,
     query_rx: &Receiver<QueuedSearchRequest>,
@@ -2245,6 +2501,7 @@ fn render_help_overlay(frame: &mut Frame, theme: &Theme) {
         entry("r", "reveal in Finder"),
         entry("y", "copy path"),
         entry("m", "cycle match mode"),
+        entry("m (embedded)", "semantic mode, once lctr scan --em has run"),
         entry("f", "cycle type filter"),
         entry("s / S", "sort field / direction"),
         entry("t", "cycle theme"),
@@ -2935,6 +3192,7 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::db::{local_db_path_for_root, Database, FileRecord, SearchResult};
+    use crate::embed::search::SemanticHit;
     use crate::query::{
         CompiledQuery, FileKind, QueryMode, SearchFilters, SearchOptions, SortField,
     };
@@ -2949,8 +3207,13 @@ mod tests {
         SearchBackend, SearchInput, SearchRequest, SearchState, SearchWorker, TopPanelArgs,
         FRAGMENTED_ESCAPE_WINDOW, TUI_RESULT_LIMIT,
     };
+    use crate::tui::{
+        detail_height, request_is_semantic, selected_has_semantic_hit, semantic_detail_lines,
+        semantic_detail_map, SearchUpdate,
+    };
     use ratatui::text::Line;
     use ratatui::widgets::TableState;
+    use std::collections::HashMap;
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -3632,6 +3895,122 @@ mod tests {
             .to_string();
 
         assert!(results.iter().any(|result| result.path == live_path));
+    }
+
+    #[test]
+    fn only_semantic_mode_routes_to_the_semantic_thread() {
+        let options = SearchOptions::new("budget");
+        assert!(!request_is_semantic(&options));
+        assert!(request_is_semantic(
+            &options.clone().with_mode(QueryMode::Semantic)
+        ));
+    }
+
+    #[test]
+    fn semantic_detail_lines_show_similarity_and_match_for_hit_paths_only() {
+        let theme = Theme::load_with_default("default");
+        let mut details = HashMap::new();
+        details.insert(
+            "/docs/budget.txt".to_string(),
+            (0.8312_f32, "quarterly budget".to_string()),
+        );
+        let lines = semantic_detail_lines("/docs/budget.txt", &details, &theme, 80);
+        assert_eq!(lines.len(), 2);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.to_string())
+                    .collect::<String>()
+            })
+            .collect();
+        assert_eq!(text[0], "similarity 0.83");
+        assert_eq!(text[1], "match quarterly budget");
+        assert!(semantic_detail_lines("/docs/other.txt", &details, &theme, 80).is_empty());
+    }
+
+    #[test]
+    fn semantic_match_line_is_one_row_fitted_to_the_width() {
+        let theme = Theme::load_with_default("default");
+        let mut details = HashMap::new();
+        details.insert(
+            "/docs/long.md".to_string(),
+            (0.5_f32, "a very long snippet ".repeat(40)),
+        );
+        let lines = semantic_detail_lines("/docs/long.md", &details, &theme, 40);
+        let match_text: String = lines[1]
+            .spans
+            .iter()
+            .map(|span| span.content.to_string())
+            .collect();
+        assert!(match_text.starts_with("match "));
+        assert!(match_text.chars().count() <= 40, "{match_text}");
+        assert!(match_text.ends_with('\u{2026}'), "{match_text}");
+        assert!(!match_text.contains('\n'));
+    }
+
+    #[test]
+    fn detail_pane_grows_only_for_a_selected_semantic_hit() {
+        assert_eq!(detail_height(36, false), 4);
+        assert_eq!(detail_height(36, true), 6);
+        assert_eq!(detail_height(20, false), 4);
+        assert_eq!(detail_height(19, false), 0);
+        assert_eq!(detail_height(19, true), 0);
+    }
+
+    #[test]
+    fn selected_hit_lookup_uses_the_exact_path_key() {
+        let mut details = HashMap::new();
+        details.insert("/docs/a.md".to_string(), (0.9_f32, "x".to_string()));
+        assert!(selected_has_semantic_hit(&details, Some("/docs/a.md")));
+        assert!(!selected_has_semantic_hit(&details, Some("/docs/b.md")));
+        assert!(!selected_has_semantic_hit(&details, None));
+    }
+
+    #[test]
+    fn semantic_detail_map_keeps_score_and_snippet_per_path() {
+        let hit = SemanticHit {
+            result: SearchResult {
+                path: "/a.txt".to_string(),
+                name: "a.txt".to_string(),
+                extension: Some("txt".to_string()),
+                kind: "text".to_string(),
+                size_bytes: 3,
+                created_at: None,
+                modified_at: None,
+            },
+            score: 0.5,
+            snippet: "alpha".to_string(),
+        };
+        let map = semantic_detail_map(&[hit]);
+        assert_eq!(map.get("/a.txt"), Some(&(0.5, "alpha".to_string())));
+    }
+
+    #[test]
+    fn semantic_request_without_an_index_reports_no_embeddings() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("index.sqlite");
+        Database::open(&db_path).expect("create index");
+        let mut worker = SearchWorker::spawn(SearchBackend::Indexed {
+            db_path,
+            root: dir.path().to_path_buf(),
+        })
+        .expect("worker spawns");
+        let options = SearchOptions::new("budget").with_mode(QueryMode::Semantic);
+        worker
+            .submit(SearchRequest { options })
+            .expect("submit semantic request");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Ok(SearchUpdate::Error { error, .. }) =
+                worker.rx.recv_timeout(Duration::from_millis(200))
+            {
+                assert!(error.contains("no embeddings yet"), "{error}");
+                break;
+            }
+            assert!(Instant::now() < deadline, "no error update arrived");
+        }
     }
 
     #[test]

@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const REPOSITORY_URL: &str = "https://github.com/NotTanJune/locator";
 const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/NotTanJune/locator/releases/latest";
-const MAX_RELEASE_ASSET_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_RELEASE_ASSET_BYTES: u64 = 1024 * 1024 * 1024;
 
 pub struct UpdateStatus {
     pub latest: String,
@@ -243,11 +243,16 @@ fn run_update_command(program: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn prebuilt_asset_name_for(os: &str, arch: &str) -> Option<&'static str> {
-    match (os, arch) {
-        ("macos", "aarch64") => Some("lctr-aarch64-apple-darwin.tar.gz"),
-        ("linux", "x86_64") => Some("lctr-x86_64-unknown-linux-gnu.tar.gz"),
-        ("windows", "x86_64") => Some("lctr-x86_64-pc-windows-msvc.zip"),
+/// Release asset for this platform. `full` selects the build with the embedding model inside
+/// (`lctr-full-*`); the lean build (`lctr-*`) downloads the model on first use.
+fn prebuilt_asset_name_for(os: &str, arch: &str, full: bool) -> Option<&'static str> {
+    match (os, arch, full) {
+        ("macos", "aarch64", false) => Some("lctr-aarch64-apple-darwin.tar.gz"),
+        ("linux", "x86_64", false) => Some("lctr-x86_64-unknown-linux-gnu.tar.gz"),
+        ("windows", "x86_64", false) => Some("lctr-x86_64-pc-windows-msvc.zip"),
+        ("macos", "aarch64", true) => Some("lctr-full-aarch64-apple-darwin.tar.gz"),
+        ("linux", "x86_64", true) => Some("lctr-full-x86_64-unknown-linux-gnu.tar.gz"),
+        ("windows", "x86_64", true) => Some("lctr-full-x86_64-pc-windows-msvc.zip"),
         _ => None,
     }
 }
@@ -402,14 +407,18 @@ fn update_from_prebuilt_release(exe_path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let asset_name = prebuilt_asset_name_for(std::env::consts::OS, std::env::consts::ARCH)
-        .with_context(|| {
-            format!(
-                "no prebuilt lctr release is available for {}-{}",
-                std::env::consts::ARCH,
-                std::env::consts::OS
-            )
-        })?;
+    let asset_name = prebuilt_asset_name_for(
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        cfg!(feature = "bundled-model"),
+    )
+    .with_context(|| {
+        format!(
+            "no prebuilt lctr release is available for {}-{}",
+            std::env::consts::ARCH,
+            std::env::consts::OS
+        )
+    })?;
     let asset = release
         .assets
         .iter()
@@ -682,18 +691,35 @@ mod tests {
     #[test]
     fn prebuilt_asset_name_matches_release_targets() {
         assert_eq!(
-            prebuilt_asset_name_for("macos", "aarch64"),
+            prebuilt_asset_name_for("macos", "aarch64", false),
             Some("lctr-aarch64-apple-darwin.tar.gz")
         );
         assert_eq!(
-            prebuilt_asset_name_for("linux", "x86_64"),
+            prebuilt_asset_name_for("linux", "x86_64", false),
             Some("lctr-x86_64-unknown-linux-gnu.tar.gz")
         );
         assert_eq!(
-            prebuilt_asset_name_for("windows", "x86_64"),
+            prebuilt_asset_name_for("windows", "x86_64", false),
             Some("lctr-x86_64-pc-windows-msvc.zip")
         );
-        assert_eq!(prebuilt_asset_name_for("linux", "aarch64"), None);
+        assert_eq!(prebuilt_asset_name_for("linux", "aarch64", false), None);
+    }
+
+    #[test]
+    fn full_asset_names_add_full_after_lctr() {
+        assert_eq!(
+            prebuilt_asset_name_for("macos", "aarch64", true),
+            Some("lctr-full-aarch64-apple-darwin.tar.gz")
+        );
+        assert_eq!(
+            prebuilt_asset_name_for("linux", "x86_64", true),
+            Some("lctr-full-x86_64-unknown-linux-gnu.tar.gz")
+        );
+        assert_eq!(
+            prebuilt_asset_name_for("windows", "x86_64", true),
+            Some("lctr-full-x86_64-pc-windows-msvc.zip")
+        );
+        assert_eq!(prebuilt_asset_name_for("linux", "aarch64", true), None);
     }
 
     #[test]

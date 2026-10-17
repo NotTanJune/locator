@@ -209,7 +209,7 @@ fn normalize_query(query: &str) -> String {
     query.trim().to_ascii_lowercase()
 }
 
-fn matches_filters(result: &SearchResult, filters: &SearchFilters) -> bool {
+pub(crate) fn matches_filters(result: &SearchResult, filters: &SearchFilters) -> bool {
     if let Some(kind) = &filters.kind {
         if result.kind != kind.as_str() {
             return false;

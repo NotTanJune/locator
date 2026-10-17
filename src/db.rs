@@ -61,6 +61,16 @@ struct IndexedSearchCandidate {
     frecency: u32,
 }
 
+/// A file row eligible for the embedding pass (see `Database::embeddable_files`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddableFile {
+    pub path: String,
+    pub kind: String,
+    pub extension: Option<String>,
+    pub size_bytes: u64,
+    pub modified_at: i64,
+}
+
 pub struct Database {
     conn: Connection,
     path: Option<PathBuf>,
@@ -539,6 +549,11 @@ impl Database {
     }
 
     pub fn search_with_options(&self, options: &SearchOptions) -> Result<Vec<SearchResult>> {
+        if options.mode == QueryMode::Semantic {
+            return Err(anyhow::anyhow!(
+                "semantic search is served by locator::embed::search"
+            ));
+        }
         options.validate()?;
         if options.limit == 0 {
             return Ok(Vec::new());
@@ -609,6 +624,11 @@ impl Database {
         mut should_cancel: impl FnMut() -> bool,
         mut on_batch: impl FnMut(SearchBatch) -> Result<()>,
     ) -> Result<SearchStreamStatus> {
+        if options.mode == QueryMode::Semantic {
+            return Err(anyhow::anyhow!(
+                "semantic search is served by locator::embed::search"
+            ));
+        }
         options.validate()?;
         if options.limit == 0 {
             return Ok(SearchStreamStatus::Complete { count: 0 });
@@ -918,6 +938,24 @@ impl Database {
                     row.get::<_, i64>(0)
                 })?;
         Ok(count as u64)
+    }
+
+    /// Active non-folder files under `root`, for the embedding pass.
+    pub fn embeddable_files(&self, root: &str) -> Result<Vec<EmbeddableFile>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT path, kind, extension, size_bytes, COALESCE(modified_at, 0)
+             FROM files WHERE root = ?1 AND deleted = 0 AND kind != 'folder' ORDER BY path",
+        )?;
+        let rows = stmt.query_map([root], |row| {
+            Ok(EmbeddableFile {
+                path: row.get(0)?,
+                kind: row.get(1)?,
+                extension: row.get(2)?,
+                size_bytes: row.get::<_, i64>(3)?.max(0) as u64,
+                modified_at: row.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn roots(&self) -> Result<Vec<String>> {
@@ -1415,7 +1453,7 @@ pub fn staging_db_path_for_root(root: impl AsRef<Path>) -> Result<PathBuf> {
         .join("staging.sqlite"))
 }
 
-fn locator_data_dir() -> Result<PathBuf> {
+pub(crate) fn locator_data_dir() -> Result<PathBuf> {
     if let Ok(path) = std::env::var("LCTR_DATA_DIR") {
         return Ok(PathBuf::from(path));
     }
@@ -1545,6 +1583,25 @@ fn indexed_search_candidate_from_row(
 }
 
 impl Database {
+    /// The active row for `path`, hydrated from disk like search results. `None` when the path
+    /// is not indexed or the file no longer exists.
+    pub fn result_for_path(&self, path: &str) -> Result<Option<SearchResult>> {
+        use rusqlite::OptionalExtension;
+        let row = self
+            .conn
+            .query_row(
+                "SELECT f.path, f.name, f.extension, f.kind, f.size_bytes, f.created_at, f.modified_at
+                 FROM files f WHERE f.path = ?1 AND f.deleted = 0",
+                [path],
+                search_result_from_row,
+            )
+            .optional()?;
+        match row {
+            Some(result) => self.hydrate_search_result(result),
+            None => Ok(None),
+        }
+    }
+
     fn hydrate_search_results(&self, results: Vec<SearchResult>) -> Result<Vec<SearchResult>> {
         let mut hydrated = Vec::with_capacity(results.len());
         for result in results {
@@ -1697,6 +1754,7 @@ fn apply_query_mode_sql(
             values.push(stem_pattern.into());
         }
         QueryMode::Fuzzy | QueryMode::Regex | QueryMode::Glob => {}
+        QueryMode::Semantic => {}
     }
 }
 
@@ -1741,6 +1799,8 @@ fn candidate_limit(options: &SearchOptions) -> usize {
         QueryMode::Fuzzy | QueryMode::Regex | QueryMode::Glob => {
             options.limit.saturating_mul(100).clamp(5000, 20000)
         }
+        // Semantic results are ranked by the vector index, never through this query.
+        QueryMode::Semantic => options.limit.saturating_mul(100).clamp(5000, 20000),
         _ => options.limit.saturating_mul(20).clamp(200, 5000),
     }
 }

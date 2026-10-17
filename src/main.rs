@@ -62,6 +62,14 @@ enum Commands {
         eta: bool,
         #[arg(long)]
         no_eta: bool,
+        #[arg(
+            long,
+            help = "Also embed file contents with EmbeddingGemma 2 for natural-language search"
+        )]
+        em: bool,
+        /// How deep `--em` embeds each file: quick (the first 8 chunks of each file, the default), balanced (up to 32 chunks per file) or deep (up to 128). A deeper run later adds only the missing chunks.
+        #[arg(long, value_parser = ["quick", "balanced", "deep"], requires = "em")]
+        depth: Option<String>,
         #[arg(long)]
         no_update_check: bool,
     },
@@ -105,6 +113,11 @@ enum Commands {
         #[command(subcommand)]
         action: Option<ConfigCommand>,
     },
+    /// Manage the local embedding model used by `scan --em` and semantic search
+    Embed {
+        #[command(subcommand)]
+        action: EmbedCommand,
+    },
     /// Generate shell completions for bash, zsh, fish, powershell, or elvish
     Completions {
         /// Shell to generate completions for
@@ -125,6 +138,54 @@ enum ConfigCommand {
     Path,
     /// Reset all settings to defaults
     Reset,
+}
+
+#[derive(Debug, clap::Subcommand)]
+enum EmbedCommand {
+    /// Show model, index, and embedding status
+    Status,
+    /// Download the embedding model (and optionally the vision model)
+    Fetch {
+        #[arg(long)]
+        vision: bool,
+    },
+    /// Delete downloaded model files
+    RemoveModel {
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Measure throughput settings on a sample of the chunks under <dir>
+    #[command(hide = true)]
+    Bench {
+        dir: PathBuf,
+        /// Only extract, filter and chunk; no model is loaded.
+        #[arg(long)]
+        count_only: bool,
+        /// Embed the sample with the production settings, write the vectors as JSON to this
+        /// path, and stop (no grid).
+        #[arg(long)]
+        dump_vectors: Option<PathBuf>,
+    },
+    /// Embed images at a vision budget, with timings and token counts (measurement and comparison)
+    #[command(hide = true)]
+    ImageProbe {
+        files: Vec<PathBuf>,
+        #[arg(long, default_value_t = 140)]
+        budget: u32,
+        #[arg(long, default_value_t = 1)]
+        runs: usize,
+        #[arg(long)]
+        dump: Option<PathBuf>,
+    },
+    /// Check Metal, throughput, batch correctness, and image embedding against the real model
+    #[command(hide = true)]
+    Selftest {
+        #[arg(long)]
+        image: bool,
+        /// Compare the vectors with DigUp's reference vectors instead of the usual checks.
+        #[arg(long)]
+        reference: bool,
+    },
 }
 
 /// Output format for `lctr find`. Default `tsv` preserves the existing format.
@@ -195,6 +256,8 @@ fn main() -> Result<()> {
             no_profile_detail,
             eta,
             no_eta,
+            em,
+            depth,
             no_update_check,
         } => {
             let use_stage_index =
@@ -275,10 +338,18 @@ fn main() -> Result<()> {
                 staged: used_stage_index,
                 detail: show_profile_detail,
             };
-            if io::stdout().is_terminal() {
+            if em {
+                println!(
+                    "{}",
+                    locator::embed::compact_scan_line(&stats, io::stdout().is_terminal())
+                );
+            } else if io::stdout().is_terminal() {
                 println!("{}", render_scan_summary_for_terminal(&summary));
             } else {
                 println!("{}", render_scan_summary(&summary));
+            }
+            if em {
+                locator::embed::run_scan_embedding(&final_index_path, &root, depth.as_deref())?;
             }
             if no_update_check {
                 locator::update_check::persist_disable();
@@ -321,6 +392,15 @@ fn main() -> Result<()> {
         Commands::Find(args) => {
             let db = Database::open_default_for_search()?;
             let options = build_search_options(&args)?;
+            if options.mode == QueryMode::Semantic {
+                let index_path = db
+                    .path()
+                    .context("semantic search needs an index file")?
+                    .to_path_buf();
+                let hits = locator::embed::semantic_query(&index_path, &options)?;
+                print_semantic_hits(&hits, args.output)?;
+                return Ok(());
+            }
             let results = db.search_with_options(&options)?;
             match args.output {
                 OutputFormat::Tsv => {
@@ -358,10 +438,13 @@ fn main() -> Result<()> {
         Commands::DeleteIndex { root } => match existing_db_path_for_working_dir(&root)? {
             Some(db_path) => {
                 let removed = delete_index_files(&db_path)?;
+                let sidecar = locator::embed::store::sidecar_path_for_index(&db_path);
+                let sidecar_removed = delete_index_files(&sidecar)?;
                 println!(
-                    "deleted index {} (removed {} files)",
+                    "deleted index {} (removed {} files; embeddings sidecar removed {} files)",
                     db_path.display(),
-                    removed
+                    removed,
+                    sidecar_removed
                 );
             }
             None => {
@@ -374,6 +457,7 @@ fn main() -> Result<()> {
             println!("vacuum complete");
         }
         Commands::Config { action } => handle_config(action)?,
+        Commands::Embed { action } => handle_embed(action)?,
         Commands::Completions { shell } => {
             use clap::CommandFactory;
             let mut cmd = Cli::command();
@@ -382,6 +466,47 @@ fn main() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// JSON shape for semantic hits: the usual result fields plus `score` and `snippet`.
+#[derive(serde::Serialize)]
+struct SemanticJson<'a> {
+    #[serde(flatten)]
+    result: &'a locator::db::SearchResult,
+    score: f32,
+    snippet: &'a str,
+}
+
+fn semantic_json(hit: &locator::embed::SemanticHit) -> SemanticJson<'_> {
+    SemanticJson {
+        result: &hit.result,
+        score: hit.score,
+        snippet: &hit.snippet,
+    }
+}
+
+/// `find --mode semantic` output. tsv adds score and snippet columns; other modes keep three.
+fn print_semantic_hits(hits: &[locator::embed::SemanticHit], output: OutputFormat) -> Result<()> {
+    match output {
+        OutputFormat::Tsv => {
+            for hit in hits {
+                println!(
+                    "{}\t{}\t{} bytes\t{:.3}\t{}",
+                    hit.result.kind, hit.result.path, hit.result.size_bytes, hit.score, hit.snippet
+                );
+            }
+        }
+        OutputFormat::Json => {
+            let items: Vec<SemanticJson<'_>> = hits.iter().map(semantic_json).collect();
+            println!("{}", serde_json::to_string_pretty(&items)?);
+        }
+        OutputFormat::Jsonl => {
+            for hit in hits {
+                println!("{}", serde_json::to_string(&semantic_json(hit))?);
+            }
+        }
+    }
     Ok(())
 }
 
@@ -427,6 +552,42 @@ fn handle_config(action: Option<ConfigCommand>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn handle_embed(action: EmbedCommand) -> Result<()> {
+    match action {
+        EmbedCommand::Status => {
+            let index = existing_db_path_for_working_dir(current_dir())?;
+            print!("{}", locator::embed::status_report(index.as_deref())?);
+            Ok(())
+        }
+        EmbedCommand::Fetch { vision } => locator::embed::fetch_models(vision),
+        EmbedCommand::RemoveModel { yes } => locator::embed::remove_models_command(yes),
+        EmbedCommand::ImageProbe {
+            files,
+            budget,
+            runs,
+            dump,
+        } => locator::embed::selftest::image_probe(&files, budget, runs, dump.as_deref()),
+        EmbedCommand::Selftest { image, reference } => {
+            if reference {
+                locator::embed::selftest::run_reference()
+            } else {
+                locator::embed::selftest::run(image)
+            }
+        }
+        EmbedCommand::Bench {
+            dir,
+            count_only,
+            dump_vectors,
+        } => {
+            if count_only {
+                locator::embed::bench::run_count_only(&dir)
+            } else {
+                locator::embed::bench::run_bench(&dir, dump_vectors.as_deref())
+            }
+        }
+    }
 }
 
 fn copy_finished_index(source: &Path, target: &Path) -> Result<()> {

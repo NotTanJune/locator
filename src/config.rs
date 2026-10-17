@@ -24,6 +24,10 @@ pub struct Config {
     /// Also index full paths (not just filenames) for substring search. Enables
     /// directory-name substring matching at the cost of a much slower scan.
     pub index_paths: bool,
+    /// Width of stored semantic-search vectors (128, 256, 512, or 768). Changing it re-embeds on the next `scan --em`.
+    pub embed_dims: u16,
+    /// How deep `scan --em` embeds each file: quick, balanced or deep (see `lctr scan --depth`).
+    pub embed_depth: String,
 }
 
 impl Default for Config {
@@ -35,19 +39,26 @@ impl Default for Config {
             preview: true,
             update_check: true,
             index_paths: false,
+            embed_dims: 768,
+            embed_depth: "quick".to_string(),
         }
     }
 }
 
 /// All settable keys, for `config` listing and validation.
-pub const KEYS: [&str; 6] = [
+pub const KEYS: [&str; 8] = [
     "icons",
     "theme",
     "backend",
     "preview",
     "update_check",
     "index_paths",
+    "embed_dims",
+    "embed_depth",
 ];
+
+const EMBED_DIMS_VALUES: [&str; 4] = ["128", "256", "512", "768"];
+const EMBED_DEPTH_VALUES: [&str; 3] = ["quick", "balanced", "deep"];
 
 impl Config {
     pub fn path() -> Result<PathBuf> {
@@ -85,6 +96,8 @@ impl Config {
             "preview" => self.preview.to_string(),
             "update_check" => self.update_check.to_string(),
             "index_paths" => self.index_paths.to_string(),
+            "embed_dims" => self.embed_dims.to_string(),
+            "embed_depth" => self.embed_depth.clone(),
             other => return Err(unknown_key(other)),
         })
     }
@@ -97,6 +110,13 @@ impl Config {
             "index_paths" => self.index_paths = parse_bool(value)?,
             "theme" => self.theme = validate_one_of(value, &THEME_VALUES, "theme")?,
             "backend" => self.backend = validate_one_of(value, &BACKEND_VALUES, "backend")?,
+            "embed_dims" => {
+                let valid = validate_one_of(value, &EMBED_DIMS_VALUES, "embed_dims")?;
+                self.embed_dims = valid.parse().context("embed_dims must be a number")?;
+            }
+            "embed_depth" => {
+                self.embed_depth = validate_one_of(value, &EMBED_DEPTH_VALUES, "embed_depth")?
+            }
             other => return Err(unknown_key(other)),
         }
         Ok(())
@@ -119,6 +139,8 @@ pub fn key_label(key: &str) -> &'static str {
         "preview" => "Preview pane",
         "update_check" => "Update check",
         "index_paths" => "Index full paths",
+        "embed_dims" => "Embedding dimensions",
+        "embed_depth" => "Embedding depth",
         _ => "",
     }
 }
@@ -140,6 +162,12 @@ pub fn key_description(key: &str) -> &'static str {
         "index_paths" => {
             "Index full file paths, not just filenames, so substring search also matches directory names. Makes the scan's optimize phase much slower (paths are ~7x more text). Off = filename search only, fast scans. Takes effect on the next scan."
         }
+        "embed_dims" => {
+            "Size of stored embedding vectors for semantic search. Smaller is faster and uses less disk, larger is more accurate. Changing it re-embeds on the next `scan --em`."
+        }
+        "embed_depth" => {
+            "How much of each file `scan --em` embeds. quick (default): the first 8 chunks of every file, so search works soonest. balanced: up to 32 chunks per file. deep: up to 128 chunks per file. A later run with a deeper setting adds only the missing chunks. `lctr scan --depth` overrides this for one run."
+        }
         _ => "",
     }
 }
@@ -149,6 +177,8 @@ pub fn key_choices(key: &str) -> Vec<&'static str> {
     match key {
         "theme" => THEME_VALUES.to_vec(),
         "backend" => BACKEND_VALUES.to_vec(),
+        "embed_dims" => EMBED_DIMS_VALUES.to_vec(),
+        "embed_depth" => EMBED_DEPTH_VALUES.to_vec(),
         // booleans
         _ => vec!["true", "false"],
     }
