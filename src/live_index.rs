@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use notify::{RecursiveMode, Watcher};
@@ -22,6 +22,11 @@ use crate::scanner::{is_skip_name, kind_for, system_time_to_utc, volume_for};
 /// How long to wait for a quiet period before applying a batch of events. Bursts
 /// (e.g. a build writing many files) coalesce into a single apply.
 const DEBOUNCE: Duration = Duration::from_millis(400);
+
+/// Upper bound on how long one batch may keep absorbing events. Without it, a
+/// steady stream of events (a build, or any process touching files under the
+/// root) would keep resetting the quiet period and the batch would never apply.
+const MAX_BATCH: Duration = Duration::from_secs(2);
 
 /// Handle to a running watcher. Dropping it stops the watcher thread.
 pub struct LiveIndex {
@@ -121,10 +126,12 @@ fn watch_loop(
 
         let mut paths: HashSet<PathBuf> = HashSet::new();
         collect_paths(first, &mut paths);
-        // Drain anything already queued so a burst applies as one batch.
+        // Drain anything already queued so a burst applies as one batch, but stop
+        // after MAX_BATCH so a continuous stream cannot starve the apply step.
+        let batch_deadline = Instant::now() + MAX_BATCH;
         while let Ok(event) = rx.recv_timeout(DEBOUNCE) {
             collect_paths(event, &mut paths);
-            if stop.load(Ordering::Relaxed) {
+            if stop.load(Ordering::Relaxed) || Instant::now() >= batch_deadline {
                 break;
             }
         }
@@ -147,6 +154,12 @@ fn watch_loop(
 
 fn collect_paths(event: notify::Result<notify::Event>, out: &mut HashSet<PathBuf>) {
     if let Ok(event) = event {
+        // Opens, reads and closes without a write (inotify reports them) never
+        // change the index, and readers polling the index file would otherwise
+        // generate them constantly.
+        if matches!(event.kind, notify::EventKind::Access(_)) {
+            return;
+        }
         for path in event.paths {
             out.insert(path);
         }
@@ -257,6 +270,22 @@ mod tests {
             matches!(result, Applied::Failed),
             "expected Failed after files table dropped"
         );
+    }
+
+    #[test]
+    fn access_events_are_ignored() {
+        let path = PathBuf::from("/tmp/x/index.sqlite");
+        let mut out = HashSet::new();
+
+        let access = notify::Event::new(notify::EventKind::Access(notify::event::AccessKind::Any))
+            .add_path(path.clone());
+        collect_paths(Ok(access), &mut out);
+        assert!(out.is_empty());
+
+        let modify = notify::Event::new(notify::EventKind::Modify(notify::event::ModifyKind::Any))
+            .add_path(path.clone());
+        collect_paths(Ok(modify), &mut out);
+        assert!(out.contains(&path));
     }
 
     #[cfg(unix)]
