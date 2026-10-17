@@ -42,6 +42,7 @@ Adds semantic search over file contents and fixes several issues in the search a
 
 - Open history (frecency) is kept when a scan rebuilds the index.
 - The live watcher matches paths relative to the scanned root and deletes whole subtrees exactly.
+- The live watcher no longer stalls while files in the watched folder are being opened or read. It now ignores access-only events and applies a batch after at most 2 seconds, so a steady stream of events cannot hold back index updates. This showed up on Linux, where reads count as events.
 - Search keeps running when one indexed path cannot be read.
 
 ## Compatibility
