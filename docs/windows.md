@@ -102,3 +102,15 @@ cargo clippy --all-targets -- -D warnings
 lctr scan $env:USERPROFILE
 lctr find powershell --limit 5
 ```
+
+## Semantic search (`--em`)
+
+- Embedding runs on the CPU on Windows. The Metal backend is Apple Silicon only, so expect a pass to take
+  much longer than on a Mac. Speed was not measured on Windows.
+- The model downloads (310 MB for text, 555 MB for images) go to `%APPDATA%\locator\models`. Set
+  `LCTR_DATA_DIR` to move them.
+- The `lctr-full-x86_64-pc-windows-msvc.zip` release archive includes the text model, so its first `--em` run
+  needs no download.
+- Building from source needs cmake, LLVM (for libclang), and the MSVC C++ toolchain. Set `LIBCLANG_PATH` to
+  the LLVM `bin` folder if the build cannot find libclang, for example `C:\Program Files\LLVM\bin`.
+- Scoop and the direct installer install the lean binary. See `docs/embeddings.md` for the rest.

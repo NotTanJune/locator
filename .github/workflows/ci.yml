@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   rust:
@@ -17,14 +18,60 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      # bindgen (used by llama-cpp-sys-2) needs libclang. The Windows runner has LLVM installed at
+      # C:\Program Files\LLVM but does not put it on the search path. Windows-only, so Linux and
+      # macOS keep their own libclang.
+      - name: Point bindgen at LLVM (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: 'Add-Content -Path $env:GITHUB_ENV -Value "LIBCLANG_PATH=C:\Program Files\LLVM\bin"'
       - name: Format
         run: cargo fmt --check
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test
+      # The bundled-model feature embeds the model file at compile time. A 1 KiB dummy file is enough
+      # to prove that the feature compiles; the real model is only used by the release workflow.
+      - name: Dummy model file (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          head -c 1024 /dev/zero > dummy.gguf
+          echo "LCTR_BUNDLED_MODEL=$PWD/dummy.gguf" >> "$GITHUB_ENV"
+      - name: Dummy model file (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          fsutil file createnew dummy.gguf 1024
+          $path = (Resolve-Path dummy.gguf).Path -replace '\\', '/'
+          Add-Content -Path $env:GITHUB_ENV -Value "LCTR_BUNDLED_MODEL=$path"
+      - name: Check the bundled-model build
+        run: cargo check --features bundled-model
       - name: Package
         run: cargo package --no-verify
       - name: Release manifest updater
         if: runner.os != 'Windows'
         run: scripts/test-update-release-manifests.sh
+
+  embedding-reference:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The model cache key is the pinned model revision, so a new pin fetches a new model.
+      - name: Cache the embedding model
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/locator/models
+          key: embeddinggemma-2-bfcd298762cc34d0357ece5ebdd31791a3a374d8
+      - name: Build
+        run: cargo build --release --locked
+      # LCTR_DATA_DIR points at the cached folder, so the models land where actions/cache saves them.
+      - name: Fetch the text and vision models
+        run: LCTR_DATA_DIR="$HOME/.local/share/locator" target/release/lctr embed fetch --vision
+      - name: Reference vectors
+        run: LCTR_DATA_DIR="$HOME/.local/share/locator" cargo test --release --locked --test embed_reference_tests -- --ignored reference_vectors

@@ -35,6 +35,8 @@ old_version=$(ruby -rjson -e 'print JSON.parse(File.read(ARGV[0])).fetch("versio
 
 printf 'mac fixture archive\n' > "$tmp_dir/artifacts/lctr-aarch64-apple-darwin.tar.gz"
 printf 'windows fixture archive\n' > "$tmp_dir/artifacts/lctr-x86_64-pc-windows-msvc.zip"
+# The full (model-bundled) build is uploaded next to the lean one. The updater must ignore it.
+printf 'full fixture archive\n' > "$tmp_dir/artifacts/lctr-full-aarch64-apple-darwin.tar.gz"
 
 mac_sha=$(sha256_file "$tmp_dir/artifacts/lctr-aarch64-apple-darwin.tar.gz")
 windows_sha=$(sha256_file "$tmp_dir/artifacts/lctr-x86_64-pc-windows-msvc.zip")
@@ -43,6 +45,11 @@ windows_sha=$(sha256_file "$tmp_dir/artifacts/lctr-x86_64-pc-windows-msvc.zip")
   cd "$tmp_dir"
   "$repo_root/scripts/update-release-manifests.sh" v1.2.3 "$tmp_dir/artifacts"
 )
+
+if grep -F "lctr-full" "$tmp_dir/Formula/lctr.rb" "$tmp_dir/bucket/lctr.json" >/dev/null 2>&1; then
+  echo "The full build must not appear in the package manifests." >&2
+  exit 1
+fi
 
 assert_contains "$tmp_dir/Formula/lctr.rb" \
   'url "https://github.com/NotTanJune/locator/releases/download/v1.2.3/lctr-aarch64-apple-darwin.tar.gz"'

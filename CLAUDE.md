@@ -27,6 +27,7 @@ Releases are tag-triggered. The tag must match `version` in `Cargo.toml` exactly
 3. Run `cargo generate-lockfile` and commit `Cargo.lock` (version must match or `--locked` fails in CI)
 4. Commit and push to main
 5. `git tag v<version> && git push origin v<version>`
+6. `release.yml` builds two archives per platform: the lean `lctr-<target>` and the full `lctr-full-<target>`, which has the text model inside (`--features bundled-model`, `LCTR_BUNDLED_MODEL` set to the downloaded, SHA-256-checked model). The update-manifests job reads only the lean archives, and `scripts/test-update-release-manifests.sh` checks that the full archive is ignored. The release notes section must start with the heading `# lctr v<version>`; the publish job fails without it.
 
 ## Architecture
 
@@ -103,3 +104,66 @@ Built with `ratatui` + `crossterm`. Layout: vertical split into top chrome (stat
 | `LCTR_SHELL` | Override shell for setup-shell |
 | `LCTR_ICONS` | Set to `1`/`true` to show Nerd Font file-type icons in results (default off) |
 | `LCTR_TIMING` | Set to print per-stage search timing (sql/hydrate/filter/frecency/total) to stderr |
+
+## Embeddings
+
+### Modules
+
+- `src/embed/mod.rs` re-exports the public functions. `model.rs` downloads and verifies the model files.
+- `runtime.rs` loads llama.cpp (text and vision) and implements the `Embedder` trait. `mixed_batch.rs` holds the mixed text and image batch.
+- `chunk.rs` extracts text and splits it into chunks (1800-character target, 200-character overlap, at most 128 chunks per file). `skip.rs` holds the never-read rules and the low-value rules.
+- `pipeline.rs` runs the pass (stages, batching, dedupe, cancel). `store.rs` owns the sidecar. `search.rs` runs semantic queries. `vector.rs` encodes f16 and normalizes. `projection.rs` projects vectors for the galaxy screen.
+- `reference.rs`, `image_sizing.rs`, `bench.rs`, and `selftest.rs` are for checks and measurements. `cli.rs` holds the handlers for `scan --em` and `lctr embed`. `fake.rs` is the test embedder.
+- `src/embed_ui.rs` is the galaxy screen and the summary card.
+
+### Sidecar
+
+The vectors live in `index.embeddings.sqlite` next to the filename index (`sidecar_path_for_index`). They are kept out of the filename index on purpose: the filename index keeps its schema, and `lctr delete-index` removes both files. Tables: `meta` (model id, dims, complete flag per root), `embed_files` (stamp, status, `chunks_total`, `depth_done`), and `chunks` (f16 vector, snippet, ordinal, unique per path and ordinal). The file is created with mode 0600.
+
+### Passes
+
+`STAGE_ENDS` in `pipeline.rs` is `[8, 32, 128]`. Pass N embeds the chunk ordinals below `STAGE_ENDS[N-1]` for every file that has them. Pass 1 covers every file before pass 2 starts. `needs_embedding` decides pass 1 work (new, changed, or failed files); `needs_deeper` decides later passes. `write_stage` replaces a file at ordinal 0 and appends after that; it refuses a pass that does not start at the stored depth. Each file is written in one transaction per pass, so a cancelled run keeps every committed file. Ordinals in code count from 0; user-facing text counts chunks from 1 (`pass_range_text`).
+
+### Mixed batch
+
+`mtmd_helper_eval_chunks` decodes chunk by chunk, and each decode pools its own tokens. The pooled vector then keeps only the last chunk, so every image got the same vector. `embed_mixed` in `mixed_batch.rs` puts the text tokens and the encoder rows into one `llama_batch_ext` and calls `llama_process` once, which is how DigUp does it. The raw pointers it needs come from accessors that the llama-cpp-2 fork adds.
+
+### Embedder and fake
+
+`with_embedder` takes a closure. The model and context are created and freed inside the call, so no embedder handle outlives a scan. `HashEmbedder` (`fake.rs`) is a deterministic stand-in. `LCTR_EMBED_FAKE=1` switches to it, and most tests use it.
+
+### MODEL_ID
+
+`MODEL_ID` in `pipeline.rs` fingerprints the vectors. Change it whenever the same input would give a different vector: a different model file, a different token cap (`MAX_INPUT_TOKENS`), a different image size, or a different batching path. `ensure_compatible` clears the sidecar when the id changes. The current value is `embeddinggemma-2-Q8_0-img140-tok2048-imgfix1`.
+
+### Embedding env vars
+
+| Var | Effect |
+|---|---|
+| `LCTR_EMBED_FAKE` | `1` uses the fake embedder (tests and CI) |
+| `LCTR_HF_BASE` | Base URL for model downloads (default Hugging Face) |
+| `LCTR_EM_PLAIN` | `1` prints plain progress even on a terminal |
+| `LCTR_TIMING` | Prints the embedding pass timing: model load, wall, GPU busy, tokens, chunks, per-pass wall, chunks and tokens, and time to the end of pass 1 |
+| `LCTR_BUNDLED_MODEL` | Build variable: absolute path to `embeddinggemma-2-Q8_0.gguf`, needed with `--features bundled-model` |
+
+### Config keys
+
+- `embed_dims`: `128`, `256`, `512`, or `768` (default `768`). Changing it re-embeds on the next `--em`.
+- `embed_depth`: `quick`, `balanced`, or `deep` (default `quick`). `lctr scan --depth` overrides it.
+
+### Dependency fork
+
+`llama-cpp-2` and `llama-cpp-sys-2` come from `https://github.com/NotTanJune/llama-cpp-rs` at commit `ce4339952a272a9ca306ad718c09dc5c055e9049`, through `[patch.crates-io]` in `Cargo.toml`. The fork pins llama.cpp `9cf967a04`, which has the EmbeddingGemma 2 architecture. It adds three raw pointer accessors (`raw_context_ptr`, `raw_mtmd_ptr`, `raw_model_ptr`) and a timing field fix. Drop the patch once a llama-cpp-2 release includes all three: delete the `[patch.crates-io]` section, then update only those two packages in `Cargo.lock`.
+
+### Build requirements
+
+cmake, libclang (bindgen in `llama-cpp-sys-2`), and a C++ toolchain. llama.cpp compiles from source the first time, which takes minutes. On Windows, set `LIBCLANG_PATH` to the LLVM `bin` folder. CI caches the build with `Swatinem/rust-cache`.
+
+### Reference test
+
+`cargo test --test embed_reference_tests -- --ignored reference_vectors` embeds the DigUp reference inputs (text and images) with the real models and requires every cosine to be at least 0.999. It needs the text and vision models (`lctr embed fetch --vision`) and skips with a message if they are missing. `lctr embed selftest --reference` runs the same check. The reference data is in `tests/fixtures/digup-reference/` (see its `NOTICE.md`).
+
+### Test env lock rule
+
+Opening a `Database` reads the global user config through `fts_index_paths`. A test that changes `LCTR_CONFIG_DIR` or `LCTR_DATA_DIR` therefore races every other test in the same binary that opens a database. `tests/db_tests.rs` has `env_guard()`, and every test in that file takes it once. Any new test that changes a `LCTR_*` variable, or that opens a database in a binary where another test changes one, must take the same guard. Each integration test file is its own process. Unit tests under `src/` have no environment changes, so they need no guard.
+

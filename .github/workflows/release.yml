@@ -15,18 +15,28 @@ jobs:
           - os: macos-latest
             target: aarch64-apple-darwin
             archive: lctr-aarch64-apple-darwin.tar.gz
+            full_archive: lctr-full-aarch64-apple-darwin.tar.gz
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             archive: lctr-x86_64-unknown-linux-gnu.tar.gz
+            full_archive: lctr-full-x86_64-unknown-linux-gnu.tar.gz
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             archive: lctr-x86_64-pc-windows-msvc.zip
+            full_archive: lctr-full-x86_64-pc-windows-msvc.zip
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      # bindgen (used by llama-cpp-sys-2) needs libclang. The Windows runner has LLVM installed at
+      # C:\Program Files\LLVM but does not put it on the search path. Set through GITHUB_ENV in a
+      # Windows-only step, because a job-level value would also reach the Linux and macOS builds.
+      - name: Point bindgen at LLVM (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: 'Add-Content -Path $env:GITHUB_ENV -Value "LIBCLANG_PATH=C:\Program Files\LLVM\bin"'
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Package Unix
@@ -50,6 +60,59 @@ jobs:
         with:
           name: ${{ matrix.archive }}
           path: ${{ matrix.archive }}
+      # Full build: the same target with the embedding model compiled in. Runs after the lean
+      # archive is packaged, because it overwrites target/<target>/release/lctr.
+      - name: Fetch embedding model
+        shell: bash
+        run: |
+          mkdir -p model
+          model="model/embeddinggemma-2-Q8_0.gguf"
+          curl -fL --retry 3 -o "$model" "https://huggingface.co/ggml-org/embeddinggemma-2-GGUF/resolve/bfcd298762cc34d0357ece5ebdd31791a3a374d8/embeddinggemma-2-Q8_0.gguf"
+          size="$(wc -c < "$model" | tr -d ' ')"
+          if [ "$size" != "309855456" ]; then
+            echo "Model size is $size bytes, expected 309855456." >&2
+            exit 1
+          fi
+          if command -v sha256sum >/dev/null 2>&1; then
+            actual="$(sha256sum "$model" | awk '{print $1}')"
+          else
+            actual="$(shasum -a 256 "$model" | awk '{print $1}')"
+          fi
+          expected="2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135"
+          if [ "$actual" != "$expected" ]; then
+            echo "Model SHA-256 is $actual, expected $expected." >&2
+            exit 1
+          fi
+          # LCTR_BUNDLED_MODEL must be an absolute path. Windows needs forward slashes for rustc.
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            path="$(cygpath -m "$PWD/$model")"
+          else
+            path="$PWD/$model"
+          fi
+          echo "LCTR_BUNDLED_MODEL=$path" >> "$GITHUB_ENV"
+      - name: Build full
+        run: cargo build --release --locked --target ${{ matrix.target }} --features bundled-model
+      - name: Package full Unix
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist-full
+          cp "target/${{ matrix.target }}/release/lctr" dist-full/
+          cp README.md LICENSE dist-full/
+          tar -C dist-full -czf "${{ matrix.full_archive }}" .
+      - name: Package full Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist-full -Force | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/lctr.exe" dist-full/
+          Copy-Item README.md, LICENSE dist-full/
+          Compress-Archive -Path dist-full/* -DestinationPath "${{ matrix.full_archive }}" -Force
+      - name: Upload full artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.full_archive }}
+          path: ${{ matrix.full_archive }}
 
   publish:
     needs: build

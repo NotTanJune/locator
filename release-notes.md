@@ -1,3 +1,54 @@
+# lctr v0.4.0
+
+Adds semantic search over file contents and fixes several issues in the search and preview code.
+
+## Semantic search
+
+- `lctr scan <dir> --em` embeds the text of documents, code, and notes, and the pixels of images, with EmbeddingGemma 2 (Google DeepMind, Apache 2.0). The model runs locally through llama.cpp. Results are stored in a separate file next to the search index.
+- Search by meaning in `lctr search` by pressing `m` until the mode reads `semantic`. In scripts, use `lctr find "<query>" --mode semantic`; `--output jsonl` adds a score and a snippet to each result.
+- Depth is set with `--depth quick|balanced|deep` or the `embed_depth` setting. The default is `quick`, which embeds the first 8 chunks of every file (pass 1). `balanced` adds chunks 9 to 32 (pass 2), and `deep` adds chunks up to 128 (pass 3). A deeper run embeds only the chunks that are missing.
+- Each pass makes search useful for more of each file. Search works after pass 1 finishes; the later passes add depth.
+- New subcommands: `lctr embed status`, `lctr embed fetch [--vision]`, and `lctr embed remove-model [--yes]`.
+- Images are embedded with a separate vision model (555 MB), downloaded the first time a scan finds an image.
+- Files whose names look like keys or credentials are never read (for example `.pem`, `.key`, `.p12`, `.env`, `id_rsa`, `credentials`). Nothing under a hidden folder is read. A text file that contains a private key block or an AWS access key id in its first 8 KiB is skipped.
+
+## Speed and requirements
+
+- Embedding speed is set by the model. On an M2 under load the pass runs at about 5 to 6 chunks per second with the GPU fully busy. That is why `quick` is the default: search works after the first pass, and the rest can wait.
+- Apple Silicon Macs run the model on Metal. Other systems run it on the CPU, which is much slower.
+- The first `--em` run downloads the text model (about 310 MB) to the lctr data folder.
+- The prebuilt binaries cover Apple Silicon macOS, Linux x86_64, and Windows x86_64. Intel Macs are not covered; build from source there.
+- Building from source needs cmake, libclang (for bindgen), and a C++ toolchain.
+
+## Downloads
+
+- `lctr` is the lean binary. It downloads the model on first use.
+- `lctr-full` has the text model inside, so the first `--em` run needs no download. Its archive is about 310 MB larger.
+- Homebrew and Scoop install the lean binary. `lctr update` keeps the variant you installed.
+
+## Open, reveal, and update
+
+- Open and reveal work on Linux (through `xdg-open`) and Windows (through Explorer). A failed action shows a message in the status line and no longer exits search.
+- `lctr update` on Windows detects Scoop installs and points them to `scoop update`. Direct installs update from the release asset. The WinGet instruction is removed because no WinGet package exists.
+
+## Preview
+
+- Symbolic links are followed for the size limits, so a link to a large file cannot bypass them.
+- FIFOs and device files are not read.
+- Directory previews list at most 5,000 entries.
+- `preview = false` in the config turns previews off.
+
+## Search and index
+
+- Open history (frecency) is kept when a scan rebuilds the index.
+- The live watcher matches paths relative to the scanned root and deletes whole subtrees exactly.
+- Search keeps running when one indexed path cannot be read.
+
+## Compatibility
+
+- The search index format is unchanged. The embeddings file is new and is created only by `--em`.
+- Two config keys are new: `embed_dims` (768 by default) and `embed_depth` (`quick` by default).
+
 # lctr v0.3.6
 
 A responsiveness and terminal cleanup release for interactive search.

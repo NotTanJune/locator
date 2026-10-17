@@ -86,6 +86,98 @@ Interactive searches are uncapped and arrive in 500-result batches. Indexed resu
 
 Cargo-installed binaries download the matching prebuilt GitHub release archive when `lctr update` runs, so updates do not rebuild the Rust dependency graph locally. Homebrew installs update through `brew upgrade lctr`. Scoop installs update through `scoop update lctr` (close `lctr` first). The Windows direct installer's default location updates through `lctr update`.
 
+## Semantic search
+
+`lctr scan <dir> --em` also embeds the contents of text files and images, so you can search by meaning
+("payment declined error") instead of only by filename. The model is EmbeddingGemma 2, which runs locally.
+The vectors are stored in a second file next to the search index. Filename search works the same as before.
+
+### Install
+
+- The Homebrew and Scoop packages install the lean binary. It downloads the text model (310 MB) the first
+  time you run `--em`.
+- The `lctr-full` archives on the release page include the text model. They need no download on the first
+  run, and they are larger.
+- Building from source needs cmake, libclang (for bindgen), and a C++ toolchain. To build the full binary,
+  set `LCTR_BUNDLED_MODEL` to the absolute path of `embeddinggemma-2-Q8_0.gguf` and add
+  `--features bundled-model`.
+- The prebuilt binaries cover Apple Silicon macOS, Linux x86_64, and Windows x86_64. Intel Macs are not
+  covered.
+
+### Scan depth
+
+`--em` embeds each file in passes. `--depth` (or the `embed_depth` setting) chooses how many:
+
+| Depth | Chunks per file | Measured on 54 files (695 chunks) |
+|---|---|---|
+| `quick` (default) | the first 8 chunks | 356 chunks in 65 s |
+| `balanced` | up to 32 chunks | 575 chunks in 103 s |
+| `deep` | up to 128 chunks | 695 chunks in about 125 s |
+
+The times are from an M2 Mac under load with the GPU fully busy, about 5 to 6 chunks per second. Search works
+after the first pass. A later run with a deeper `--depth` embeds only the missing chunks. Stopping with `q`
+or Ctrl-C keeps what was written, and the next run continues.
+
+```sh
+lctr scan ~/Documents --em                  # quick: first 8 chunks of each file
+lctr scan ~/Documents --em --depth deep     # adds the rest, up to 128 chunks per file
+```
+
+### Search and find
+
+- In `lctr search`, press `m` until the mode reads `semantic`.
+- From a script: `lctr find "payment declined error" --mode semantic --output jsonl`. Each result has a
+  score and a snippet.
+
+### Embedding commands
+
+- `lctr embed status` shows the model files, the index, and how many chunks are embedded.
+- `lctr embed fetch [--vision]` downloads the text model, and the vision model with `--vision`.
+- `lctr embed remove-model [--yes]` deletes the downloaded models.
+- `lctr delete-index` also deletes the embeddings file.
+
+### Config
+
+- `embed_dims`: `128`, `256`, `512`, or `768` (default `768`). Changing it re-embeds on the next `--em` run.
+- `embed_depth`: `quick`, `balanced`, or `deep` (default `quick`). `lctr scan --depth` overrides it for one run.
+
+Set either with `lctr config set embed_depth balanced`.
+
+### What is never read
+
+- Files whose names look like keys or credentials: extensions `.pem`, `.key`, `.p12`, `.pfx`, `.keystore`,
+  `.jks`, `.ppk`, `.kdbx`, `.gpg`, `.asc`, `.crt`, `.cer`, `.der`, `.p8`, `.mobileprovision`; names that start
+  with `id_rsa`, `id_dsa`, `id_ecdsa`, `id_ed25519`, `.env`, `secret`, `credential`, `.netrc`, `.npmrc`,
+  `.pypirc`, or `htpasswd`.
+- Anything under a hidden folder (a path part that starts with a dot), such as `~/.ssh` or `~/.aws`.
+- Text files whose first 8 KiB contains a private key block or an AWS access key id.
+- Lock files, minified code, source maps, SVG images, logs, dependency and build folders, and vendor folders
+  that have a package manifest.
+
+### Disk use
+
+The vectors take 1,536 bytes per chunk (768 dimensions at 2 bytes each), about 154 MB per 100,000 chunks. The
+embeddings file also stores a 240-character snippet per chunk and SQLite overhead. Measured on the 695-chunk
+test corpus, the file was 1.6 MB, about 234 MB per 100,000 chunks.
+
+### Model files
+
+Models are downloaded once and checked against a pinned SHA-256:
+
+- macOS: `~/Library/Application Support/locator/models`
+- Linux: `~/.local/share/locator/models`
+- Windows: `%APPDATA%\locator\models`
+
+Set `LCTR_DATA_DIR` to move the whole data folder. The text model is 310 MB, and the vision model (used for
+images) is 555 MB, downloaded when a scan finds images.
+
+### Credits
+
+- EmbeddingGemma 2 by Google DeepMind, Apache 2.0 license.
+- llama.cpp, MIT license.
+- DigUp by ARahim3, MIT license. The reference vectors used by the test suite, the staged passes, and the
+  secret-file rules come from DigUp.
+
 ## Privacy
 
 `lctr` does not collect, upload, sell, or transmit any information from your machine. There is no account, telemetry, analytics, cloud sync, or background service.
