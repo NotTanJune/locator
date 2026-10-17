@@ -873,3 +873,196 @@ fn fts_upgrades_from_detail_full_on_open() {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].name, "hello-world.rs");
 }
+
+#[test]
+fn import_access_from_copies_previous_history() {
+    let tmp = tempdir().expect("tmp");
+    let old_path = tmp.path().join("old.sqlite");
+    let new_path = tmp.path().join("new.sqlite");
+
+    let old_db = Database::open(&old_path).expect("open old");
+    old_db.record_access("/tmp/a.txt").expect("record a");
+    old_db.record_access("/tmp/a.txt").expect("record a again");
+    old_db.record_access("/tmp/b.txt").expect("record b");
+    drop(old_db);
+
+    let new_db = Database::open_fresh_staged_scan(&new_path).expect("open staged");
+    assert_eq!(new_db.import_access_from(&old_path).unwrap(), 2);
+    drop(new_db);
+
+    let conn = rusqlite::Connection::open(&new_path).expect("open new raw");
+    let count_a: i64 = conn
+        .query_row(
+            "SELECT open_count FROM access WHERE path = '/tmp/a.txt'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("a count");
+    assert_eq!(count_a, 2);
+    let total: i64 = conn
+        .query_row("SELECT COUNT(*) FROM access", [], |row| row.get(0))
+        .expect("total");
+    assert_eq!(total, 2);
+}
+
+#[test]
+fn import_access_from_missing_or_legacy_previous_is_noop() {
+    let tmp = tempdir().expect("tmp");
+    let new_db =
+        Database::open_fresh_staged_scan(tmp.path().join("new.sqlite")).expect("open staged");
+
+    let missing = tmp.path().join("does-not-exist.sqlite");
+    assert_eq!(new_db.import_access_from(&missing).unwrap(), 0);
+
+    let legacy_path = tmp.path().join("legacy.sqlite");
+    {
+        let legacy = rusqlite::Connection::open(&legacy_path).expect("open legacy");
+        legacy
+            .execute_batch("CREATE TABLE files (id INTEGER PRIMARY KEY);")
+            .expect("create legacy");
+    }
+    assert_eq!(new_db.import_access_from(&legacy_path).unwrap(), 0);
+    // A second call proves DETACH ran after the first.
+    assert_eq!(new_db.import_access_from(&legacy_path).unwrap(), 0);
+}
+
+#[test]
+fn mark_path_deleted_only_removes_exact_subtree() {
+    let db = Database::open_in_memory().expect("open db");
+    let sep = std::path::MAIN_SEPARATOR;
+    let p = |parts: &[&str]| format!("{sep}{}", parts.join(&sep.to_string()));
+
+    let dir = p(&["proj", "my_dir"]);
+    let rows = [
+        (dir.clone(), "my_dir", None),
+        (
+            p(&["proj", "my_dir", "alpha.txt"]),
+            "alpha.txt",
+            Some("txt"),
+        ),
+        (
+            p(&["proj", "myXdir", "bravo.txt"]),
+            "bravo.txt",
+            Some("txt"),
+        ),
+        (
+            p(&["proj", "MY_DIR", "charlie.txt"]),
+            "charlie.txt",
+            Some("txt"),
+        ),
+        (
+            p(&["proj", "my_dir2", "delta.txt"]),
+            "delta.txt",
+            Some("txt"),
+        ),
+        (p(&["proj", "my%dir", "echo.txt"]), "echo.txt", Some("txt")),
+    ];
+    for (path, name, ext) in &rows {
+        db.upsert_file(&record(path, name, *ext, 1, 2024))
+            .expect("upsert");
+    }
+
+    assert_eq!(db.mark_path_deleted(&dir).unwrap(), 2);
+    assert_eq!(db.count_active().unwrap(), 4);
+    assert_eq!(db.mark_path_deleted(&dir).unwrap(), 0);
+
+    let percent_dir = format!("{}{sep}", p(&["proj", "my%dir"]));
+    assert_eq!(db.mark_path_deleted(&percent_dir).unwrap(), 1);
+    assert_eq!(db.count_active().unwrap(), 3);
+}
+
+#[test]
+fn mark_path_deleted_handles_a_single_file() {
+    let db = Database::open_in_memory().expect("open db");
+    let sep = std::path::MAIN_SEPARATOR;
+    let path = format!("{sep}proj{sep}only.txt");
+    db.upsert_file(&record(&path, "only.txt", Some("txt"), 1, 2024))
+        .expect("upsert");
+
+    assert_eq!(db.mark_path_deleted(&path).unwrap(), 1);
+    assert_eq!(db.count_active().unwrap(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn verified_search_keeps_unreadable_paths() {
+    let dir = tempdir().expect("temp dir");
+    let db_path = dir.path().join("index.sqlite");
+    let locked_dir = dir.path().join("locked");
+    std::fs::create_dir(&locked_dir).expect("create locked dir");
+    let locked_file = locked_dir.join("report-locked.pdf");
+    let open_file = dir.path().join("report-open.pdf");
+    std::fs::write(&locked_file, "locked").expect("write locked file");
+    std::fs::write(&open_file, "open").expect("write open file");
+
+    {
+        let db = Database::open(&db_path).expect("db opens");
+        db.upsert_file(&record_for_path(&locked_file, Some("pdf"), 100, 2024))
+            .expect("insert locked");
+        db.upsert_file(&record_for_path(&open_file, Some("pdf"), 100, 2024))
+            .expect("insert open");
+    }
+
+    std::fs::set_permissions(&locked_dir, std::fs::Permissions::from_mode(0o000))
+        .expect("lock dir");
+    if std::fs::symlink_metadata(&locked_file).is_ok() {
+        // Running as root: the permission-denied scenario cannot be produced.
+        std::fs::set_permissions(&locked_dir, std::fs::Permissions::from_mode(0o755))
+            .expect("restore dir");
+        return;
+    }
+
+    let db = Database::open_readonly(&db_path)
+        .expect("readonly db opens")
+        .with_search_path_verification();
+    let plain = db.search("report", &SearchFilters::new(), 10);
+    let options = db.search_with_options(&SearchOptions::new("report"));
+    let interactive = db.search_interactive("report", 10);
+
+    // Restore permissions before any assert can panic so tempdir cleanup works.
+    std::fs::set_permissions(&locked_dir, std::fs::Permissions::from_mode(0o755))
+        .expect("restore dir");
+
+    for results in [
+        plain.expect("fts search works"),
+        options.expect("option search works"),
+        interactive.expect("interactive search works"),
+    ] {
+        assert_eq!(results.len(), 2);
+        assert!(results
+            .iter()
+            .any(|result| result.path == locked_file.to_string_lossy()));
+        assert!(results
+            .iter()
+            .any(|result| result.path == open_file.to_string_lossy()));
+    }
+}
+
+#[test]
+fn verified_search_drops_paths_whose_parent_became_a_file() {
+    let dir = tempdir().expect("temp dir");
+    let db_path = dir.path().join("index.sqlite");
+    let parent_file = dir.path().join("report-parent");
+    std::fs::write(&parent_file, "i am a file").expect("write parent file");
+    let child_path = parent_file.join("report-child.pdf");
+    let real_path = dir.path().join("report-real.pdf");
+    std::fs::write(&real_path, "real").expect("write real file");
+
+    {
+        let db = Database::open(&db_path).expect("db opens");
+        db.upsert_file(&record_for_path(&child_path, Some("pdf"), 100, 2024))
+            .expect("insert child");
+        db.upsert_file(&record_for_path(&real_path, Some("pdf"), 100, 2024))
+            .expect("insert real");
+    }
+
+    let db = Database::open_readonly(&db_path)
+        .expect("readonly db opens")
+        .with_search_path_verification();
+    let results = db
+        .search_with_options(&SearchOptions::new("report"))
+        .expect("search succeeds despite ENOTDIR path");
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0].path, real_path.to_string_lossy());
+}

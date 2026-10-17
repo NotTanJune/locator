@@ -169,6 +169,51 @@ fn staged_scan_creates_directory_local_index() {
 }
 
 #[test]
+fn staged_rescan_preserves_open_history() {
+    let root = tempdir().expect("root");
+    let data = tempdir().expect("data dir");
+    std::fs::write(root.path().join("report.pdf"), "fake").expect("write file");
+
+    let scan = || {
+        let mut cmd = Command::cargo_bin("lctr").expect("binary exists");
+        cmd.env("LCTR_DATA_DIR", data.path())
+            .arg("scan")
+            .arg(root.path())
+            .arg("--stage-index")
+            .assert()
+            .success();
+    };
+    scan();
+
+    let index_path = root.path().join(".locator/index.sqlite");
+    let file_path = root.path().join("report.pdf").to_string_lossy().to_string();
+    {
+        let conn = rusqlite::Connection::open(&index_path).expect("open index");
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS access (path TEXT PRIMARY KEY, open_count INTEGER NOT NULL DEFAULT 0, last_opened_at INTEGER);",
+        )
+        .expect("create access");
+        conn.execute(
+            "INSERT INTO access(path, open_count, last_opened_at) VALUES (?1, 5, 1700000000)",
+            [&file_path],
+        )
+        .expect("insert access");
+    }
+
+    scan();
+
+    let conn = rusqlite::Connection::open(&index_path).expect("reopen index");
+    let open_count: i64 = conn
+        .query_row(
+            "SELECT open_count FROM access WHERE path = ?1",
+            [&file_path],
+            |row| row.get(0),
+        )
+        .expect("access row survives rescan");
+    assert_eq!(open_count, 5);
+}
+
+#[test]
 #[cfg(unix)]
 fn staged_scan_readonly_root_falls_back_to_app_support_index() {
     let root = tempdir().expect("root");

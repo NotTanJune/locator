@@ -163,7 +163,7 @@ enum Applied {
 }
 
 fn apply_path(db: &Database, root: &str, path: &Path) -> Applied {
-    if path_is_pruned(path) {
+    if path_is_pruned(Path::new(root), path) {
         return Applied::Unchanged;
     }
 
@@ -185,8 +185,14 @@ fn apply_path(db: &Database, root: &str, path: &Path) -> Applied {
     }
 }
 
-fn path_is_pruned(path: &Path) -> bool {
-    path.components()
+/// Skip events under pruned directories (node_modules, target, .git, ...),
+/// matching the scanner, which prunes only entries *below* the scanned root.
+/// Components of the root itself are never considered, so a project living
+/// at e.g. `~/build/app` still gets live updates.
+fn path_is_pruned(root: &Path, path: &Path) -> bool {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    relative
+        .components()
         .any(|component| is_skip_name(&component.as_os_str().to_string_lossy()))
 }
 
@@ -251,5 +257,52 @@ mod tests {
             matches!(result, Applied::Failed),
             "expected Failed after files table dropped"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pruning_ignores_root_components() {
+        let root = Path::new("/home/u/build/app");
+        assert!(!path_is_pruned(
+            root,
+            Path::new("/home/u/build/app/src/main.rs")
+        ));
+        assert!(path_is_pruned(
+            root,
+            Path::new("/home/u/build/app/node_modules/x/index.js")
+        ));
+        assert!(path_is_pruned(
+            root,
+            Path::new("/home/u/build/app/.git/HEAD")
+        ));
+
+        let cache_root = Path::new("/home/u/.cache/proj");
+        assert!(!path_is_pruned(
+            cache_root,
+            Path::new("/home/u/.cache/proj/notes.txt")
+        ));
+
+        // Outside the root: fallback keeps the old whole-path behavior.
+        assert!(path_is_pruned(
+            Path::new("/elsewhere"),
+            Path::new("/x/target/y")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_path_indexes_files_when_root_has_skip_named_ancestor() {
+        let dir = tempdir().expect("temp dir");
+        let app = dir.path().join("build").join("app");
+        std::fs::create_dir_all(&app).expect("create root");
+        let root = app.canonicalize().expect("canonical root");
+        let db = Database::open(root.join("index.sqlite")).expect("open db");
+
+        let file = root.join("hello.txt");
+        std::fs::write(&file, b"hello").expect("write file");
+
+        let result = apply_path(&db, &root.to_string_lossy(), &file);
+        assert!(matches!(result, Applied::Changed));
+        assert_eq!(db.count_active().unwrap(), 1);
     }
 }

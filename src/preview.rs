@@ -21,6 +21,10 @@ const MAX_PREVIEW_BYTES: u64 = 2 * 1024 * 1024;
 /// willing to decode. Larger than the text cap because real photos are big.
 const MAX_IMAGE_PREVIEW_BYTES: u64 = 50 * 1024 * 1024;
 
+/// Directory previews stop reading after this many entries so a huge folder
+/// cannot stall the UI thread. Sorting applies to the entries read.
+const MAX_DIRECTORY_PREVIEW_ENTRIES: usize = 5_000;
+
 /// What a preview resolved to. Text/Info carry ready-to-render lines; Image
 /// carries a decoded image the TUI turns into a terminal graphics protocol.
 pub enum Preview {
@@ -53,13 +57,29 @@ fn highlighter() -> &'static Highlighter {
 
 /// Build a preview for `path`, capping text/PDF output at `max_lines`.
 pub fn preview_for(path: &Path, max_lines: usize) -> Preview {
-    let metadata = match std::fs::symlink_metadata(path) {
+    // Follow symlinks: every reader below opens the target, so size caps and
+    // file-type checks must apply to the target too, not the link.
+    let metadata = match std::fs::metadata(path) {
         Ok(metadata) => metadata,
-        Err(error) => return Preview::Info(info_lines(&format!("cannot read: {error}"))),
+        Err(error) => {
+            let is_link = std::fs::symlink_metadata(path)
+                .map(|meta| meta.file_type().is_symlink())
+                .unwrap_or(false);
+            let message = if is_link {
+                format!("broken symlink: {error}")
+            } else {
+                format!("cannot read: {error}")
+            };
+            return Preview::Info(info_lines(&message));
+        }
     };
 
     if metadata.is_dir() {
         return directory_preview(path, max_lines);
+    }
+    // FIFOs, sockets, and devices can block forever or never end when read.
+    if !metadata.is_file() {
+        return Preview::Info(info_lines("special file (not previewed)"));
     }
 
     let extension = path
@@ -74,7 +94,7 @@ pub fn preview_for(path: &Path, max_lines: usize) -> Preview {
         return pdf_preview(path, &metadata, max_lines);
     }
 
-    text_or_binary_preview(path, &extension, max_lines)
+    text_or_binary_preview(path, &metadata, &extension, max_lines)
 }
 
 fn directory_preview(path: &Path, max_lines: usize) -> Preview {
@@ -86,6 +106,7 @@ fn directory_preview(path: &Path, max_lines: usize) -> Preview {
         Ok(entries) => {
             let mut names = entries
                 .filter_map(|entry| entry.ok())
+                .take(MAX_DIRECTORY_PREVIEW_ENTRIES)
                 .map(|entry| {
                     let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
                     let name = entry.file_name().to_string_lossy().to_string();
@@ -96,9 +117,15 @@ fn directory_preview(path: &Path, max_lines: usize) -> Preview {
                     }
                 })
                 .collect::<Vec<_>>();
+            let truncated = names.len() == MAX_DIRECTORY_PREVIEW_ENTRIES;
             names.sort();
             for name in names.into_iter().take(max_lines) {
                 lines.push(Line::from(name));
+            }
+            if truncated {
+                lines.push(Line::from(format!(
+                    "(showing first {MAX_DIRECTORY_PREVIEW_ENTRIES} entries, unsorted beyond that)"
+                )));
             }
         }
         Err(error) => lines.push(Line::from(format!("cannot list: {error}"))),
@@ -164,30 +191,37 @@ fn pdf_preview(path: &Path, metadata: &std::fs::Metadata, max_lines: usize) -> P
     }
 }
 
-fn text_or_binary_preview(path: &Path, extension: &str, max_lines: usize) -> Preview {
-    let metadata = std::fs::symlink_metadata(path).ok();
-    if let Some(meta) = &metadata {
-        if meta.len() > MAX_PREVIEW_BYTES {
-            return Preview::Info(info_lines(&format!(
-                "file too large to preview ({})",
-                human_size(meta.len())
-            )));
-        }
+fn text_or_binary_preview(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    extension: &str,
+    max_lines: usize,
+) -> Preview {
+    if metadata.len() > MAX_PREVIEW_BYTES {
+        return Preview::Info(info_lines(&format!(
+            "file too large to preview ({})",
+            human_size(metadata.len())
+        )));
     }
 
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) => return Preview::Info(info_lines(&format!("cannot read: {error}"))),
-    };
+    let mut bytes = Vec::new();
+    let read = std::fs::File::open(path).and_then(|file| {
+        use std::io::Read;
+        file.take(MAX_PREVIEW_BYTES + 1).read_to_end(&mut bytes)
+    });
+    if let Err(error) = read {
+        return Preview::Info(info_lines(&format!("cannot read: {error}")));
+    }
+    if bytes.len() as u64 > MAX_PREVIEW_BYTES {
+        return Preview::Info(info_lines("file too large to preview"));
+    }
 
     if looks_binary(&bytes) {
         let mut lines = vec![Line::from(Span::styled(
             "binary file",
             Style::default().fg(Color::Yellow),
         ))];
-        if let Some(meta) = &metadata {
-            lines.push(Line::from(format_size_line(meta.len())));
-        }
+        lines.push(Line::from(format_size_line(metadata.len())));
         return Preview::Info(lines);
     }
 

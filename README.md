@@ -84,7 +84,7 @@ If no index exists, `lctr search` uses live filesystem search. If an interrupted
 
 Interactive searches are uncapped and arrive in 500-result batches. Indexed results keep their final ranking as batches arrive. Live and hybrid searches show discovered paths immediately, then apply one final global reorder when discovery completes. The result list renders only its visible viewport, so navigation remains responsive with large result sets.
 
-Cargo-installed binaries download the matching prebuilt GitHub release archive when `lctr update` runs, so updates do not rebuild the Rust dependency graph locally. Homebrew and WinGet installations continue to update through their package managers.
+Cargo-installed binaries download the matching prebuilt GitHub release archive when `lctr update` runs, so updates do not rebuild the Rust dependency graph locally. Homebrew installs update through `brew upgrade lctr`. Scoop installs update through `scoop update lctr` (close `lctr` first). The Windows direct installer's default location updates through `lctr update`.
 
 ## Privacy
 

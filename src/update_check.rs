@@ -10,7 +10,6 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const REPOSITORY: &str = "NotTanJune/locator";
 const REPOSITORY_URL: &str = "https://github.com/NotTanJune/locator";
 const LATEST_RELEASE_URL: &str = "https://api.github.com/repos/NotTanJune/locator/releases/latest";
 const MAX_RELEASE_ASSET_BYTES: u64 = 512 * 1024 * 1024;
@@ -144,7 +143,12 @@ fn extract_tag_name(body: &str) -> Option<String> {
 enum InstallSource {
     Homebrew,
     Cargo,
-    WindowsPackageManager,
+    /// Scoop (`<scoop root>\apps\lctr\...`). Scoop will not update an app
+    /// while it is running, so `lctr update` prints the command instead.
+    Scoop,
+    /// `install.ps1` default location
+    /// (`%LOCALAPPDATA%\Programs\lctr\bin`). Self-updates from the release.
+    WindowsInstaller,
     Unsupported,
 }
 
@@ -160,7 +164,15 @@ fn detect_install_source(exe_path: &str, homebrew_prefix: &str, windows: bool) -
     }
 
     if windows {
-        return InstallSource::WindowsPackageManager;
+        let normalized = exe_path.replace('/', "\\").to_ascii_lowercase();
+        if normalized.contains("\\scoop\\apps\\lctr\\")
+            || normalized.contains("\\apps\\lctr\\current\\")
+        {
+            return InstallSource::Scoop;
+        }
+        if normalized.ends_with("\\programs\\lctr\\bin\\lctr.exe") {
+            return InstallSource::WindowsInstaller;
+        }
     }
 
     InstallSource::Unsupported
@@ -196,7 +208,8 @@ fn detect_update_cmd_for(exe_path: &str, homebrew_prefix: &str, windows: bool) -
     match detect_install_source(exe_path, homebrew_prefix, windows) {
         InstallSource::Homebrew => "brew upgrade lctr".to_string(),
         InstallSource::Cargo => "lctr update".to_string(),
-        InstallSource::WindowsPackageManager => "winget upgrade NotTanJune.locator".to_string(),
+        InstallSource::Scoop => "scoop update lctr".to_string(),
+        InstallSource::WindowsInstaller => "lctr update".to_string(),
         InstallSource::Unsupported => {
             "see https://github.com/NotTanJune/locator/releases".to_string()
         }
@@ -431,9 +444,11 @@ pub fn run_update() -> Result<()> {
     match source {
         InstallSource::Homebrew => run_update_command("brew", &["upgrade", "lctr"]),
         InstallSource::Cargo => update_from_prebuilt_release(&exe_path),
-        InstallSource::WindowsPackageManager => {
-            run_update_command("winget", &["upgrade", REPOSITORY])
-        }
+        InstallSource::Scoop => bail!(
+            "lctr is managed by Scoop, which cannot update lctr while it is running. \
+             Close lctr, then run: scoop update; scoop update lctr"
+        ),
+        InstallSource::WindowsInstaller => update_from_prebuilt_release(&exe_path),
         InstallSource::Unsupported => bail!(
             "automatic updates are unavailable for this installation; reinstall from {}",
             REPOSITORY_URL
@@ -546,6 +561,120 @@ mod tests {
         );
         assert_eq!(
             detect_update_cmd_for(r"C:\Users\test\.cargo\bin\lctr.exe", "", true),
+            "lctr update"
+        );
+    }
+
+    #[test]
+    fn install_source_detection_matches_documented_install_paths() {
+        let rows: &[(&str, &str, bool, InstallSource)] = &[
+            (
+                "/opt/homebrew/Cellar/lctr/0.3.6/bin/lctr",
+                "",
+                false,
+                InstallSource::Homebrew,
+            ),
+            (
+                "/opt/homebrew/bin/lctr",
+                "/opt/homebrew",
+                false,
+                InstallSource::Homebrew,
+            ),
+            (
+                "/Users/test/.cargo/bin/lctr",
+                "",
+                false,
+                InstallSource::Cargo,
+            ),
+            (
+                r"C:\Users\test\.cargo\bin\lctr.exe",
+                "",
+                true,
+                InstallSource::Cargo,
+            ),
+            (
+                r"C:\Users\test\scoop\apps\lctr\current\lctr.exe",
+                "",
+                true,
+                InstallSource::Scoop,
+            ),
+            (
+                r"C:\Users\test\scoop\apps\lctr\0.3.6\lctr.exe",
+                "",
+                true,
+                InstallSource::Scoop,
+            ),
+            (
+                r"C:\ProgramData\scoop\apps\lctr\current\lctr.exe",
+                "",
+                true,
+                InstallSource::Scoop,
+            ),
+            (
+                r"D:\Tools\ScoopRoot\apps\lctr\current\lctr.exe",
+                "",
+                true,
+                InstallSource::Scoop,
+            ),
+            (
+                r"C:\Users\test\AppData\Local\Programs\lctr\bin\lctr.exe",
+                "",
+                true,
+                InstallSource::WindowsInstaller,
+            ),
+            (
+                "C:/Users/test/AppData/Local/Programs/lctr/bin/lctr.exe",
+                "",
+                true,
+                InstallSource::WindowsInstaller,
+            ),
+            (r"C:\Tools\lctr.exe", "", true, InstallSource::Unsupported),
+            ("/usr/local/bin/lctr", "", false, InstallSource::Unsupported),
+            (
+                r"C:\Users\test\scoop\apps\lctr\current\lctr.exe",
+                "",
+                false,
+                InstallSource::Unsupported,
+            ),
+        ];
+        for (path, prefix, windows, expected) in rows {
+            assert_eq!(
+                detect_install_source(path, prefix, *windows),
+                *expected,
+                "path {path:?} prefix {prefix:?} windows {windows}"
+            );
+        }
+    }
+
+    #[test]
+    fn update_hints_never_mention_winget() {
+        let windows_paths = [
+            r"C:\Users\test\.cargo\bin\lctr.exe",
+            r"C:\Users\test\scoop\apps\lctr\current\lctr.exe",
+            r"C:\Users\test\scoop\apps\lctr\0.3.6\lctr.exe",
+            r"C:\ProgramData\scoop\apps\lctr\current\lctr.exe",
+            r"D:\Tools\ScoopRoot\apps\lctr\current\lctr.exe",
+            r"C:\Users\test\AppData\Local\Programs\lctr\bin\lctr.exe",
+            "C:/Users/test/AppData/Local/Programs/lctr/bin/lctr.exe",
+            r"C:\Tools\lctr.exe",
+        ];
+        for path in windows_paths {
+            let hint = detect_update_cmd_for(path, "", true);
+            assert!(
+                !hint.to_ascii_lowercase().contains("winget"),
+                "hint for {path:?} mentions winget: {hint}"
+            );
+        }
+        assert_eq!(
+            detect_update_cmd_for(r"C:\Users\test\scoop\apps\lctr\current\lctr.exe", "", true),
+            "scoop update lctr"
+        );
+        assert_eq!(
+            detect_update_cmd_for(
+                r"C:\Users\test\AppData\Local\Programs\lctr\bin\lctr.exe",
+                "",
+                true
+            ),
             "lctr update"
         );
     }

@@ -255,6 +255,14 @@ fn main() -> Result<()> {
             let final_index_path = staged_target.clone().unwrap_or_else(|| db_path.clone());
             let used_stage_index = staged_target.is_some();
             if let Some(target) = staged_target {
+                if let Err(error) = db.import_access_from(&target) {
+                    spinner.suspend(|| {
+                        eprintln!(
+                            "warning: could not keep open history from {}: {error:#}",
+                            target.display()
+                        )
+                    });
+                }
                 db.checkpoint()?;
                 drop(db);
                 copy_finished_index(&db_path, &target)?;

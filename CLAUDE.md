@@ -16,7 +16,7 @@ cargo run -- scan ~/some/dir     # run lctr scan
 cargo run -- search              # run lctr TUI search
 ```
 
-CI also runs `scripts/test-update-release-manifests.sh` (Unix only) to validate the Homebrew formula and WinGet manifest update scripts.
+CI also runs `scripts/test-update-release-manifests.sh` (Unix only) to validate the Homebrew formula and Scoop manifest update scripts.
 
 ## Releasing
 
@@ -91,7 +91,7 @@ Built with `ratatui` + `crossterm`. Layout: vertical split into top chrome (stat
 
 ### Update check
 
-`src/update_check.rs` — non-blocking, cached GitHub release check. Hits `api.github.com/repos/NotTanJune/locator/releases/latest` via `ureq` (2s timeout) at most once per 24h. Cache at `dirs::config_dir()/locator/update_check`. Opt out: `--no-update-check` flag (persists a marker file) or `LCTR_NO_UPDATE_CHECK=1` env var. `lctr update` downloads the matching prebuilt GitHub release for Cargo-installed binaries, or delegates to Homebrew or WinGet based on the executable path.
+`src/update_check.rs` — non-blocking, cached GitHub release check. Hits `api.github.com/repos/NotTanJune/locator/releases/latest` via `ureq` (2s timeout) at most once per 24h. Cache at `dirs::config_dir()/locator/update_check`. Opt out: `--no-update-check` flag (persists a marker file) or `LCTR_NO_UPDATE_CHECK=1` env var. `lctr update` downloads the matching prebuilt GitHub release for Cargo-installed binaries, updates the Windows direct-installer location the same way, delegates to Homebrew, and prints the Scoop command for Scoop installs, based on the executable path.
 
 ### Key env vars
 

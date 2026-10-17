@@ -821,6 +821,51 @@ impl Database {
         Ok(())
     }
 
+    /// Copy frecency rows (`access`) from a previous index file into this
+    /// database. Staged scans build a fresh database without history, so the
+    /// scan calls this before swapping files to keep open/reveal/copy ranking.
+    /// Returns the number of rows copied. A missing previous file, or one
+    /// without an `access` table, copies nothing.
+    pub fn import_access_from(&self, previous: &Path) -> Result<u64> {
+        if !previous.exists() {
+            return Ok(0);
+        }
+        self.conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS access (
+                path TEXT PRIMARY KEY,
+                open_count INTEGER NOT NULL DEFAULT 0,
+                last_opened_at INTEGER
+             );",
+        )?;
+        self.conn.execute(
+            "ATTACH DATABASE ?1 AS previous",
+            params![previous.to_string_lossy()],
+        )?;
+        let copied = (|| -> Result<u64> {
+            let has_access: bool = self.conn.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM previous.sqlite_master
+                    WHERE type = 'table' AND name = 'access'
+                 )",
+                [],
+                |row| row.get(0),
+            )?;
+            if !has_access {
+                return Ok(0);
+            }
+            let rows = self.conn.execute(
+                "INSERT OR REPLACE INTO main.access(path, open_count, last_opened_at)
+                 SELECT path, open_count, last_opened_at FROM previous.access",
+                [],
+            )?;
+            Ok(rows as u64)
+        })();
+        let detached = self.conn.execute_batch("DETACH DATABASE previous");
+        let copied = copied?;
+        detached?;
+        Ok(copied)
+    }
+
     /// Frecency weight per path (open count scaled by recency). Best-effort: any
     /// failure (e.g. a connection without the `access` table) yields an empty
     /// map so search never breaks.
@@ -850,10 +895,18 @@ impl Database {
     /// Soft-delete a single path (and, if it is a directory, everything beneath
     /// it). Used by the live filesystem watcher when a path is removed.
     pub fn mark_path_deleted(&self, path: &str) -> Result<u64> {
-        let prefix = format!("{}/%", path.trim_end_matches('/'));
+        // Exact descendants only: a byte-range on the BINARY-collated, indexed
+        // `path` column. LIKE would treat `_`/`%` as wildcards and ignore ASCII
+        // case, soft-deleting unrelated siblings.
+        let separator = std::path::MAIN_SEPARATOR;
+        let next = char::from_u32(separator as u32 + 1).expect("separator successor");
+        let base = path.trim_end_matches(separator);
+        let lower = format!("{base}{separator}");
+        let upper = format!("{base}{next}");
         let changed = self.conn.execute(
-            "UPDATE files SET deleted = 1 WHERE path = ?1 OR path LIKE ?2",
-            params![path, prefix],
+            "UPDATE files SET deleted = 1
+             WHERE deleted = 0 AND (path = ?1 OR (path >= ?2 AND path < ?3))",
+            params![path, lower, upper],
         )?;
         Ok(changed as u64)
     }
@@ -1505,12 +1558,16 @@ impl Database {
     fn hydrate_search_result(&self, mut result: SearchResult) -> Result<Option<SearchResult>> {
         let metadata = match fs::symlink_metadata(&result.path) {
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == ErrorKind::NotFound => {
+            // Gone from disk: a removed file, or a parent folder that is now a file.
+            Err(error)
+                if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) =>
+            {
                 return Ok((!self.verify_paths_on_search).then_some(result));
             }
-            Err(error) => {
-                return Err(error).with_context(|| format!("read metadata for {}", result.path));
-            }
+            // Present but not inspectable (permission denied, I/O error, stale network
+            // handle). Keep the indexed row unhydrated rather than failing the whole
+            // search over one path.
+            Err(_) => return Ok(Some(result)),
         };
 
         result.size_bytes = metadata.len();

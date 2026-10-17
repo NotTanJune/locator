@@ -841,7 +841,8 @@ fn run_loop(
         match &preview_target {
             Some(path) => {
                 let cached = preview_state.as_ref().map(|state| state.path.as_str());
-                if cached != Some(path.as_str())
+                if preview_enabled
+                    && cached != Some(path.as_str())
                     && preview_pending_since.elapsed() >= PREVIEW_DEBOUNCE
                 {
                     preview_state = Some(build_preview(&mut picker, path));
@@ -1305,9 +1306,15 @@ fn run_loop(
                             backend_label != "indexed" && !search_state.live_complete_for(query);
                         if selected_path(&selected, &results).is_some() {
                             if let Some(path) = selected_path(&selected, &results) {
-                                open_file(Path::new(path))?;
-                                record_access_if_indexed(&watch_target, path);
-                                status = format!("opened {path}");
+                                match open_file(Path::new(path)) {
+                                    Ok(()) => {
+                                        record_access_if_indexed(&watch_target, path);
+                                        status = format!("opened {path}");
+                                    }
+                                    Err(error) => {
+                                        status = format!("open failed: {error:#}");
+                                    }
+                                }
                             }
                         } else if live_backfill && should_show_results(query) {
                             let options = tui_search_options(query)
@@ -1352,17 +1359,25 @@ fn run_loop(
                     KeyCode::PageUp => move_selection(&mut selected, results.len(), -10),
                     KeyCode::Char('o') | KeyCode::Enter => {
                         if let Some(path) = selected_path(&selected, &results) {
-                            open_file(Path::new(path))?;
-                            record_access_if_indexed(&watch_target, path);
-                            status = format!("opened {path}");
+                            match open_file(Path::new(path)) {
+                                Ok(()) => {
+                                    record_access_if_indexed(&watch_target, path);
+                                    status = format!("opened {path}");
+                                }
+                                Err(error) => {
+                                    status = format!("open failed: {error:#}");
+                                }
+                            }
                         }
                     }
                     KeyCode::Char('r') => {
                         if let Some(path) = selected_path(&selected, &results) {
                             #[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
                             {
-                                finder_reveal.request_reveal(Path::new(path))?;
-                                status = format!("revealing {path}");
+                                match finder_reveal.request_reveal(Path::new(path)) {
+                                    Ok(()) => status = format!("revealing {path}"),
+                                    Err(error) => status = format!("reveal failed: {error:#}"),
+                                }
                             }
                             #[cfg(not(all(
                                 target_os = "macos",
@@ -1382,9 +1397,15 @@ fn run_loop(
                     }
                     KeyCode::Char('y') => {
                         if let Some(path) = selected_path(&selected, &results) {
-                            copy_path(Path::new(path))?;
-                            record_access_if_indexed(&watch_target, path);
-                            status = format!("copied {path}");
+                            match copy_path(Path::new(path)) {
+                                Ok(()) => {
+                                    record_access_if_indexed(&watch_target, path);
+                                    status = format!("copied {path}");
+                                }
+                                Err(error) => {
+                                    status = format!("copy failed: {error:#}");
+                                }
+                            }
                         }
                     }
                     KeyCode::Char('m') => {

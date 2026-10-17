@@ -24,12 +24,158 @@ const FINDER_HELPER_ARG: &str = "__finder-helper";
 #[cfg(all(target_os = "macos", target_arch = "aarch64", not(test)))]
 const FINDER_HELPER_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Desktop launcher conventions. Chosen from the build target at runtime, but
+/// every variant is unit-tested on every host so Linux/Windows logic is
+/// verified even on a macOS dev machine.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Platform {
+    MacOs,
+    Linux,
+    Windows,
+}
+
+const CURRENT_PLATFORM: Platform = if cfg!(target_os = "macos") {
+    Platform::MacOs
+} else if cfg!(windows) {
+    Platform::Windows
+} else {
+    Platform::Linux
+};
+
+/// One external launcher invocation.
+#[derive(Debug, PartialEq, Eq)]
+struct LaunchSpec {
+    program: &'static str,
+    args: Vec<std::ffi::OsString>,
+    /// Pass `args` verbatim (Windows only). `explorer.exe /select,"<path>"`
+    /// breaks under std's normal argument quoting.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    raw_args: bool,
+    /// Wait for exit and treat non-zero as failure. `explorer.exe` exits 1 even
+    /// on success, so Windows specs only check that the process spawned.
+    check_status: bool,
+}
+
+fn open_spec(platform: Platform, path: &Path) -> LaunchSpec {
+    match platform {
+        Platform::MacOs => LaunchSpec {
+            program: "open",
+            args: vec![path.as_os_str().to_owned()],
+            raw_args: false,
+            check_status: true,
+        },
+        Platform::Linux => LaunchSpec {
+            program: "xdg-open",
+            args: vec![path.as_os_str().to_owned()],
+            raw_args: false,
+            check_status: true,
+        },
+        Platform::Windows => LaunchSpec {
+            program: "explorer.exe",
+            args: vec![path.as_os_str().to_owned()],
+            raw_args: false,
+            check_status: false,
+        },
+    }
+}
+
+/// Reveal = show the item in the platform file manager. macOS reveal normally
+/// goes through `FinderRevealSession`; this spec covers the generic fallback.
+/// Linux has no portable "select item" command, so it opens the parent folder.
+#[cfg_attr(all(target_os = "macos", not(test)), allow(dead_code))]
+fn reveal_spec(platform: Platform, path: &Path) -> Result<LaunchSpec> {
+    Ok(match platform {
+        Platform::MacOs => LaunchSpec {
+            program: "open",
+            args: vec!["-R".into(), path.as_os_str().to_owned()],
+            raw_args: false,
+            check_status: true,
+        },
+        Platform::Linux => {
+            let parent = path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .with_context(|| format!("reveal {}: no parent folder", path.display()))?;
+            LaunchSpec {
+                program: "xdg-open",
+                args: vec![parent.as_os_str().to_owned()],
+                raw_args: false,
+                check_status: true,
+            }
+        }
+        Platform::Windows => {
+            let mut arg = std::ffi::OsString::from("/select,\"");
+            arg.push(path.as_os_str());
+            arg.push("\"");
+            LaunchSpec {
+                program: "explorer.exe",
+                args: vec![arg],
+                raw_args: true,
+                check_status: false,
+            }
+        }
+    })
+}
+
+#[cfg(windows)]
+fn push_launch_args(command: &mut std::process::Command, spec: &LaunchSpec) {
+    use std::os::windows::process::CommandExt;
+    if spec.raw_args {
+        for arg in &spec.args {
+            command.raw_arg(arg);
+        }
+    } else {
+        command.args(&spec.args);
+    }
+}
+
+#[cfg(not(windows))]
+fn push_launch_args(command: &mut std::process::Command, spec: &LaunchSpec) {
+    command.args(&spec.args);
+}
+
+/// Run a launcher without letting its output paint over the TUI. Stdout and
+/// stderr are captured (or discarded), and non-zero exits become errors that
+/// carry the launcher's first stderr line.
+fn run_launch(spec: &LaunchSpec, action: &str, path: &Path) -> Result<()> {
+    let mut command = std::process::Command::new(spec.program);
+    push_launch_args(&mut command, spec);
+    command.stdin(std::process::Stdio::null());
+    if !spec.check_status {
+        command
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .with_context(|| format!("{action} {}: run {}", path.display(), spec.program))?;
+        return Ok(());
+    }
+    let output = command
+        .output()
+        .with_context(|| format!("{action} {}: run {}", path.display(), spec.program))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let detail = stderr.lines().next().unwrap_or("").trim();
+    if detail.is_empty() {
+        bail!(
+            "{action} {}: {} exited with {}",
+            path.display(),
+            spec.program,
+            output.status
+        );
+    }
+    bail!(
+        "{action} {}: {} exited with {}: {detail}",
+        path.display(),
+        spec.program,
+        output.status
+    );
+}
+
 pub fn open_file(path: &Path) -> Result<()> {
-    std::process::Command::new("open")
-        .arg(path)
-        .status()
-        .with_context(|| format!("open {}", path.display()))?;
-    Ok(())
+    run_launch(&open_spec(CURRENT_PLATFORM, path), "open", path)
 }
 
 /// Owns one Finder window created by a single TUI search session.
@@ -799,16 +945,7 @@ fn parse_window_id(response: &str, path: &Path) -> Result<u64> {
 
 #[cfg(all(not(target_os = "macos"), not(test)))]
 fn reveal_once(path: &Path) -> Result<()> {
-    let status = std::process::Command::new("open")
-        .arg("-R")
-        .arg(path)
-        .status()
-        .with_context(|| format!("reveal {}", path.display()))?;
-    if status.success() {
-        Ok(())
-    } else {
-        bail!("reveal {}: open exited with {status}", path.display());
-    }
+    run_launch(&reveal_spec(CURRENT_PLATFORM, path)?, "reveal", path)
 }
 
 pub fn copy_path(path: &Path) -> Result<()> {
@@ -829,8 +966,8 @@ mod tests {
     use anyhow::{bail, Result};
 
     use super::{
-        AutomationOutput, FinderAutomation, FinderRevealSession, CLOSE_WINDOW_SCRIPT,
-        CREATE_WINDOW_SCRIPT, RETARGET_WINDOW_SCRIPT,
+        open_spec, reveal_spec, AutomationOutput, FinderAutomation, FinderRevealSession, Platform,
+        CLOSE_WINDOW_SCRIPT, CREATE_WINDOW_SCRIPT, RETARGET_WINDOW_SCRIPT,
     };
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     use super::{FinderHelperRequest, FinderHelperResponse};
@@ -1061,6 +1198,62 @@ mod tests {
             let decoded: FinderHelperResponse =
                 serde_json::from_str(&encoded).expect("decode response");
             assert_eq!(decoded.result, result);
+        }
+    }
+
+    #[test]
+    fn open_spec_uses_platform_launcher() {
+        let p = Path::new("/tmp/dir/file.txt");
+        let expected_args = vec![OsString::from(p)];
+
+        let mac = open_spec(Platform::MacOs, p);
+        assert_eq!(mac.program, "open");
+        assert_eq!(mac.args, expected_args);
+        assert!(mac.check_status);
+
+        let linux = open_spec(Platform::Linux, p);
+        assert_eq!(linux.program, "xdg-open");
+        assert_eq!(linux.args, expected_args);
+        assert!(linux.check_status);
+
+        let windows = open_spec(Platform::Windows, p);
+        assert_eq!(windows.program, "explorer.exe");
+        assert_eq!(windows.args, expected_args);
+        assert!(!windows.raw_args);
+        assert!(!windows.check_status);
+    }
+
+    #[test]
+    fn reveal_spec_selects_item_or_parent() {
+        let p = Path::new("/tmp/dir/file.txt");
+
+        let mac = reveal_spec(Platform::MacOs, p).expect("macos reveal spec");
+        assert_eq!(mac.program, "open");
+        assert_eq!(mac.args, vec![OsString::from("-R"), OsString::from(p)]);
+
+        let linux = reveal_spec(Platform::Linux, p).expect("linux reveal spec");
+        assert_eq!(linux.program, "xdg-open");
+        assert_eq!(linux.args, vec![OsString::from("/tmp/dir")]);
+
+        let win_path = Path::new(r"C:\Users\me\file name.txt");
+        let windows = reveal_spec(Platform::Windows, win_path).expect("windows reveal spec");
+        assert_eq!(windows.program, "explorer.exe");
+        assert_eq!(
+            windows.args,
+            vec![OsString::from(r#"/select,"C:\Users\me\file name.txt""#)]
+        );
+        assert!(windows.raw_args);
+        assert!(!windows.check_status);
+
+        assert!(reveal_spec(Platform::Linux, Path::new("file.txt")).is_err());
+    }
+
+    #[test]
+    fn open_spec_keeps_path_as_single_argument() {
+        let p = Path::new("/tmp/-weird & \"name\".txt");
+        for platform in [Platform::MacOs, Platform::Linux] {
+            let spec = open_spec(platform, p);
+            assert_eq!(spec.args, vec![OsString::from(p)]);
         }
     }
 }
