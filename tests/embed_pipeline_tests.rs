@@ -249,7 +249,14 @@ fn deleted_file_is_pruned_with_its_chunks() {
     write_standard_tree(&fx.root);
     scan_into_index(&fx.root, &fx.index);
     run_fake(&fx);
-    let soup = format!("{}/soup.md", canonical(&fx.root));
+    // Join with the platform separator: the scanner stores `\` paths on Windows.
+    let soup = fx
+        .root
+        .canonicalize()
+        .expect("canonical")
+        .join("soup.md")
+        .to_string_lossy()
+        .to_string();
     assert!(!store_for(&fx)
         .snippets_for(&[(soup.clone(), 0)])
         .expect("before")[0]
