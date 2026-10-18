@@ -2,7 +2,7 @@ class Lctr < Formula
   desc "Fast local file metadata search"
   homepage "https://github.com/NotTanJune/locator"
   url "https://github.com/NotTanJune/locator/releases/download/v0.4.0/lctr-aarch64-apple-darwin.tar.gz"
-  sha256 "a6f3cd366ecfbdc674bfeade26d16935afe869383248a5ed1455151992368683"
+  sha256 "690583322a439698c8ce4f9ce2136dbc84a0e84ea59d301118b502818e35916f"
   license "GPL-3.0-only"
 
   head do
