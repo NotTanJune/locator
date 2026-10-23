@@ -1,3 +1,19 @@
+# lctr v0.4.1
+
+Makes `scan --em` skip build output and Photos library internals, and fixes a PDF crash.
+
+## Embedding
+
+- Xcode build folders with a suffix (`DerivedData-mac`, `DerivedData-ios`, and so on) are skipped as build output. Before, only a folder named exactly `DerivedData` was skipped.
+- Inside a `.photoslibrary` package, `database/` (the library's own search index) and `derivatives/` (resized copies of photos) are skipped. Originals are still embedded. Photos stored only as HEIC are no longer searchable by image content, because their JPEG copies lived in `derivatives/`.
+- A file that an older version embedded and that a skip rule now covers is marked skipped on the next `--em` run, and its chunks are removed from the embeddings index.
+- On a home folder scan with many Xcode projects and a large Photos library, these rules removed about two thirds of the chunks.
+
+## Fixes
+
+- A malformed PDF no longer prints a `pdf-extract` panic message over the scan display. The file is recorded as failed and the scan continues, as before.
+- Previewing a malformed PDF in `lctr search` shows "pdf text could not be extracted" instead of crashing search.
+
 # lctr v0.4.0
 
 Adds semantic search over file contents and fixes several issues in the search and preview code.

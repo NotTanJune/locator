@@ -153,13 +153,11 @@ fn extract_pdf(path: &Path, size_bytes: u64) -> Extracted {
     if let Err(message) = regular_file(path) {
         return Extracted::Failed(message);
     }
-    // pdf-extract can panic on malformed files; a panic only fails this file.
-    let outcome = std::panic::catch_unwind(|| pdf_extract::extract_text(path));
-    match outcome {
-        Ok(Ok(text)) if text.trim().is_empty() => Extracted::Skipped(SkipReason::Empty),
-        Ok(Ok(text)) => Extracted::Text(text),
-        Ok(Err(error)) => Extracted::Failed(format!("pdf text extraction failed: {error}")),
-        Err(_) => Extracted::Failed("pdf text extraction panicked".to_string()),
+    // A panic on a malformed file only fails this file.
+    match crate::preview::extract_pdf_text(path) {
+        Ok(text) if text.trim().is_empty() => Extracted::Skipped(SkipReason::Empty),
+        Ok(text) => Extracted::Text(text),
+        Err(message) => Extracted::Failed(message),
     }
 }
 

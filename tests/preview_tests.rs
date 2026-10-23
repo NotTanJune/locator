@@ -126,3 +126,48 @@ fn directory_listing_is_capped() {
     assert!(matches!(preview, Preview::Info(_)));
     assert!(info_text(preview).contains("showing first 5000 entries"));
 }
+
+/// Minimal PDF whose page content is a bare `c` operator, which panics inside pdf-extract.
+fn pdf_with_operandless_curve() -> Vec<u8> {
+    let content = "c";
+    let objects = [
+        "<< /Type /Catalog /Pages 2 0 R >>".to_string(),
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_string(),
+        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] /Contents 4 0 R >>".to_string(),
+        format!(
+            "<< /Length {} >>\nstream\n{content}\nendstream",
+            content.len()
+        ),
+    ];
+    let mut pdf = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for (index, body) in objects.iter().enumerate() {
+        offsets.push(pdf.len());
+        pdf.extend(format!("{} 0 obj\n{body}\nendobj\n", index + 1).bytes());
+    }
+    let xref = pdf.len();
+    pdf.extend(format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).bytes());
+    for offset in offsets {
+        pdf.extend(format!("{offset:010} 00000 n \n").bytes());
+    }
+    pdf.extend(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .bytes(),
+    );
+    pdf
+}
+
+#[test]
+fn malformed_pdf_panic_becomes_an_error() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let pdf = dir.path().join("broken.pdf");
+    fs::write(&pdf, pdf_with_operandless_curve()).expect("write pdf");
+    assert_eq!(
+        locator::preview::extract_pdf_text(&pdf),
+        Err("pdf text extraction panicked".to_string())
+    );
+    assert!(info_text(preview_for(&pdf, 50)).contains("pdf text could not be extracted"));
+}

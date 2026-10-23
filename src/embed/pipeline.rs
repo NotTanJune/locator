@@ -321,7 +321,22 @@ pub fn run_pass_with_embedder(
     // Stage by stage: every file gets stage 1 before any file gets stage 2, so the first results
     // arrive early. Each stage re-reads the files it needs (extraction is cheap). A stage that is
     // cancelled keeps what it wrote, and the next pass resumes at the earliest incomplete stage.
+    // Rules depend only on the path, so they are computed once for every stage.
     let home = dirs::home_dir();
+    let rule_by_path: HashMap<String, &'static str> = files
+        .iter()
+        .filter_map(|file| {
+            let absolute = Path::new(&file.path);
+            let relative = absolute.strip_prefix(&root).unwrap_or(absolute);
+            never_read_rule(
+                relative,
+                absolute,
+                home.as_deref(),
+                &dir_has_vendor_manifest,
+            )
+            .map(|rule| (file.path.clone(), rule))
+        })
+        .collect();
     let stages = request.depth.stages();
     let mut totals = WriterCounts::default();
     let mut extract_total = Duration::ZERO;
@@ -337,7 +352,10 @@ pub fn run_pass_with_embedder(
         for file in &files {
             let stamp = stamp_of(file);
             let needed = if stage == 0 {
+                // A file embedded before a rule covered it is rewritten as skipped, which drops
+                // its chunks.
                 store.needs_embedding(&stamp, end_chunk)?
+                    || (rule_by_path.contains_key(&file.path) && !store.is_skipped(&file.path)?)
             } else {
                 store.needs_deeper(&stamp, end_chunk)?
             };
@@ -350,18 +368,9 @@ pub fn run_pass_with_embedder(
         }
         // Low-value files are recorded as skipped without being read (stage 1 only). The rest are
         // ordered by priority, so stopping early keeps the most useful files.
-        let mut rule_by_path: HashMap<String, &'static str> = HashMap::new();
         let mut low_value_counts: BTreeMap<&'static str, usize> = BTreeMap::new();
         for file in &todo {
-            let absolute = Path::new(&file.path);
-            let relative = absolute.strip_prefix(&root).unwrap_or(absolute);
-            if let Some(rule) = never_read_rule(
-                relative,
-                absolute,
-                home.as_deref(),
-                &dir_has_vendor_manifest,
-            ) {
-                rule_by_path.insert(file.path.clone(), rule);
+            if let Some(rule) = rule_by_path.get(&file.path) {
                 *low_value_counts.entry(rule).or_default() += 1;
             }
         }

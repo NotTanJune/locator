@@ -287,6 +287,13 @@ impl EmbedStore {
             && row.depth_done < row.chunks_total.min(limit as i64))
     }
 
+    /// True when the stored row for `path` is a skip, whatever its stamp.
+    pub fn is_skipped(&self, path: &str) -> Result<bool> {
+        Ok(self
+            .progress(path)?
+            .is_some_and(|row| row.status == FileStatus::Skipped as i64))
+    }
+
     fn progress(&self, path: &str) -> Result<Option<Progress>> {
         self.conn
             .query_row(

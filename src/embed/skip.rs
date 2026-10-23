@@ -8,7 +8,7 @@ use crate::db::EmbeddableFile;
 /// Detail recorded for files skipped by a rule, so later runs do not retry them.
 pub const LOW_VALUE_DETAIL: &str = "low-value file";
 
-const DEPENDENCY_OR_BUILD_DIRS: [&str; 16] = [
+const DEPENDENCY_OR_BUILD_DIRS: [&str; 15] = [
     "node_modules",
     "target",
     "build",
@@ -19,7 +19,6 @@ const DEPENDENCY_OR_BUILD_DIRS: [&str; 16] = [
     "__pycache__",
     ".gradle",
     "Pods",
-    "DerivedData",
     ".cache",
     ".idea",
     "site-packages",
@@ -166,8 +165,20 @@ pub fn low_value_rule(
     let (file_name, directories) = components.split_last()?;
     for (index, directory) in directories.iter().enumerate() {
         let name = directory.as_str();
-        if DEPENDENCY_OR_BUILD_DIRS.contains(&name) {
+        // Xcode names per-target build folders DerivedData-ios, DerivedData-mac, and so on.
+        if DEPENDENCY_OR_BUILD_DIRS.contains(&name) || name.starts_with("DerivedData") {
             return Some("dependency or build directory");
+        }
+        // Inside a Photos library, database/ holds its own search index and derivatives/ holds
+        // resized copies of the photos.
+        if name.to_ascii_lowercase().ends_with(".photoslibrary") {
+            let inner = &directories[index + 1..];
+            if inner.iter().any(|part| part == "database") {
+                return Some("photos library database");
+            }
+            if inner.iter().any(|part| part == "derivatives") {
+                return Some("photos library thumbnails");
+            }
         }
         if VIRTUALENV_DIRS.contains(&name) {
             return Some("virtualenv directory");
@@ -373,6 +384,55 @@ mod tests {
         assert_eq!(
             rule("run/server.log", "/r/run/server.log", None),
             Some("log file")
+        );
+    }
+
+    #[test]
+    fn derived_data_folders_with_a_suffix_are_build_output() {
+        for dir in ["DerivedData", "DerivedData-mac", "DerivedData-ios"] {
+            let relative = format!("app/{dir}/Build/Intermediates.noindex/main.d");
+            assert_eq!(
+                rule(&relative, &format!("/r/{relative}"), None),
+                Some("dependency or build directory")
+            );
+        }
+        assert_eq!(
+            rule("notes/DerivedData.md", "/r/notes/DerivedData.md", None),
+            None
+        );
+    }
+
+    #[test]
+    fn photos_library_internals_are_skipped_but_originals_are_kept() {
+        let lib = "Pictures/Photos Library.photoslibrary";
+        let check = |inner: &str| {
+            let relative = format!("{lib}/{inner}");
+            rule(
+                &relative,
+                &format!("/Users/me/{relative}"),
+                Some("/Users/me"),
+            )
+        };
+        assert_eq!(
+            check("database/search/Spotlight/NSFileProtection/a.txt"),
+            Some("photos library database")
+        );
+        assert_eq!(
+            check("resources/derivatives/masters/2/2F9D_4_5005_c.jpeg"),
+            Some("photos library thumbnails")
+        );
+        assert_eq!(
+            check("scopes/syndication/resources/derivatives/B/x.jpeg"),
+            Some("photos library thumbnails")
+        );
+        assert_eq!(check("originals/A/A411.jpeg"), None);
+        assert_eq!(
+            rule(
+                "photos/database/notes.md",
+                "/r/photos/database/notes.md",
+                None
+            ),
+            None
         );
     }
 

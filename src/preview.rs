@@ -162,6 +162,31 @@ fn image_preview(path: &Path, metadata: &std::fs::Metadata) -> Preview {
     }
 }
 
+thread_local! {
+    static QUIET_PANIC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `pdf_extract::extract_text` that turns a panic (common on malformed PDFs) into `Err`
+/// without the default hook printing over the TUI. Other threads' panics still print.
+pub fn extract_pdf_text(path: &Path) -> Result<String, String> {
+    static HOOK: std::sync::Once = std::sync::Once::new();
+    HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            if !QUIET_PANIC.with(|quiet| quiet.get()) {
+                previous(info);
+            }
+        }));
+    });
+    QUIET_PANIC.with(|quiet| quiet.set(true));
+    let outcome = std::panic::catch_unwind(|| pdf_extract::extract_text(path));
+    QUIET_PANIC.with(|quiet| quiet.set(false));
+    match outcome {
+        Ok(result) => result.map_err(|error| format!("pdf text extraction failed: {error}")),
+        Err(_) => Err("pdf text extraction panicked".to_string()),
+    }
+}
+
 fn pdf_preview(path: &Path, metadata: &std::fs::Metadata, max_lines: usize) -> Preview {
     if metadata.len() > MAX_PREVIEW_BYTES {
         return Preview::Info(info_lines(&format!(
@@ -169,7 +194,7 @@ fn pdf_preview(path: &Path, metadata: &std::fs::Metadata, max_lines: usize) -> P
             human_size(metadata.len())
         )));
     }
-    match pdf_extract::extract_text(path) {
+    match extract_pdf_text(path) {
         Ok(text) => {
             let mut lines = vec![Line::from(Span::styled(
                 "pdf (extracted text)",

@@ -13,7 +13,9 @@ use locator::embed::pipeline::{
     run_pass, run_pass_with_embedder, PassEvent, PassRequest, PassSummary,
 };
 use locator::embed::runtime::{document_input, query_input, Embedder};
-use locator::embed::store::{sidecar_path_for_index, EmbedStore, VectorIndex};
+use locator::embed::store::{
+    sidecar_path_for_index, EmbedStore, FileStamp, FileStatus, StoredChunk, VectorIndex,
+};
 use locator::embed::vector::truncate_and_normalize;
 use locator::scanner::{scan_root, ScanOptions};
 
@@ -269,6 +271,61 @@ fn deleted_file_is_pruned_with_its_chunks() {
     let store = store_for(&fx);
     assert_eq!(store.snippets_for(&[(soup, 0)]).expect("after")[0], "");
     assert_eq!(store.stats().expect("stats").files, 5);
+}
+
+#[test]
+fn file_embedded_before_a_rule_covered_it_loses_its_chunks() {
+    let fx = fixture();
+    let build = fx.root.join("DerivedData-mac");
+    fs::create_dir_all(&build).expect("build dir");
+    fs::write(build.join("main.d"), "dependencies: main.o main.c").expect("dep file");
+    scan_into_index(&fx.root, &fx.index);
+    run_fake(&fx);
+    let path = fx
+        .root
+        .canonicalize()
+        .expect("canonical")
+        .join("DerivedData-mac")
+        .join("main.d")
+        .to_string_lossy()
+        .to_string();
+    let store = store_for(&fx);
+    assert!(store.is_skipped(&path).expect("skipped"));
+
+    // What an older build that lacked the rule left behind: the file embedded and current.
+    let metadata = fs::metadata(&path).expect("metadata");
+    let stamp = FileStamp {
+        path: path.clone(),
+        mtime: metadata
+            .modified()
+            .expect("mtime")
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("epoch")
+            .as_secs() as i64,
+        size: metadata.len() as i64,
+    };
+    let chunk = StoredChunk {
+        ordinal: 0,
+        start_byte: 0,
+        snippet: "dependencies".to_string(),
+        vector: vec![0.0; DIMS],
+    };
+    store
+        .write_file(
+            &canonical(&fx.root),
+            &stamp,
+            FileStatus::Done,
+            &[chunk],
+            None,
+        )
+        .expect("write old row");
+    drop(store);
+
+    run_fake(&fx);
+
+    let store = store_for(&fx);
+    assert!(store.is_skipped(&path).expect("skipped again"));
+    assert_eq!(store.snippets_for(&[(path, 0)]).expect("snippet")[0], "");
 }
 
 #[test]
