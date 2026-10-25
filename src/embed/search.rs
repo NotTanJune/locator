@@ -100,7 +100,11 @@ impl SemanticSearcher {
             .pop()
             .ok_or_else(|| anyhow!("embedder returned no query vector"))?;
         let query_vector = truncate_and_normalize(&raw, self.dims);
-        let candidates = (options.limit * CANDIDATE_FACTOR).max(MIN_CANDIDATES);
+        let candidates = options
+            .limit
+            .saturating_mul(CANDIDATE_FACTOR)
+            .max(MIN_CANDIDATES)
+            .min(self.index.len());
         let scored = self.index.top_k(&query_vector, candidates);
 
         // Best chunk per file: `scored` is sorted by score, so the first hit for a path wins.

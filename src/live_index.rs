@@ -28,7 +28,7 @@ const DEBOUNCE: Duration = Duration::from_millis(400);
 /// root) would keep resetting the quiet period and the batch would never apply.
 const MAX_BATCH: Duration = Duration::from_secs(2);
 
-/// Handle to a running watcher. Dropping it stops the watcher thread.
+/// Handle to a running watcher. Dropping it requests shutdown without waiting on I/O.
 pub struct LiveIndex {
     generation: Arc<AtomicU64>,
     write_errors: Arc<AtomicU64>,
@@ -41,6 +41,16 @@ impl LiveIndex {
     /// `root` must match the `root` string stored by the scan so upserts land on
     /// the same rows.
     pub fn spawn(root: PathBuf, db_path: PathBuf) -> Result<Self> {
+        Self::start(root, db_path, true)
+    }
+
+    /// Start without blocking the terminal on database or recursive watcher setup.
+    /// Initialization failures are reported through `write_errors`.
+    pub fn spawn_background(root: PathBuf, db_path: PathBuf) -> Result<Self> {
+        Self::start(root, db_path, false)
+    }
+
+    fn start(root: PathBuf, db_path: PathBuf, wait_ready: bool) -> Result<Self> {
         let generation = Arc::new(AtomicU64::new(0));
         let write_errors = Arc::new(AtomicU64::new(0));
         let stop = Arc::new(AtomicBool::new(false));
@@ -48,43 +58,51 @@ impl LiveIndex {
         let thread_write_errors = Arc::clone(&write_errors);
         let thread_stop = Arc::clone(&stop);
 
-        // Probe that we can open the index for writing before spawning, so
-        // callers can fall back cleanly when the index is read-only.
-        let db = Database::open(&db_path).context("open index for live watching")?;
-
-        let (tx, rx) = mpsc::channel();
-        let mut watcher = notify::recommended_watcher(move |event| {
-            // A send failure just means the consumer is gone; ignore it.
-            let _ = tx.send(event);
-        })
-        .context("create filesystem watcher")?;
-        watcher
-            .watch(&root, RecursiveMode::Recursive)
-            .with_context(|| format!("watch {}", root.display()))?;
-
-        let root_string = root.to_string_lossy().to_string();
+        let (ready_tx, ready_rx) = mpsc::channel();
         let handle = std::thread::Builder::new()
             .name("lctr-live-index".into())
             .spawn(move || {
-                // Keep the watcher alive for the duration of the thread.
-                let _watcher = watcher;
-                watch_loop(
-                    &rx,
-                    &db,
-                    &root_string,
-                    &thread_stop,
-                    &thread_generation,
-                    &thread_write_errors,
-                );
+                let outcome = (|| -> Result<()> {
+                    let db = Database::open(&db_path).context("open index for live watching")?;
+                    if thread_stop.load(Ordering::Relaxed) {
+                        return Ok(());
+                    }
+                    let (tx, rx) = mpsc::channel();
+                    let mut watcher = notify::recommended_watcher(move |event| {
+                        let _ = tx.send(event);
+                    })
+                    .context("create filesystem watcher")?;
+                    watcher
+                        .watch(&root, RecursiveMode::Recursive)
+                        .with_context(|| format!("watch {}", root.display()))?;
+                    let _ = ready_tx.send(Ok(()));
+                    watch_loop(
+                        &rx,
+                        &db,
+                        &root.to_string_lossy(),
+                        &thread_stop,
+                        &thread_generation,
+                        &thread_write_errors,
+                    );
+                    Ok(())
+                })();
+                if let Err(error) = outcome {
+                    thread_write_errors.fetch_add(1, Ordering::Relaxed);
+                    let _ = ready_tx.send(Err(error));
+                }
             })
             .context("spawn live-index thread")?;
 
-        Ok(Self {
+        let live = Self {
             generation,
             write_errors,
             stop,
             handle: Some(handle),
-        })
+        };
+        if wait_ready {
+            ready_rx.recv().context("initialize live-index thread")??;
+        }
+        Ok(live)
     }
 
     /// Monotonic counter bumped each time a batch of changes is applied. The TUI
@@ -103,9 +121,9 @@ impl LiveIndex {
 impl Drop for LiveIndex {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
-        }
+        // Filesystem calls and SQLite locks can stall. The worker owns its
+        // resources and finishes the current operation before observing stop.
+        self.handle.take();
     }
 }
 
@@ -138,6 +156,9 @@ fn watch_loop(
 
         let mut changed = false;
         for path in paths {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
             match apply_path(db, root, &path) {
                 Applied::Changed => changed = true,
                 Applied::Unchanged => {}
@@ -236,6 +257,44 @@ fn record_for(root: &str, path: &Path, metadata: &std::fs::Metadata) -> Option<F
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dropping_watcher_does_not_wait_for_blocked_io() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+        let stop = Arc::new(AtomicBool::new(false));
+        let (release_tx, release_rx) = mpsc::channel();
+        let live = super::LiveIndex {
+            generation: Arc::new(AtomicU64::new(0)),
+            write_errors: Arc::new(AtomicU64::new(0)),
+            stop: Arc::clone(&stop),
+            handle: Some(std::thread::spawn(move || {
+                release_rx.recv().unwrap();
+            })),
+        };
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            drop(live);
+            dropped_tx.send(()).unwrap();
+        });
+        let dropped = dropped_rx.recv_timeout(Duration::from_secs(1));
+        release_tx.send(()).unwrap();
+        dropped.expect("watcher shutdown must not wait on I/O");
+        assert!(stop.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn background_start_reports_initialization_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let live =
+            super::LiveIndex::spawn_background(dir.path().into(), dir.path().into()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while live.write_errors() == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(live.write_errors(), 1);
+    }
+
     use super::*;
     use rusqlite::Connection;
     use tempfile::tempdir;

@@ -299,7 +299,7 @@ The TUI has two focuses: **Search** (default) and **Results**. The footer shows 
 type   filter results
 Tab/↓  move focus to results list
 Enter  open top result
-Esc    clear query, or quit if query is empty
+Esc    quit (also Ctrl+C, from any focus or help)
 F1/?   show help overlay
 ```
 
@@ -319,7 +319,8 @@ S      toggle sort order
 t      cycle theme
 w      toggle live index watcher
 ?/F1   show help overlay
-//Tab/Esc  return to search focus
+//Tab  return to search focus
+Esc/Ctrl+C  quit
 ```
 
 </details>

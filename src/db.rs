@@ -125,7 +125,11 @@ impl Database {
         let path = path.as_ref();
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .with_context(|| format!("open read-only database {}", path.display()))?;
-        conn.execute_batch("PRAGMA query_only = ON;")?;
+        conn.execute_batch(
+            "PRAGMA query_only = ON;
+             PRAGMA temp_store = MEMORY;
+             PRAGMA cache_size = -200000;",
+        )?;
         Ok(Self {
             conn,
             path: Some(path.to_path_buf()),

@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.2
+
+- Fixed semantic-search candidate-count overflow with unlimited results and contained worker panics so failures appear in the status line instead of corrupting the terminal.
+- Made `Esc` and `Ctrl+C` quit from every search focus and the help overlay.
+- Moved preview work and live watcher startup off the input thread, and stopped waiting for watcher I/O during shutdown.
+- Replaced per-query migration writes with read-only database connections using the existing search cache and memory settings.
+- Bounded result-batch processing between input polls and deferred watcher refreshes until the active search finishes.
+- Restored terminal input and screen state before Finder cleanup.
+- Added regression tests for blocked previews, watcher shutdown, database writer contention, and exit keys in a real terminal.
+
 ## 0.3.6
 
 - Fixed TUI result navigation so the highlighted row moves through the visible viewport before scrolling at its edge, in both directions.

@@ -106,6 +106,28 @@ fn scores_are_descending_and_limit_is_respected() {
 }
 
 #[test]
+fn unlimited_and_near_overflow_limits_return_all_matching_files() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("docs");
+    fs::create_dir_all(&root).unwrap();
+    write_corpus(&root);
+    let index = dir.path().join("index.sqlite");
+    index_and_embed(&root, &index);
+    let mut searcher = SemanticSearcher::open(&index).unwrap().unwrap();
+    let mut embedder = HashEmbedder;
+    for limit in [usize::MAX, usize::MAX / 5 + 1, 100] {
+        let hits = searcher
+            .search(
+                &mut embedder,
+                &query("budget soup server").with_limit(limit),
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 3);
+        assert!(hits.windows(2).all(|pair| pair[0].score >= pair[1].score));
+    }
+}
+
+#[test]
 fn extension_filter_applies_to_semantic_results() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().join("docs");

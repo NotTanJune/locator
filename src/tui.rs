@@ -614,17 +614,27 @@ fn enable_keyboard_enhancement() -> bool {
 }
 
 pub fn run_with_backend(search_backend: SearchBackend, update_check_disabled: bool) -> Result<()> {
-    let _guard = TerminalGuard::enter()?;
+    let guard = TerminalGuard::enter()?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend)?;
-    run_loop(&mut terminal, search_backend, update_check_disabled)
+    let mut finder_reveal = run_loop(&mut terminal, search_backend, update_check_disabled)?;
+    // Restore normal signal handling before waiting for external Finder cleanup.
+    drop(guard);
+    finder_reveal.close().context("close Finder reveal session")
+}
+
+fn is_quit_key(key: KeyEvent) -> bool {
+    key.kind != KeyEventKind::Release
+        && (key.code == KeyCode::Esc
+            || (matches!(key.code, KeyCode::Char('c' | 'C'))
+                && key.modifiers.contains(KeyModifiers::CONTROL)))
 }
 
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     search_backend: SearchBackend,
     update_check_disabled: bool,
-) -> Result<()> {
+) -> Result<FinderRevealSession> {
     let mut input = SearchInput::default();
     let mut results = Vec::new();
     let mut result_paths = HashSet::new();
@@ -649,9 +659,9 @@ fn run_loop(
         .as_ref()
         .is_some_and(|(_, db_path)| crate::embed::semantic_available(db_path));
     let mut semantic_loaded = false;
-    let mut live_index = watch_target
-        .as_ref()
-        .and_then(|(root, db_path)| LiveIndex::spawn(root.clone(), db_path.clone()).ok());
+    let mut live_index = watch_target.as_ref().and_then(|(root, db_path)| {
+        LiveIndex::spawn_background(root.clone(), db_path.clone()).ok()
+    });
     let mut watch_enabled = live_index.is_some();
     let mut live_generation = live_index.as_ref().map_or(0, LiveIndex::generation);
     // Do not probe terminal capabilities before the first frame. The probe
@@ -660,6 +670,8 @@ fn run_loop(
     // handling after its timeout. Half-block rendering remains available for
     // image previews without delaying TUI startup.
     let mut picker = Picker::halfblocks();
+    let preview_worker = PreviewWorker::spawn();
+    let mut preview_requested: Option<String> = None;
     let mut preview_state: Option<PreviewState> = None;
     let mut preview_target: Option<String> = None;
     let mut preview_pending_since = Instant::now();
@@ -697,7 +709,11 @@ fn run_loop(
             needs_draw = true;
         }
 
-        while let Some(update) = search_worker.try_recv() {
+        // Yield to keyboard input even when a broad query keeps producing batches.
+        for _ in 0..8 {
+            let Some(update) = search_worker.try_recv() else {
+                break;
+            };
             let query = input.as_str();
             match update {
                 SearchUpdate::Reset {
@@ -811,7 +827,8 @@ fn run_loop(
         // query so new/removed files surface without a keystroke.
         if let Some(live) = live_index.as_ref() {
             let current = live.generation();
-            if current != live_generation {
+            // A busy filesystem must not continually cancel an active search.
+            if current != live_generation && loading_query.is_none() {
                 live_generation = current;
                 let query = input.as_str();
                 if should_show_results(query) {
@@ -848,16 +865,27 @@ fn run_loop(
         if preview_path != preview_target {
             preview_target = preview_path.clone();
             preview_pending_since = Instant::now();
+            preview_requested = None;
+            preview_state = None;
+            needs_draw = true;
+        }
+        while let Ok((path, preview)) = preview_worker.rx.try_recv() {
+            if preview_enabled && preview_target.as_deref() == Some(path.as_str()) {
+                preview_state = Some(build_preview(&mut picker, preview));
+                needs_draw = true;
+            }
         }
         match &preview_target {
             Some(path) => {
-                let cached = preview_state.as_ref().map(|state| state.path.as_str());
                 if preview_enabled
-                    && cached != Some(path.as_str())
+                    && preview_requested.as_deref() != Some(path.as_str())
                     && preview_pending_since.elapsed() >= PREVIEW_DEBOUNCE
                 {
-                    preview_state = Some(build_preview(&mut picker, path));
-                    needs_draw = true;
+                    preview_worker
+                        .tx
+                        .send(path.clone())
+                        .context("request preview")?;
+                    preview_requested = Some(path.clone());
                 }
             }
             None => {
@@ -1256,6 +1284,9 @@ fn run_loop(
             continue;
         }
         if let Event::Key(key) = event {
+            if is_quit_key(key) {
+                break;
+            }
             if key.kind != KeyEventKind::Press {
                 continue;
             }
@@ -1263,10 +1294,6 @@ fn run_loop(
             if show_help {
                 show_help = false;
                 continue;
-            }
-            // Ctrl-C always quits regardless of focus.
-            if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                break;
             }
             let navigation_code =
                 matches!(key.code, KeyCode::Up | KeyCode::Down).then_some(key.code);
@@ -1291,19 +1318,6 @@ fn run_loop(
             needs_draw = true;
             match focus {
                 Focus::Search => match key.code {
-                    KeyCode::Esc => {
-                        if !input.as_str().is_empty() {
-                            input = SearchInput::default();
-                            search_state.mark_dirty();
-                            if backend_label == "live" {
-                                clear_results(&mut results, &mut result_paths, &mut selected);
-                            }
-                            normalize_selection(&mut selected, results.len());
-                            status = "cleared".to_string();
-                        } else {
-                            break;
-                        }
-                    }
                     KeyCode::Backspace if input.backspace() => {
                         search_state.mark_dirty();
                         last_edit = Instant::now();
@@ -1485,7 +1499,7 @@ fn run_loop(
                             watch_enabled = false;
                             status = "live watch off".to_string();
                         } else if let Some((root, db_path)) = watch_target.as_ref() {
-                            match LiveIndex::spawn(root.clone(), db_path.clone()).ok() {
+                            match LiveIndex::spawn_background(root.clone(), db_path.clone()).ok() {
                                 Some(live) => {
                                     live_generation = live.generation();
                                     live_index = Some(live);
@@ -1504,7 +1518,7 @@ fn run_loop(
                     KeyCode::Char('?') | KeyCode::F(1) => {
                         show_help = true;
                     }
-                    KeyCode::Char('/') | KeyCode::Tab | KeyCode::Esc => {
+                    KeyCode::Char('/') | KeyCode::Tab => {
                         focus = Focus::Search;
                     }
                     KeyCode::Backspace => {
@@ -1537,11 +1551,7 @@ fn run_loop(
         }
     }
 
-    finder_reveal
-        .close()
-        .context("close Finder reveal session")?;
-
-    Ok(())
+    Ok(finder_reveal)
 }
 
 #[cfg(test)]
@@ -1556,6 +1566,12 @@ fn open_search_database(path: &Path) -> Result<Database> {
     Database::open(path)
         .or_else(|_| Database::open_readonly(path))
         .map(Database::with_search_path_verification)
+}
+
+fn open_search_reader(path: &Path) -> Result<Database> {
+    // Backend selection already upgrades the schema. Queries only need a reader:
+    // no migration writes, and a fresh handle sees a staged index replacement.
+    Database::open_readonly(path).map(Database::with_search_path_verification)
 }
 
 #[cfg(test)]
@@ -1706,7 +1722,7 @@ fn search_worker_loop(
                     }
 
                     let mut next_request = None;
-                    let outcome = open_search_database(&db_path).and_then(|db| {
+                    let outcome = open_search_reader(&db_path).and_then(|db| {
                         db.search_streaming_with_options(
                             &options,
                             || {
@@ -1862,7 +1878,7 @@ fn search_worker_loop(
                     let mut next_request = None;
                     let mut seen_paths = HashSet::new();
                     let mut final_results = Vec::new();
-                    let indexed_outcome = open_search_database(&db_path).and_then(|db| {
+                    let indexed_outcome = open_search_reader(&db_path).and_then(|db| {
                         db.search_streaming_with_options(
                             &options,
                             || {
@@ -2093,14 +2109,36 @@ fn semantic_worker_loop(
     result_tx: Sender<SearchUpdate>,
     details: SemanticDetails,
 ) {
+    semantic_worker_with(query_rx, result_tx, |pending, query_rx, result_tx| {
+        serve_semantic_requests(&index_path, pending, query_rx, result_tx, &details)
+    });
+}
+
+fn semantic_worker_with(
+    query_rx: Receiver<QueuedSearchRequest>,
+    result_tx: Sender<SearchUpdate>,
+    serve: impl FnOnce(
+        &mut Option<QueuedSearchRequest>,
+        &Receiver<QueuedSearchRequest>,
+        &Sender<SearchUpdate>,
+    ) -> Result<()>,
+) {
     let mut pending = match query_rx.recv() {
         Ok(request) => Some(request),
         Err(_) => return,
     };
-    if let Err(error) =
-        serve_semantic_requests(&index_path, &mut pending, &query_rx, &result_tx, &details)
-    {
-        // The index or model could not be loaded. Report that for every request that arrives.
+    // Unwind and drop the model session on panic. Keep the active request so it
+    // receives an Error update and the UI can stop its loading indicator.
+    let outcome = crate::panic_guard::catch_quiet(std::panic::AssertUnwindSafe(|| {
+        serve(&mut pending, &query_rx, &result_tx)
+    }))
+    .unwrap_or_else(|_| {
+        Err(anyhow::anyhow!(
+            "semantic search failed internally; restart lctr to retry"
+        ))
+    });
+    if let Err(error) = outcome {
+        // A failed model session is not reused. Filename search remains available.
         let message = format!("{error:#}");
         while let Some(request) = pending.take() {
             let request = latest_queued_request(request, &query_rx);
@@ -2127,7 +2165,7 @@ fn serve_semantic_requests(
     let config = embedder_config_for_search()?;
     with_embedder(&config, |embedder| {
         while let Some(request) = pending.take() {
-            let request = latest_queued_request(request, query_rx);
+            let request = pending.insert(latest_queued_request(request, query_rx));
             run_semantic_request(&mut searcher, embedder, request, result_tx, details);
             *pending = query_rx.recv().ok();
         }
@@ -2138,15 +2176,12 @@ fn serve_semantic_requests(
 fn run_semantic_request(
     searcher: &mut SemanticSearcher,
     embedder: &mut dyn Embedder,
-    request: QueuedSearchRequest,
+    request: &QueuedSearchRequest,
     result_tx: &Sender<SearchUpdate>,
     details: &SemanticDetails,
 ) {
-    let QueuedSearchRequest {
-        request_id,
-        request,
-    } = request;
-    let options = request.options;
+    let request_id = request.request_id;
+    let options = request.request.options.clone();
     if let Ok(mut shared) = details.lock() {
         shared.clear();
     }
@@ -2384,25 +2419,53 @@ enum PreviewRender {
     Image(Box<StatefulProtocol>),
 }
 
+/// A slow filesystem read or decoder must never own the keyboard thread.
+/// Dropping the channels does not wait for an in-flight preview.
+struct PreviewWorker {
+    tx: Sender<String>,
+    rx: Receiver<(String, Preview)>,
+}
+
+impl PreviewWorker {
+    fn spawn() -> Self {
+        Self::spawn_with(|path| preview::preview_for(Path::new(path), PREVIEW_MAX_LINES))
+    }
+
+    fn spawn_with(render: impl Fn(&str) -> Preview + Send + 'static) -> Self {
+        let (tx, requests) = mpsc::channel::<String>();
+        let (responses, rx) = mpsc::channel();
+        thread::spawn(move || {
+            while let Ok(mut path) = requests.recv() {
+                // Skip selections passed while the previous file was decoding.
+                while let Ok(newer) = requests.try_recv() {
+                    path = newer;
+                }
+                let preview = render(&path);
+                if responses.send((path, preview)).is_err() {
+                    break;
+                }
+            }
+        });
+        Self { tx, rx }
+    }
+}
+
 /// Cached preview for the currently-selected path, so decode/highlight runs only
 /// when the selection changes rather than every render tick.
 struct PreviewState {
-    path: String,
     meta: Vec<Line<'static>>,
     render: PreviewRender,
 }
 
-fn build_preview(picker: &mut Picker, path: &str) -> PreviewState {
-    match preview::preview_for(Path::new(path), PREVIEW_MAX_LINES) {
+fn build_preview(picker: &mut Picker, preview: Preview) -> PreviewState {
+    match preview {
         Preview::Text(lines) | Preview::Info(lines) => PreviewState {
-            path: path.to_string(),
             meta: Vec::new(),
             render: PreviewRender::Lines(lines),
         },
         Preview::Image { image, meta } => {
             let protocol = picker.new_resize_protocol(*image);
             PreviewState {
-                path: path.to_string(),
                 meta,
                 render: PreviewRender::Image(Box::new(protocol)),
             }
@@ -2492,7 +2555,7 @@ fn render_help_overlay(frame: &mut Frame, theme: &Theme) {
         entry("type", "filter results"),
         entry("Tab / \u{2193}", "move focus to results list"),
         entry("Enter", "open selected file"),
-        entry("Esc", "clear query / quit"),
+        entry("Esc / Ctrl+C", "quit from anywhere"),
         entry("F1 / ?", "this help"),
         Line::from(""),
         heading("Results focus (Tab or \u{2193} to enter)"),
@@ -2506,10 +2569,10 @@ fn render_help_overlay(frame: &mut Frame, theme: &Theme) {
         entry("s / S", "sort field / direction"),
         entry("t", "cycle theme"),
         entry("w", "toggle live watch"),
-        entry("/ Esc Tab", "return to search"),
+        entry("/ Tab", "return to search"),
         Line::from(""),
         Line::from(Span::styled(
-            "  press any key to close",
+            "  Esc / Ctrl+C quit; other keys close help",
             Style::default().fg(theme.muted),
         )),
     ];
@@ -3112,8 +3175,8 @@ fn edit_status(backend_label: &str) -> String {
 /// Persistent footer hint shown under results. Content depends on current focus.
 pub(crate) fn footer_hint(focus: Focus) -> &'static str {
     match focus {
-        Focus::Search => "type to filter \u{00b7} \u{2193}/\u{21e5} results \u{00b7} \u{23ce} open \u{00b7} esc clear",
-        Focus::Results => "j/k move \u{00b7} o open \u{00b7} r reveal \u{00b7} y copy \u{00b7} m/f/s mode/filter/sort \u{00b7} / search",
+        Focus::Search => "type to filter \u{00b7} \u{2193}/\u{21e5} results \u{00b7} \u{23ce} open \u{00b7} esc quit",
+        Focus::Results => "j/k move \u{00b7} o open \u{00b7} r reveal \u{00b7} y copy \u{00b7} m/f/s mode/filter/sort \u{00b7} / search \u{00b7} esc quit",
     }
 }
 
@@ -3499,6 +3562,153 @@ mod tests {
 
         assert_eq!(response.0.query, "archive");
         assert!(!response.1.is_empty());
+    }
+
+    #[test]
+    fn repeated_indexed_search_does_not_wait_for_a_writer() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("index.sqlite");
+        drop(Database::open(&path).unwrap());
+        let mut worker = SearchWorker::spawn(SearchBackend::Indexed {
+            db_path: path.clone(),
+            root: dir.path().to_path_buf(),
+        })
+        .unwrap();
+        let request = || SearchRequest {
+            options: SearchOptions::new("archive"),
+        };
+        let complete = |worker: &mut SearchWorker| loop {
+            match worker
+                .rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("search must not wait for writer")
+            {
+                SearchUpdate::Complete { .. } => break,
+                SearchUpdate::Error { error, .. } => panic!("{error}"),
+                _ => {}
+            }
+        };
+        worker.submit(request()).unwrap();
+        complete(&mut worker);
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        worker.submit(request()).unwrap();
+        complete(&mut worker);
+        writer.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[test]
+    fn quit_keys_accept_press_and_repeat_but_not_release() {
+        use crossterm::event::KeyEventKind;
+        for (code, modifiers) in [
+            (KeyCode::Esc, KeyModifiers::NONE),
+            (KeyCode::Char('c'), KeyModifiers::CONTROL),
+            (
+                KeyCode::Char('C'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            ),
+        ] {
+            for kind in [
+                KeyEventKind::Press,
+                KeyEventKind::Repeat,
+                KeyEventKind::Release,
+            ] {
+                assert_eq!(
+                    super::is_quit_key(KeyEvent::new_with_kind(code, modifiers, kind)),
+                    kind != KeyEventKind::Release
+                );
+            }
+        }
+        assert!(!super::is_quit_key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::NONE
+        )));
+    }
+
+    #[test]
+    fn semantic_worker_panic_reports_active_and_later_requests() {
+        let (tx, requests) = std::sync::mpsc::channel();
+        let (responses, rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            super::semantic_worker_with(requests, responses, |pending, _, responses| {
+                let active = pending.as_ref().unwrap();
+                responses
+                    .send(SearchUpdate::Reset {
+                        request_id: active.request_id,
+                        options: active.request.options.clone(),
+                    })
+                    .unwrap();
+                panic!("injected semantic worker panic");
+            });
+        });
+        let options = SearchOptions::new("budget").with_mode(QueryMode::Semantic);
+        tx.send(super::QueuedSearchRequest {
+            request_id: 41,
+            request: SearchRequest {
+                options: options.clone(),
+            },
+        })
+        .unwrap();
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            SearchUpdate::Reset { request_id: 41, .. }
+        ));
+        for request_id in [41, 42] {
+            match rx.recv_timeout(Duration::from_secs(2)).unwrap() {
+                SearchUpdate::Error {
+                    request_id: actual,
+                    options: actual_options,
+                    error,
+                } => {
+                    assert_eq!(actual, request_id);
+                    assert_eq!(actual_options, options);
+                    assert!(error.contains("restart lctr"));
+                }
+                _ => panic!("a panic must terminate the loading state with an error"),
+            }
+            if request_id == 41 {
+                tx.send(super::QueuedSearchRequest {
+                    request_id: 42,
+                    request: SearchRequest {
+                        options: options.clone(),
+                    },
+                })
+                .unwrap();
+            }
+        }
+        drop(tx);
+        worker.join().expect("semantic worker contains the panic");
+    }
+
+    #[test]
+    fn preview_worker_skips_superseded_requests_and_drop_does_not_wait() {
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let worker = super::PreviewWorker::spawn_with(move |path| {
+            started_tx.send(path.to_string()).unwrap();
+            release_rx.recv().unwrap();
+            crate::preview::Preview::Info(Vec::new())
+        });
+        worker.tx.send("first".into()).unwrap();
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "first"
+        );
+        worker.tx.send("skipped".into()).unwrap();
+        worker.tx.send("latest".into()).unwrap();
+        release_tx.send(()).unwrap();
+        assert_eq!(
+            started_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            "latest"
+        );
+        let (dropped_tx, dropped_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            drop(worker);
+            dropped_tx.send(()).unwrap();
+        });
+        let dropped = dropped_rx.recv_timeout(Duration::from_secs(1));
+        release_tx.send(()).unwrap();
+        dropped.expect("dropping a preview worker must not wait for file I/O");
     }
 
     #[test]

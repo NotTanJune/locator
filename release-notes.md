@@ -1,3 +1,30 @@
+# lctr v0.4.2
+
+Fixes unresponsive search sessions and makes the exit keys consistent.
+
+## Search responsiveness
+
+- File reads, PDF extraction, image decoding, and text highlighting for previews run on a background worker. A slow preview no longer blocks keyboard input. Queued previews skip superseded selections.
+- Filesystem watcher startup runs in the background. Quitting requests watcher shutdown without waiting for an in-flight filesystem or database operation.
+- Indexed and hybrid queries open read-only database connections instead of repeating migration writes for each query. Readers retain the existing cache and in-memory temporary-storage settings and see staged index replacements on subsequent queries.
+- Search-result batches yield to keyboard input. Filesystem changes wait for the active search to finish before scheduling a refresh, rather than continually cancelling it.
+
+## Exit keys
+
+- `Esc` and `Ctrl+C` quit from the search field, results list, or help overlay, including when a query is present.
+- `Esc` no longer clears the query or returns focus to search. Use `/` or `Tab` to return from the results list to the search field.
+- The terminal returns to its normal screen and input mode before waiting for Finder cleanup.
+
+## Semantic search
+
+- Fixed candidate-count overflow when interactive semantic search requests unlimited results. Candidate counts saturate and are capped to the number of indexed chunks.
+- A Rust panic in the semantic worker is caught without printing over the search interface. The active query receives an error status instead of remaining stuck on "searching". The failed model session is dropped; filename search and exit keys remain available. Restart lctr to retry semantic search after an internal failure.
+
+## Compatibility
+
+- No database schema change, migration, new dependency, or new configuration key is required.
+- Terminal regression checks cover both exit keys across indexed, live, and semantic search, including missing-model errors, with terminal restoration verified. Large-directory performance depends on the filesystem and query.
+
 # lctr v0.4.1
 
 Makes `scan --em` skip build output and Photos library internals, and fixes a PDF crash.
