@@ -47,6 +47,7 @@ jobs:
       # invalidates the llama.cpp build, and rust-cache will not overwrite an
       # exact hit. `release` and the target triple keep this cache apart from
       # CI's debug cache. rust-cache also hashes rustc and Cargo.lock.
+      # An exact hit is restored and not written again.
       - name: Runner image cache key
         shell: bash
         run: echo "RUNNER_IMAGE_KEY=${ImageOS:-$RUNNER_OS}-${ImageVersion:-unknown}" >> "$GITHUB_ENV"
