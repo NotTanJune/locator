@@ -6,8 +6,6 @@ on:
       - "v*"
     branches:
       - main
-      # Proof branch so a push here runs the same job. Removed after the warm run.
-      - cursor/fast-release-workflow-6e1b
     # Path filters are not applied to tag pushes. A main push runs this same
     # build job so the release-profile cache is saved on the default branch,
     # which is the only cache a later tag run can restore.
@@ -55,9 +53,9 @@ jobs:
         with:
           key: release-${{ matrix.target }}-${{ env.RUNNER_IMAGE_KEY }}
           # Workspace crates stay out (the default), so the bundled-model
-          # binary is not stored once per platform.
-          # Proof runs also save on this branch. The follow-up commit keeps main only.
-          save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/cursor/fast-release-workflow-6e1b' }}
+          # binary is not stored once per platform. Only main saves: a tag
+          # run can restore the default branch, not another branch.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # The llama.cpp submodule inside the llama-cpp-rs checkout has paths longer than the 260
       # character Windows limit. Without this, cargo fails with "path too long" while fetching it.
       - name: Allow long paths (Windows)
@@ -73,10 +71,9 @@ jobs:
         run: 'Add-Content -Path $env:GITHUB_ENV -Value "LIBCLANG_PATH=C:\Program Files\LLVM\bin"'
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
-      # Loose objects duplicate the static archives cargo links. Dropping them
-      # keeps lib/, common, and vendor/hash, and the full build below is the
-      # check that the link still works. This is what keeps three release
-      # caches inside the repo cache limit.
+      # Loose objects duplicate the static archives the link uses. Drop them
+      # and keep lib/, common, and vendor/hash. The full build below is the
+      # check that those archives still link.
       - name: Drop llama.cpp object files
         shell: bash
         run: |
@@ -150,7 +147,7 @@ jobs:
           fi
           echo "LCTR_BUNDLED_MODEL=$path" >> "$GITHUB_ENV"
       - name: Save embedding model
-        if: steps.model-cache.outputs.cache-hit != 'true' && runner.os == 'Linux' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/cursor/fast-release-workflow-6e1b')
+        if: steps.model-cache.outputs.cache-hit != 'true' && runner.os == 'Linux' && github.ref == 'refs/heads/main'
         uses: actions/cache/save@v4
         with:
           path: model/embeddinggemma-2-Q8_0.gguf
