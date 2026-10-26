@@ -18,7 +18,15 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
+      # The runner image is part of the key. An ubuntu/windows/macos image bump
+      # invalidates the llama.cpp build, and rust-cache will not overwrite an exact hit.
+      - name: Runner image cache key
+        shell: bash
+        run: echo "RUNNER_IMAGE_KEY=${ImageOS:-$RUNNER_OS}-${ImageVersion:-unknown}" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ env.RUNNER_IMAGE_KEY }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # The llama.cpp submodule inside the llama-cpp-rs checkout has paths longer than the 260
       # character Windows limit. Without this, cargo fails with "path too long" while fetching it.
       - name: Allow long paths (Windows)
@@ -68,7 +76,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Runner image cache key
+        shell: bash
+        run: echo "RUNNER_IMAGE_KEY=${ImageOS:-$RUNNER_OS}-${ImageVersion:-unknown}" >> "$GITHUB_ENV"
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ env.RUNNER_IMAGE_KEY }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # The model cache key is the pinned model revision, so a new pin fetches a new model.
       - name: Cache the embedding model
         uses: actions/cache@v4

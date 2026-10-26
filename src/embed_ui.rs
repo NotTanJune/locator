@@ -894,11 +894,20 @@ mod tests {
     #[test]
     fn galaxy_caps_points_at_six_thousand() {
         let mut galaxy = Galaxy::new(768);
-        for batch in 0..30 {
-            galaxy.add_vectors(PointKind::Text, synthetic_vectors(250, batch));
+        // One real batch still runs projection and refit. Further points go through
+        // insert_point directly: add_vectors on 7,500 x 768-dim vectors refits the
+        // whole cloud often enough to dominate `cargo test` in debug.
+        galaxy.add_vectors(PointKind::Text, synthetic_vectors(250, 0));
+        for _ in 0..(MAX_POINTS + 500) {
+            galaxy.insert_point(GalaxyPoint {
+                pos: [0.0, 0.0, 0.0],
+                target: [0.0, 0.0, 0.0],
+                born: 0.0,
+                hue: PointKind::Text,
+                vector: Vec::new(),
+            });
         }
         assert_eq!(galaxy.points.len(), MAX_POINTS);
-        assert!(galaxy.points.len() <= MAX_POINTS);
     }
 
     #[test]
