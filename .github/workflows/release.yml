@@ -4,6 +4,17 @@ on:
   push:
     tags:
       - "v*"
+    branches:
+      - main
+    # Path filters are not applied to tag pushes. A main push runs this same
+    # build job so the release-profile cache is saved on the default branch,
+    # which is the only cache a later tag run can restore.
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "**/build.rs"
+      - "src/**"
+      - ".github/workflows/**"
   workflow_dispatch:
 
 jobs:
@@ -30,6 +41,21 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      # The runner image is part of the key, same as CI. An image bump
+      # invalidates the llama.cpp build, and rust-cache will not overwrite an
+      # exact hit. `release` and the target triple keep this cache apart from
+      # CI's debug cache. rust-cache also hashes rustc and Cargo.lock.
+      # An exact hit is restored and not written again.
+      - name: Runner image cache key
+        shell: bash
+        run: echo "RUNNER_IMAGE_KEY=${ImageOS:-$RUNNER_OS}-${ImageVersion:-unknown}" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}-${{ env.RUNNER_IMAGE_KEY }}
+          # Workspace crates stay out (the default), so the bundled-model
+          # binary is not stored once per platform. Only main saves: a tag
+          # run can restore the default branch, not another branch.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # The llama.cpp submodule inside the llama-cpp-rs checkout has paths longer than the 260
       # character Windows limit. Without this, cargo fails with "path too long" while fetching it.
       - name: Allow long paths (Windows)
@@ -45,6 +71,17 @@ jobs:
         run: 'Add-Content -Path $env:GITHUB_ENV -Value "LIBCLANG_PATH=C:\Program Files\LLVM\bin"'
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
+      # Loose objects duplicate the static archives the link uses. Drop them
+      # and keep lib/, common, and vendor/hash. The full build below is the
+      # check that those archives still link.
+      - name: Drop llama.cpp object files
+        shell: bash
+        run: |
+          size_kib() { du -sk target | awk '{print $1}'; }
+          before="$(size_kib)"
+          find target -path '*llama-cpp-sys-*' -type f \( -name '*.o' -o -name '*.obj' -o -name '*.pdb' \) -delete
+          after="$(size_kib)"
+          echo "target directory ${before} KiB before dropping object files, ${after} KiB after"
       - name: Package Unix
         if: runner.os != 'Windows'
         shell: bash
@@ -62,18 +99,31 @@ jobs:
           Copy-Item README.md, LICENSE dist/
           Compress-Archive -Path dist/* -DestinationPath "${{ matrix.archive }}" -Force
       - name: Upload artifact
+        if: startsWith(github.ref, 'refs/tags/')
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.archive }}
           path: ${{ matrix.archive }}
-      # Full build: the same target with the embedding model compiled in. Runs after the lean
-      # archive is packaged, because it overwrites target/<target>/release/lctr.
+      # The file is pinned by revision and is the same on every OS. One cache
+      # entry, written from Linux with a cross-OS archive.
+      - name: Restore embedding model
+        id: model-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: model/embeddinggemma-2-Q8_0.gguf
+          key: embeddinggemma-2-Q8_0-bfcd298762cc34d0357ece5ebdd31791a3a374d8
+          enableCrossOsArchive: true
       - name: Fetch embedding model
+        if: steps.model-cache.outputs.cache-hit != 'true'
         shell: bash
         run: |
           mkdir -p model
+          curl -fL --retry 3 -o model/embeddinggemma-2-Q8_0.gguf \
+            "https://huggingface.co/ggml-org/embeddinggemma-2-GGUF/resolve/bfcd298762cc34d0357ece5ebdd31791a3a374d8/embeddinggemma-2-Q8_0.gguf"
+      - name: Check embedding model
+        shell: bash
+        run: |
           model="model/embeddinggemma-2-Q8_0.gguf"
-          curl -fL --retry 3 -o "$model" "https://huggingface.co/ggml-org/embeddinggemma-2-GGUF/resolve/bfcd298762cc34d0357ece5ebdd31791a3a374d8/embeddinggemma-2-Q8_0.gguf"
           size="$(wc -c < "$model" | tr -d ' ')"
           if [ "$size" != "309855456" ]; then
             echo "Model size is $size bytes, expected 309855456." >&2
@@ -96,6 +146,15 @@ jobs:
             path="$PWD/$model"
           fi
           echo "LCTR_BUNDLED_MODEL=$path" >> "$GITHUB_ENV"
+      - name: Save embedding model
+        if: steps.model-cache.outputs.cache-hit != 'true' && runner.os == 'Linux' && github.ref == 'refs/heads/main'
+        uses: actions/cache/save@v4
+        with:
+          path: model/embeddinggemma-2-Q8_0.gguf
+          key: embeddinggemma-2-Q8_0-bfcd298762cc34d0357ece5ebdd31791a3a374d8
+          enableCrossOsArchive: true
+      # Full build: the same target with the embedding model compiled in. Runs after the lean
+      # archive is packaged, because it overwrites target/<target>/release/lctr.
       - name: Build full
         run: cargo build --release --locked --target ${{ matrix.target }} --features bundled-model
       - name: Package full Unix
@@ -115,6 +174,7 @@ jobs:
           Copy-Item README.md, LICENSE dist-full/
           Compress-Archive -Path dist-full/* -DestinationPath "${{ matrix.full_archive }}" -Force
       - name: Upload full artifact
+        if: startsWith(github.ref, 'refs/tags/')
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.full_archive }}
