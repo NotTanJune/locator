@@ -6,6 +6,8 @@ on:
       - "v*"
     branches:
       - main
+      # Proof branch so a push here runs the same job. Removed after the warm run.
+      - cursor/fast-release-workflow-6e1b
     # Path filters are not applied to tag pushes. A main push runs this same
     # build job so the release-profile cache is saved on the default branch,
     # which is the only cache a later tag run can restore.
