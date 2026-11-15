@@ -20,14 +20,18 @@ use crate::tui::TerminalGuard;
 
 /// Launch the settings TUI. Loads config, edits in place, saves on request.
 pub fn run() -> Result<()> {
+    // Fail before taking over the terminal if the file is not valid TOML, so saving cannot clobber it.
+    let config = Config::load_with_warning()?;
     let _guard = TerminalGuard::enter_default_cursor().context("enter terminal")?;
     let backend = CrosstermBackend::new(io::stdout());
     let mut terminal = Terminal::new(backend).context("create terminal")?;
-    run_loop(&mut terminal)
+    run_loop(&mut terminal, config)
 }
 
-fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
-    let mut config = Config::load();
+fn run_loop(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    mut config: Config,
+) -> Result<()> {
     let mut selected = 0usize;
     let mut dirty = false;
     let mut status =

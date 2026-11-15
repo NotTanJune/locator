@@ -72,7 +72,7 @@ fn scan_creates_directory_local_index_and_find_uses_current_directory() {
         .success()
         .stdout(contains("1 files indexed"));
 
-    assert!(root.path().join(".locator/index.sqlite").exists());
+    assert!(root.path().join(".locator/index.db").exists());
 
     let mut find = Command::cargo_bin("lctr").expect("binary exists");
     find.current_dir(root.path())
@@ -102,8 +102,8 @@ fn scan_without_root_indexes_current_directory() {
         .stdout(contains("staging index at").not())
         .stdout(contains("staged index copied").not());
 
-    assert!(root_path.join(".locator/index.sqlite").exists());
-    assert!(!home.path().join(".locator/index.sqlite").exists());
+    assert!(root_path.join(".locator/index.db").exists());
+    assert!(!home.path().join(".locator/index.db").exists());
 }
 
 #[test]
@@ -120,7 +120,7 @@ fn scan_defaults_to_high_throughput_staged_profile() {
         .success()
         .stdout(contains("staging index at").not())
         .stdout(contains("1 files indexed"))
-        .stdout(contains("post-scan index build"))
+        .stdout(contains("index write"))
         .stdout(contains("filesystem scan counts"));
 }
 
@@ -157,7 +157,7 @@ fn staged_scan_creates_directory_local_index() {
         .stdout(contains("scan complete"))
         .stdout(contains("staged index copied").not());
 
-    assert!(root.path().join(".locator/index.sqlite").exists());
+    assert!(root.path().join(".locator/index.db").exists());
 
     let mut find = Command::cargo_bin("lctr").expect("binary exists");
     find.current_dir(root.path())
@@ -185,7 +185,7 @@ fn staged_rescan_preserves_open_history() {
     };
     scan();
 
-    let index_path = root.path().join(".locator/index.sqlite");
+    let index_path = root.path().join(".locator/index.db");
     let file_path = root.path().join("report.pdf").to_string_lossy().to_string();
     {
         let conn = rusqlite::Connection::open(&index_path).expect("open index");
@@ -236,11 +236,11 @@ fn staged_scan_readonly_root_falls_back_to_app_support_index() {
         .arg("--stage-index")
         .assert()
         .success()
-        .stdout(contains("using fallback staged target"))
+        .stdout(contains("using fallback index"))
         .stdout(contains("scan complete"))
         .stdout(contains("staged index copied").not());
 
-    assert!(!root.path().join(".locator/index.sqlite").exists());
+    assert!(!root.path().join(".locator/index.db").exists());
 
     let mut find = Command::cargo_bin("lctr").expect("binary exists");
     find.env("LCTR_DATA_DIR", data.path())
@@ -283,7 +283,7 @@ fn scan_readonly_root_falls_back_to_app_support_index() {
         .success()
         .stdout(contains("1 files indexed"));
 
-    assert!(!root.path().join(".locator/index.sqlite").exists());
+    assert!(!root.path().join(".locator/index.db").exists());
 
     let mut find = Command::cargo_bin("lctr").expect("binary exists");
     find.env("LCTR_DATA_DIR", data.path())
@@ -345,8 +345,6 @@ fn shell_init_zsh_prints_cd_wrapper_without_default_home_cd() {
         .stdout(contains("function lctr()"))
         .stdout(contains("command lctr"))
         .stdout(contains("cd --"))
-        .stdout(contains("--batch-size"))
-        .stdout(contains("--writer-queue-batches"))
         .stdout(contains("--native-buffer-mb"))
         .stdout(contains("--native-workers"))
         .stdout(contains("--native-output-batch-size"))
@@ -435,13 +433,13 @@ fn scan_exposes_throughput_tuning_options() {
         .arg("--help")
         .assert()
         .success()
-        .stdout(contains("--batch-size"))
-        .stdout(contains("--writer-queue-batches"))
         .stdout(contains("--native-buffer-mb"))
         .stdout(contains("--native-workers"))
         .stdout(contains("--native-output-batch-size"))
-        .stdout(contains("--stage-index"))
-        .stdout(contains("--no-stage-index"))
+        .stdout(contains("--batch-size").not())
+        .stdout(contains("--writer-queue-batches").not())
+        .stdout(contains("--stage-index").not())
+        .stdout(contains("--no-stage-index").not())
         .stdout(contains("--profile-detail"))
         .stdout(contains("--no-profile-detail"))
         .stdout(contains("dirent"));
@@ -460,11 +458,10 @@ fn scan_profile_detail_prints_expanded_timings() {
         .arg("--profile-detail")
         .assert()
         .success()
-        .stdout(contains("post-scan index build"))
+        .stdout(contains("index write"))
         .stdout(contains("filesystem scan counts"))
-        .stdout(contains("filename index"))
+        .stdout(contains("name file"))
         .stdout(contains("metadata reads"))
-        .stdout(contains("sort"))
         .stdout(contains("profile detail:").not())
         .stdout(contains("native detail:").not())
         .stdout(contains("getattr calls").not());
@@ -483,7 +480,7 @@ fn delete_index_removes_current_directory_index() {
         .assert()
         .success();
 
-    let db_path = root.path().join(".locator/index.sqlite");
+    let db_path = root.path().join(".locator/index.db");
     assert!(db_path.exists());
 
     let mut delete = Command::cargo_bin("lctr").expect("binary exists");
@@ -511,7 +508,7 @@ fn delete_index_removes_target_directory_index() {
         .assert()
         .success();
 
-    let db_path = root.path().join(".locator/index.sqlite");
+    let db_path = root.path().join(".locator/index.db");
     assert!(db_path.exists());
 
     let mut delete = Command::cargo_bin("lctr").expect("binary exists");
@@ -532,6 +529,7 @@ fn delete_index_reports_unindexed_target_directory() {
 
     let mut delete = Command::cargo_bin("lctr").expect("binary exists");
     delete
+        .current_dir(root.path())
         .arg("delete-index")
         .arg(root.path())
         .assert()
@@ -563,7 +561,7 @@ fn rescan_over_existing_index_succeeds_and_no_tmp_residue() {
     let root = tempdir().expect("root");
     std::fs::write(root.path().join("invoice.pdf"), "fake").expect("write file");
 
-    // First scan — creates .locator/index.sqlite via the staged swap path.
+    // First scan — creates .locator/index.db via the staged swap path.
     let mut scan1 = Command::cargo_bin("lctr").expect("binary exists");
     scan1
         .current_dir(root.path())
@@ -744,5 +742,77 @@ fn scan_output_includes_profile_timing_summary() {
         .stdout(contains("scan complete"))
         .stdout(contains("timing breakdown"))
         .stdout(contains("walk+metadata"))
-        .stdout(contains("sqlite writes"));
+        .stdout(contains("name file"));
+}
+
+#[cfg(unix)]
+#[test]
+fn shell_wrapper_skips_depth_value_when_finding_scan_root() {
+    let bin = tempdir().expect("bin");
+    let root = tempdir().expect("root");
+    let stub = bin.path().join("lctr");
+    std::fs::write(&stub, "#!/bin/sh\nexit 0\n").expect("write stub");
+    std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    let init = Command::cargo_bin("lctr")
+        .expect("binary exists")
+        .args(["shell-init", "bash"])
+        .output()
+        .expect("shell-init");
+    assert!(init.status.success());
+    let script = bin.path().join("init.bash");
+    std::fs::write(&script, &init.stdout).expect("write init");
+
+    for depth in ["--depth deep", "--depth=deep"] {
+        let program = format!(
+            "source '{}'; lctr scan --em {depth} '{}'; pwd -P",
+            script.display(),
+            root.path().display()
+        );
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(program)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.path().display(),
+                    std::env::var("PATH").unwrap()
+                ),
+            )
+            .output()
+            .expect("run bash");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let cwd = String::from_utf8(out.stdout).unwrap();
+        assert_eq!(
+            std::path::PathBuf::from(cwd.trim()),
+            root.path().canonicalize().unwrap(),
+            "{depth}"
+        );
+    }
+}
+
+#[test]
+fn scan_accepts_the_old_tuning_flags_and_ignores_them() {
+    let root = tempdir().expect("root");
+    let data = tempdir().expect("data dir");
+    std::fs::write(root.path().join("invoice.pdf"), "fake").expect("write file");
+
+    let mut scan = Command::cargo_bin("lctr").expect("binary exists");
+    scan.env("LCTR_DATA_DIR", data.path())
+        .current_dir(data.path())
+        .arg("scan")
+        .arg(root.path())
+        .arg("--batch-size")
+        .arg("1000")
+        .arg("--writer-queue-batches")
+        .arg("4")
+        .arg("--stage-index")
+        .assert()
+        .success()
+        .stdout(contains("1 files indexed"));
 }

@@ -140,9 +140,7 @@ fn scan_completion_dashboard_contains_summary_bars_and_commands() {
             total: Duration::from_secs(10),
             discovery: Duration::from_secs(1),
             walk: Duration::from_secs(4),
-            sqlite_writes: Duration::from_secs(2),
-            cleanup: Duration::from_secs(3),
-            batches: 2,
+            name_file_write: Duration::from_secs(2),
             indexed_files: 42,
             indexed_bytes: 4_200_000,
             ..Default::default()
@@ -151,8 +149,7 @@ fn scan_completion_dashboard_contains_summary_bars_and_commands() {
     let summary = ScanSummary {
         stats: &stats,
         root: Path::new("/tmp/docs"),
-        index_path: Path::new("/tmp/docs/.locator/index.sqlite"),
-        staged: true,
+        index_path: Path::new("/tmp/docs/.locator/index.db"),
         detail: false,
     };
 
@@ -164,7 +161,7 @@ fn scan_completion_dashboard_contains_summary_bars_and_commands() {
     assert!(frame.contains("4.2 files/s"));
     assert!(frame.contains("search-ready index"));
     assert!(frame.contains("walk+metadata"));
-    assert!(frame.contains("sqlite writes"));
+    assert!(frame.contains("name file"));
     assert!(!frame.contains("staged index copied"));
     assert!(frame.contains("lctr search /tmp/docs"));
     assert!(frame.contains("lctr delete-index /tmp/docs"));
@@ -192,9 +189,7 @@ fn scan_completion_dashboard_includes_error_samples_and_profile_detail() {
         profile: ScanProfile {
             total: Duration::from_secs(2),
             record_handling: Duration::from_millis(10),
-            writer_wait: Duration::from_millis(20),
-            fts_rebuild: Duration::from_millis(30),
-            index_rebuild: Duration::from_millis(40),
+            name_file_write: Duration::from_millis(30),
             native_getattr_calls: 5,
             native_parse: Duration::from_millis(50),
             native_queue_wait: Duration::from_millis(60),
@@ -206,8 +201,7 @@ fn scan_completion_dashboard_includes_error_samples_and_profile_detail() {
     let summary = ScanSummary {
         stats: &stats,
         root: Path::new("/tmp/docs"),
-        index_path: Path::new("/tmp/index.sqlite"),
-        staged: false,
+        index_path: Path::new("/tmp/index.db"),
         detail: true,
     };
 
@@ -217,9 +211,9 @@ fn scan_completion_dashboard_includes_error_samples_and_profile_detail() {
     assert!(!frame.contains("error summary:"));
     assert!(frame.contains("permission denied: 2"));
     assert!(frame.contains("/tmp/private/file"));
-    assert!(frame.contains("post-scan index build"));
+    assert!(frame.contains("index write"));
     assert!(frame.contains("filesystem scan counts"));
-    assert!(frame.contains("filename index"));
+    assert!(frame.contains("name file"));
     assert!(frame.contains("metadata reads"));
     assert!(!frame.contains("profile detail:"));
     assert!(!frame.contains("record handling"));

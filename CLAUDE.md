@@ -41,28 +41,48 @@ Releases are tag-triggered. The tag must match `version` in `Cargo.toml` exactly
 
 The binary is `lctr` (`src/main.rs`); the library crate is `locator` (`src/lib.rs`). All subcommands are defined with clap derive in `main.rs` (the `Commands` enum) and dispatch into library functions.
 
-Subcommands: `scan <root>` (build index), `search` (interactive TUI), `find` (non-interactive query, scriptable output), `watch <root>` (poll-refresh the index every 5s via `src/watch.rs`), `status`, `update` (update through the detected installation method), `roots` / `remove-root` (manage indexed roots), `delete-index`, `vacuum`, `shell-init` / `setup-shell` (install the `lctr`-cd shell wrapper).
+Subcommands: `scan <root>` (walk the root, build the index in memory and write it once at the end), `search` (interactive TUI), `find` (non-interactive query, scriptable output), `watch <root>` (scan once, then keep the index current with the `LiveIndex` watcher; when the watcher cannot start it scans again every 5s, `src/watch.rs`), `status`, `update` (update through the detected installation method), `roots` / `remove-root` (manage indexed roots), `delete-index`, `vacuum`, `shell-init` / `setup-shell` (install the `lctr`-cd shell wrapper).
 
 ### Index storage
 
-SQLite via `rusqlite`. `src/db.rs` owns all schema, queries, and DB open helpers. Index location priority:
+An index is two files that sit side by side. `index.db` is SQLite and stays small: the `scan_roots`, `access`, `changes` and `search_state` tables, and `PRAGMA user_version`, which holds `INDEX_FORMAT`. `index.names` holds every indexed path and its kind in a compact format (`src/name_file.rs`). `src/db.rs` owns the schema, the queries and the open helpers. Index location priority:
 
-1. Nearest `.locator/index.sqlite` walking up from the current directory
-2. Fallback: `~/Library/Application Support/locator/index.sqlite` (macOS) or OS equivalent via `dirs`
+1. Nearest `.locator/index.db` walking up from the current directory
+2. Fallback: `~/Library/Application Support/locator/index.db` (macOS) or OS equivalent via `dirs`
 
-Scans use a staged write strategy: data is written to a temp staging DB, then atomically copied to the final path on completion. `ScanCompletion` (Complete / Incomplete / Unknown) is persisted so the TUI can detect interrupted scans.
+`name_file_path` maps a database path to the name file beside it. The embeddings sidecar keeps its name, `index.embeddings.sqlite`.
 
-Full-text search uses an FTS5 virtual table `files_fts` with the **trigram** tokenizer (`recreate_fts_if_needed`), which makes substring (`Contains`) queries index-accelerated instead of a full-table `LIKE` scan — the dominant search cost on large indexes. By default it indexes **`name` only** (filenames); the `index_paths` config setting switches it to `name`+`path` for directory-substring search at the cost of a much slower scan-finish (paths are ~7× more text → trigram build dominates the "optimize" phase). The FTS table and its sync triggers (`create_fts_triggers`) are rebuilt only when columns mismatch (`fts_columns`/`fts_sql_has_path`/`fts_index_paths`) — never on every open, which would race concurrent writers (the live watcher). The search query (`files_fts MATCH`, via `trigram_match`) is column-agnostic; queries <3 chars fall back to indexed `name_lower LIKE`. Opening an older index transparently rebuilds the FTS. Per-stage search timing: `LCTR_TIMING`.
+The name file starts with a header and a folder table. Each folder stores its parent and its own name, so a path is its folder's full path plus the row's name. Rows are cut into blocks of `BLOCK_ROWS` (4,096), and each block has three lz4 parts: the lowercased names, one case bit per name byte, and one kind byte per row. The file holds no sizes or dates. It is written whole to `index.names.tmp` and replaced by rename, and never edited in place.
 
-Search hydration (`hydrate_search_results`, one `symlink_metadata` per row) runs **after** sort+truncate, so only the returned page is stat'd, not the whole `candidate_limit` pool — critical on large indexes.
+The active rows are the name file's rows that `changes` does not hide, plus the live rows of `changes`. A `changes` row with a kind is a live row. A row with no kind is a removal: that path and everything beneath it is gone. `Pending` is the in-memory form of `changes` (`load_state` reads it). Each writer does one thing:
+
+- `upsert_files_with_indexed_at` writes one live row per record to `changes` and registers a new record root in `scan_roots` as incomplete.
+- `mark_path_deleted` writes a removal to `changes`, deletes the `changes` rows beneath that path, and returns how many active rows it removed. It records the removal even when that count is 0, so a scan that is walking the tree right now cannot bring the path back.
+- `compact_name_file` folds `changes` into a new name file and empties `changes`.
+- `remove_root` does the same fold but drops the rows the root owns and deletes the root from `scan_roots`.
+- `install_scan` replaces the rows the scanned root owns with the scan's rows, deletes the `changes` rows it owns that are older than the scan, and marks the root complete.
+
+Any new code that changes rows must either write to `changes` or replace the name file inside one `IMMEDIATE` transaction (`begin_write`) through `replace_name_file`.
+
+Each row has one owner: `owner` returns the longest registered root that the path equals or lies beneath. `install_scan` replaces only the rows its root owns. When the walk entered a registered root nested under the scanned root (the scan has a row at or beneath it), the scan takes over that root: it is removed from `scan_roots` and its old rows go. A nested root that the walk did not enter keeps its registration and its rows.
+
+`replace_name_file` runs inside the caller's `IMMEDIATE` transaction. It writes `index.names.tmp`, syncs it, renames it over `index.names`, and then sets `snapshot_id` in `search_state`; the caller commits. A crash between the rename and the commit leaves a name file that is newer than SQLite says. That is harmless, because applying `changes` to a file that already holds them gives the same active rows. So a reader always uses the file on disk. `snapshot_id` only tells a handle whether its cached mapping is current (`name_file_with_id`); `0` means no name file has been written. A missing name file while `snapshot_id` is not 0 means the rows are lost. A writable open then runs `mark_lost_name_file`, which marks every root incomplete, sets `snapshot_id` to 0 and prints one warning that tells the user to run `lctr scan`.
+
+A scan collects its rows in a `NameFileBuilder` and calls `install_scan` once, when the walk ends. A scan that stops early changes nothing, and the old index stays. The old `--stage-index`, `--no-stage-index`, `--batch-size` and `--writer-queue-batches` flags are still accepted, hidden, and do nothing. `ScanCompletion` (Complete / Incomplete / Unknown) reads `scan_roots.complete`, so the TUI can tell a finished index from a root that was never fully scanned.
+
+`lctr find` and the TUI share `for_each_match`, which calls `name_file_for_search`, runs the match with no row cap and lets `CompiledQuery` decide each row. `row_matches` is the rule: Contains with no path separator in the query tests the name only; every other query tests the name, then the path. `NameScan` splits the blocks across all cores. For Contains, Exact, Suffix and Prefix queries that fit inside a name, `needles` returns byte strings, `NameScan` searches the lowercased names of each block for them and tests only the rows it finds. Every other mode (fuzzy, regex, glob, a query with a path separator, a Prefix query that could start a path) tests every row. The live rows of `changes` are tested after the name file's rows, and the name file's rows that `changes` hides are skipped. When a search finds more than `MAX_PENDING_CHANGES` (2,000) changes, `name_file_for_search` folds them first through `compact_name_file`; the watcher does the same through `compact_name_file_if_needed`. Ordering happens in Rust (`sort_results_compiled`, a total order). The semantic search checks many paths against one view of the index with `PathLookup` (`Database::path_lookup`).
+
+Scans store names only, so sizes and dates come from hydration (`hydrate_in_place`, one `symlink_metadata` per row). `find` keeps a ranked pool (`top_matches`) and hydrates rows in rank order until it has `limit`, so only the returned rows are stat'd. A size or date filter, or a sort by size or date, cannot be answered from the index: `needs_disk_metadata` makes both paths hydrate every match first (`hydrate_all`, one thread per core) and then filter and sort.
+
+Old indexes convert on open. An index written by lctr 0.4 or earlier has a `files` table. When `migrate` finds one in the opened file, `convert_old_tables` imports its active rows through `import_old_rows` (the old rows replace the rows of the roots it lists, and its `scan_roots` rows are kept), then drops `files`, the full-text table, the old triggers and `pending_changes`, and vacuums. When `Database::open` opens `index.db` and an `index.sqlite` sits beside it, `adopt_old_sibling` runs `convert_sibling`: it imports the rows and the `access` rows, then deletes `index.sqlite` with its `-wal` and `-shm` files. If an old binary writes a new `index.sqlite` later, the next open imports and removes it again. A failed conversion prints a warning and the open still succeeds. `Database::open_readonly` makes a short writable open first when either kind of old index is present, and `index_is_present` counts a sibling `index.sqlite` as an index. `remove_old_staging_files` deletes the staging files that older versions left in a fallback data folder after an interrupted scan, and the folder when it is then empty; `lctr scan` calls it first. `lctr delete-index` removes `index.db` with its `-wal` and `-shm` files, `index.names` with its `.tmp` file, an old `index.sqlite` beside them, and the embeddings sidecar. A database whose `user_version` is larger than `INDEX_FORMAT`, or a name file whose format is, fails to open with an error that says to run `lctr update`. Per-stage search timing: `LCTR_TIMING`.
 
 ### Search modes (TUI)
 
 `tui.rs` selects a `SearchBackend` variant before entering the event loop:
 
-- `Indexed` — full index exists; queries go to SQLite only.
-- `Hybrid` — scan was interrupted; SQLite results first, then live `jwalk` walk fills gaps.
-- `Live` — no index at all; pure filesystem walk via `src/live_search.rs`.
+- `Indexed`: the root's scan is complete, and queries read the name file and `changes`.
+- `Hybrid`: the scan was interrupted or never finished; results from the name file come first, then a live `jwalk` walk fills the gaps.
+- `Live`: no index at all; a pure filesystem walk via `src/live_search.rs`.
 
 The `SearchWorker` (inner struct in `tui.rs`) runs searches on a background thread and sends results back over a channel. The event loop calls `try_recv` each tick.
 
@@ -74,19 +94,19 @@ Compile a query once per search with `CompiledQuery::compile(mode, query)` and r
 
 ### Live index watcher
 
-`src/live_index.rs` — while the search TUI is open on an `Indexed`/`Hybrid` index, `LiveIndex::spawn(root, db_path)` runs a `notify` filesystem watcher on a background thread. Events are debounced (~400ms) and applied as per-path upserts (`Database::upsert_file`) or soft-deletes (`Database::mark_path_deleted`) against the same WAL SQLite file the search reads. A generation counter is bumped per applied batch; the TUI re-runs the current query when it changes so new/removed files surface without a keystroke. The `w` key toggles the watcher; it falls back to the existing `Hybrid` live-backfill when the watcher can't start.
+`src/live_index.rs`: while the search TUI is open on an `Indexed`/`Hybrid` index, `LiveIndex::spawn(root, db_path)` runs a `notify` filesystem watcher on a background thread. Events are debounced (~400ms) and applied as per-path live rows (`Database::upsert_file`) or removals (`Database::mark_path_deleted`), which land in the `changes` table of the same WAL SQLite file the search reads. The name file is not touched. After a batch, `watch_loop` calls `compact_name_file_if_needed`, which folds `changes` into a new name file once it holds more than 2,000 rows. A generation counter is bumped per applied batch; the TUI re-runs the current query when it changes so new and removed files surface without a keystroke. The `w` key toggles the watcher; it falls back to the existing `Hybrid` live-backfill when the watcher can't start.
 
 ### Preview pane
 
-`src/preview.rs` — `preview_for(path, max_lines)` returns a `Preview` (syntax-highlighted text via `syntect`, decoded image via the `image` crate, extracted PDF text via `pdf-extract`, directory listing, or binary/metadata fallback). The TUI (`tui.rs`) shows it in a right-hand pane split off the results area when width ≥ ~100 cols, caches it per selected path, and renders images inline with `ratatui-image` (auto-detected kitty/iterm2/sixel protocol, half-block fallback). Syntax sets/themes load once via a `OnceLock`.
+`src/preview.rs` — `preview_for(path, max_lines)` returns a `Preview` (syntax-highlighted text via `syntect`, decoded image via the `image` crate (a JPEG goes through `jpeg-decoder`, which scales to 1/2, 1/4 or 1/8 while it decodes, so a large photo is never held at full size), extracted PDF text via `pdf-extract`, directory listing, or binary/metadata fallback). The TUI (`tui.rs`) shows it in a right-hand pane split off the results area when width ≥ ~100 cols, caches it per selected path, and renders images inline with `ratatui-image` (auto-detected kitty/iterm2/sixel protocol, half-block fallback). Syntax sets/themes load once via a `OnceLock`.
 
 ### Frecency
 
-Opening/revealing/copying a result records an access in the `access` table (`open_count`, `last_opened_at`). `Database::search_with_options` blends a recency-weighted open count into Relevance ordering (boost, not override). Schema is created in `migrate()`.
+Opening/revealing/copying a result records an access in the `access` table (`open_count`, `last_opened_at`). `Database::search_with_options` blends a recency-weighted open count into Relevance ordering (boost, not override). The `access` table lives in `index.db` and `migrate()` creates it. Converting an old index copies its `access` rows over.
 
 ### Scanner
 
-`src/scanner.rs` walks the filesystem with `jwalk` (parallel), batches `FileRecord`s, and sends them to a writer thread that bulk-inserts into SQLite. Backends: `ParallelWalk` (jwalk parallel walker, the default — fastest on large trees in benchmarks), `Dirent` (directory-entry metadata), `Native` (macOS `getattrlistbulk`), and `Auto`. Pick via `--backend`. Progress is reported via `emit_progress` to a shared `latest_progress` cell.
+`src/scanner.rs` walks the filesystem with `jwalk` (parallel) and pushes each path and kind into a `NameFileBuilder` in memory. There is no writer thread and no SQLite bulk insert: `scan_root_with_progress` calls `Database::install_scan` once at the end and records its duration as `ScanProfile::name_file_write`. Backends: `ParallelWalk` (jwalk parallel walker, the default and the fastest on large trees in benchmarks), `Dirent` (directory-entry metadata), `Native` (macOS `getattrlistbulk`), and `Auto`. Pick via `--backend`. Progress is reported via `emit_progress` to a shared `latest_progress` cell.
 
 `src/scan_ui.rs` renders the live animated scan dashboard (separate from the search TUI) that consumes that progress while a scan runs.
 
@@ -96,7 +116,7 @@ Built with `ratatui` + `crossterm`. Layout: vertical split into top chrome (stat
 
 ### Config
 
-`src/config.rs` — persistent settings in `<config_dir>/locator/config.toml` (serde + toml). Keys: `icons`, `theme`, `backend`, `preview`, `update_check`, `index_paths`, each with `key_label`/`key_description`/`key_choices` metadata. `lctr config` with no subcommand opens an interactive settings TUI (`src/config_ui.rs`: ratatui editor showing each setting's choices + description, theme previews live, save with `s`). Scriptable subcommands remain: `lctr config list` (plain text), `get`/`set <key> [value]`, `path`, `reset`. Precedence: explicit flag / env var > config > built-in default (e.g. `LCTR_ICONS` overrides `config.icons`; `--backend` overrides `config.backend`; the `t`-key theme file overrides `config.theme` via `Theme::load_with_default`).
+`src/config.rs` — persistent settings in `<config_dir>/locator/config.toml` (serde + toml). Keys: `icons`, `theme`, `backend`, `preview`, `update_check`, each with `key_label`/`key_description`/`key_choices` metadata. `lctr config` with no subcommand opens an interactive settings TUI (`src/config_ui.rs`: ratatui editor showing each setting's choices + description, theme previews live, save with `s`). Scriptable subcommands remain: `lctr config list` (plain text), `get`/`set <key> [value]`, `path`, `reset`. Precedence: explicit flag / env var > config > built-in default (e.g. `LCTR_ICONS` overrides `config.icons`; `--backend` overrides `config.backend`; the `t`-key theme file overrides `config.theme` via `Theme::load_with_default`).
 
 ### Update check
 
@@ -106,12 +126,12 @@ Built with `ratatui` + `crossterm`. Layout: vertical split into top chrome (stat
 
 | Var | Effect |
 |---|---|
-| `LCTR_DB` | Override DB path |
+| `LCTR_DB` | Override the database path; the name file sits beside it with the extension `.names` |
 | `LCTR_DATA_DIR` | Override data directory |
 | `LCTR_NO_UPDATE_CHECK` | Disable release check |
 | `LCTR_SHELL` | Override shell for setup-shell |
 | `LCTR_ICONS` | Set to `1`/`true` to show Nerd Font file-type icons in results (default off) |
-| `LCTR_TIMING` | Set to print per-stage search timing (sql/hydrate/filter/frecency/total) to stderr |
+| `LCTR_TIMING` | Set to print per-stage search timing (match + rank, or match then sort; hydrate; total) to stderr |
 
 ## Embeddings
 
@@ -126,7 +146,7 @@ Built with `ratatui` + `crossterm`. Layout: vertical split into top chrome (stat
 
 ### Sidecar
 
-The vectors live in `index.embeddings.sqlite` next to the filename index (`sidecar_path_for_index`). They are kept out of the filename index on purpose: the filename index keeps its schema, and `lctr delete-index` removes both files. Tables: `meta` (model id, dims, complete flag per root), `embed_files` (stamp, status, `chunks_total`, `depth_done`), and `chunks` (f16 vector, snippet, ordinal, unique per path and ordinal). The file is created with mode 0600.
+The vectors live in `index.embeddings.sqlite` next to the filename index (`sidecar_path_for_index`). They are kept out of `index.db` and `index.names` on purpose: those two files hold only paths and state, and `lctr delete-index` removes the sidecar along with them. Tables: `meta` (model id, dims, complete flag per root), `embed_files` (stamp, status, `chunks_total`, `depth_done`), and `chunks` (f16 vector, snippet, ordinal, unique per path and ordinal). The file is created with mode 0600.
 
 ### Passes
 
@@ -173,5 +193,4 @@ cmake, libclang (bindgen in `llama-cpp-sys-2`), and a C++ toolchain. llama.cpp c
 
 ### Test env lock rule
 
-Opening a `Database` reads the global user config through `fts_index_paths`. A test that changes `LCTR_CONFIG_DIR` or `LCTR_DATA_DIR` therefore races every other test in the same binary that opens a database. `tests/db_tests.rs` has `env_guard()`, and every test in that file takes it once. Any new test that changes a `LCTR_*` variable, or that opens a database in a binary where another test changes one, must take the same guard. Each integration test file is its own process. Unit tests under `src/` have no environment changes, so they need no guard.
-
+Opening a `Database` no longer reads the user config. `locator_data_dir` (used by the default index path helpers) reads `LCTR_DATA_DIR`, and `src/config.rs` reads `LCTR_CONFIG_DIR`. A test that changes either variable races every other test in the same binary that reads it. `tests/db_tests.rs` has `env_guard()`, and every test in that file takes it once. Any new test that changes a `LCTR_*` variable, or that reads one in a binary where another test changes one, must take the same guard. Each integration test file is its own process. Unit tests under `src/` have no environment changes, so they need no guard.

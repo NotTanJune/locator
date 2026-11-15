@@ -2,6 +2,7 @@
 //! in-memory vector index used for search.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -11,6 +12,10 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use super::vector::{dot_f16, encode_f16};
 
 const SCHEMA_VERSION: &str = "1";
+
+/// Detail of an image skipped because the vision model was not installed. Sidecars already hold
+/// rows with this text, so it is the marker that lets a later pass with vision retry them.
+pub const VISION_MISSING_DETAIL: &str = "vision model not installed";
 
 /// One file's embedding progress, as stored in `embed_files`.
 struct Progress {
@@ -46,7 +51,7 @@ fn migrate_progress_columns(conn: &Connection) -> Result<()> {
 }
 const MAX_SEARCH_WORKERS: usize = 8;
 
-/// Sidecar path for a main index: `index.sqlite` becomes `index.embeddings.sqlite`.
+/// Sidecar path for a main index: `index.db` becomes `index.embeddings.sqlite`.
 pub fn sidecar_path_for_index(index_path: &Path) -> PathBuf {
     let stem = index_path
         .file_stem()
@@ -225,14 +230,22 @@ impl EmbedStore {
         }
     }
 
-    /// Deletes rows for files under `root` that are no longer active in the main index.
-    pub fn prune_to_active(&self, root: &str, active_paths: &[String]) -> Result<u64> {
+    /// Deletes rows for files under `root` that are no longer active in the main index, and rows
+    /// of roots that are not in `index_roots` (the main index's roots) any more.
+    pub fn prune_to_active(
+        &self,
+        root: &str,
+        active_paths: &[String],
+        index_roots: &[String],
+    ) -> Result<u64> {
         let tx = self.conn.unchecked_transaction().context("begin prune")?;
         tx.execute_batch(
             "CREATE TEMP TABLE IF NOT EXISTS active (path TEXT PRIMARY KEY);
-             DELETE FROM temp.active;",
+             CREATE TEMP TABLE IF NOT EXISTS index_roots (root TEXT PRIMARY KEY);
+             DELETE FROM temp.active;
+             DELETE FROM temp.index_roots;",
         )
-        .context("create temp active table")?;
+        .context("create temp prune tables")?;
         {
             let mut insert = tx
                 .prepare("INSERT OR IGNORE INTO temp.active (path) VALUES (?1)")
@@ -242,22 +255,46 @@ impl EmbedStore {
                     .execute(params![path])
                     .context("insert active path")?;
             }
+            let mut insert = tx
+                .prepare("INSERT OR IGNORE INTO temp.index_roots (root) VALUES (?1)")
+                .context("prepare root insert")?;
+            for index_root in index_roots {
+                insert
+                    .execute(params![index_root])
+                    .context("insert index root")?;
+            }
         }
-        let removed = tx
+        // A file embedded under a nested root that this root now covers moves to this root, so it
+        // is kept here and pruned here once it disappears.
+        tx.execute(
+            "UPDATE embed_files SET root = ?1
+             WHERE root != ?1 AND path IN (SELECT path FROM temp.active)",
+            params![root],
+        )
+        .context("retag active files")?;
+        let mut removed = tx
             .execute(
                 "DELETE FROM embed_files WHERE root = ?1
                  AND NOT EXISTS (SELECT 1 FROM temp.active a WHERE a.path = embed_files.path)",
                 params![root],
             )
             .context("prune embed_files")? as u64;
+        // `lctr remove-root`, or a parent scan that took over every file of a nested root.
+        removed += tx
+            .execute(
+                "DELETE FROM embed_files WHERE root != ?1
+                 AND root NOT IN (SELECT root FROM temp.index_roots)",
+                params![root],
+            )
+            .context("prune removed roots")? as u64;
         tx.execute(
             "DELETE FROM chunks WHERE NOT EXISTS
              (SELECT 1 FROM embed_files f WHERE f.path = chunks.path)",
             [],
         )
         .context("prune orphan chunks")?;
-        tx.execute_batch("DELETE FROM temp.active;")
-            .context("clear temp active table")?;
+        tx.execute_batch("DELETE FROM temp.active; DELETE FROM temp.index_roots;")
+            .context("clear temp prune tables")?;
         tx.commit().context("commit prune")?;
         Ok(removed)
     }
@@ -285,6 +322,20 @@ impl EmbedStore {
         Ok(current
             && row.status == FileStatus::Done as i64
             && row.depth_done < row.chunks_total.min(limit as i64))
+    }
+
+    /// True when `path` is stored as skipped only because the vision model was not installed.
+    pub fn skipped_without_vision(&self, path: &str) -> Result<bool> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT 1 FROM embed_files WHERE path = ?1 AND status = ?2 AND detail = ?3",
+                params![path, FileStatus::Skipped as i64, VISION_MISSING_DETAIL],
+                |_| Ok(()),
+            )
+            .optional()
+            .context("read embed_files row")?
+            .is_some())
     }
 
     /// True when the stored row for `path` is a skip, whatever its stamp.
@@ -503,22 +554,6 @@ impl EmbedStore {
                 row.get::<_, i64>(0)
             })? as u64)
     }
-
-    /// Every stored chunk's path, ordinal, and f16 bytes, in insertion order.
-    fn all_vectors(&self) -> Result<Vec<(String, u32, Vec<u8>)>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT path, ordinal, vec FROM chunks ORDER BY path, ordinal")
-            .context("prepare vector load")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)? as u32,
-                row.get::<_, Vec<u8>>(2)?,
-            ))
-        })?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-    }
 }
 
 fn file_len(path: &Path) -> u64 {
@@ -532,6 +567,14 @@ pub struct ScoredChunk {
     pub score: f32,
 }
 
+/// A file's best-scoring chunk. `path` borrows from the `VectorIndex`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScoredFile<'a> {
+    pub path: &'a str,
+    pub ordinal: u32,
+    pub score: f32,
+}
+
 /// All chunk vectors in memory as f16 (2 bytes per component), scored by dot product.
 pub struct VectorIndex {
     dims: usize,
@@ -541,47 +584,74 @@ pub struct VectorIndex {
 }
 
 impl VectorIndex {
-    /// Loads every chunk vector from the store.
+    /// Loads every chunk vector from the store, copying each row straight into the index.
     pub fn load(store: &EmbedStore) -> Result<VectorIndex> {
         let dims = store
             .dims()?
             .ok_or_else(|| anyhow!("embeddings sidecar has no dims"))?;
-        let rows = store.all_vectors()?;
-        Self::from_rows(dims, rows)
+        let mut index = VectorIndex::with_capacity(dims, store.chunk_count()? as usize);
+        let mut path_ids = HashMap::new();
+        let mut stmt = store
+            .conn
+            .prepare("SELECT path, ordinal, vec FROM chunks ORDER BY path, ordinal")
+            .context("prepare vector load")?;
+        let mut rows = stmt.query([]).context("load vectors")?;
+        while let Some(row) = rows.next()? {
+            index.push(
+                &mut path_ids,
+                row.get_ref(0)?.as_str()?,
+                row.get::<_, i64>(1)? as u32,
+                row.get_ref(2)?.as_blob()?,
+            )?;
+        }
+        Ok(index)
     }
 
     /// Builds an index from `(path, ordinal, f16 bytes)` rows. Each vector must be `dims` components.
     pub fn from_rows(dims: usize, rows: Vec<(String, u32, Vec<u8>)>) -> Result<VectorIndex> {
-        let mut paths: Vec<String> = Vec::new();
-        let mut path_ids: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
-        let mut refs = Vec::with_capacity(rows.len());
-        let mut vecs = Vec::with_capacity(rows.len() * dims * 2);
-        for (path, ordinal, bytes) in rows {
-            if bytes.len() != dims * 2 {
-                bail!(
-                    "stored vector for {path} has {} bytes, expected {}",
-                    bytes.len(),
-                    dims * 2
-                );
-            }
-            let path_id = match path_ids.get(&path) {
-                Some(id) => *id,
-                None => {
-                    let id = paths.len() as u32;
-                    path_ids.insert(path.clone(), id);
-                    paths.push(path);
-                    id
-                }
-            };
-            refs.push((path_id, ordinal));
-            vecs.extend_from_slice(&bytes);
+        let mut index = VectorIndex::with_capacity(dims, rows.len());
+        let mut path_ids = HashMap::new();
+        for (path, ordinal, bytes) in &rows {
+            index.push(&mut path_ids, path, *ordinal, bytes)?;
         }
-        Ok(VectorIndex {
+        Ok(index)
+    }
+
+    fn with_capacity(dims: usize, rows: usize) -> VectorIndex {
+        VectorIndex {
             dims,
-            paths,
-            refs,
-            vecs,
-        })
+            paths: Vec::new(),
+            refs: Vec::with_capacity(rows),
+            vecs: Vec::with_capacity(rows * dims * 2),
+        }
+    }
+
+    fn push(
+        &mut self,
+        path_ids: &mut HashMap<String, u32>,
+        path: &str,
+        ordinal: u32,
+        bytes: &[u8],
+    ) -> Result<()> {
+        if bytes.len() != self.dims * 2 {
+            bail!(
+                "stored vector for {path} has {} bytes, expected {}",
+                bytes.len(),
+                self.dims * 2
+            );
+        }
+        let path_id = match path_ids.get(path) {
+            Some(id) => *id,
+            None => {
+                let id = self.paths.len() as u32;
+                path_ids.insert(path.to_string(), id);
+                self.paths.push(path.to_string());
+                id
+            }
+        };
+        self.refs.push((path_id, ordinal));
+        self.vecs.extend_from_slice(bytes);
+        Ok(())
     }
 
     pub fn len(&self) -> usize {
@@ -594,8 +664,66 @@ impl VectorIndex {
 
     /// Top `k` chunks by dot product, highest first. `query` must be L2-normalized with `dims` components.
     pub fn top_k(&self, query: &[f32], k: usize) -> Vec<ScoredChunk> {
-        let n = self.refs.len();
-        if k == 0 || n == 0 || query.len() != self.dims {
+        if k == 0 {
+            return Vec::new();
+        }
+        let mut scored: Vec<(f32, usize)> = self.scores(query).into_iter().zip(0..).collect();
+        if scored.len() > k {
+            scored.select_nth_unstable_by(k - 1, |a, b| {
+                b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal)
+            });
+            scored.truncate(k);
+        }
+        scored.sort_by(|a, b| {
+            b.0.partial_cmp(&a.0)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| self.path_of(a.1).cmp(self.path_of(b.1)))
+        });
+        scored
+            .into_iter()
+            .map(|(score, row)| ScoredChunk {
+                path: self.path_of(row).to_string(),
+                ordinal: self.refs[row].1,
+                score,
+            })
+            .collect()
+    }
+
+    /// Every file's best chunk by dot product, highest first, ties by path. Within a file the
+    /// lowest ordinal wins a tie.
+    pub fn best_per_file(&self, query: &[f32]) -> Vec<ScoredFile<'_>> {
+        let mut best: Vec<Option<(f32, u32)>> = vec![None; self.paths.len()];
+        for (&(path_id, ordinal), score) in self.refs.iter().zip(self.scores(query)) {
+            let slot = &mut best[path_id as usize];
+            if slot.is_none_or(|(top, _)| score > top) {
+                *slot = Some((score, ordinal));
+            }
+        }
+        let mut files: Vec<ScoredFile<'_>> = best
+            .into_iter()
+            .zip(&self.paths)
+            .filter_map(|(slot, path)| {
+                slot.map(|(score, ordinal)| ScoredFile {
+                    path,
+                    ordinal,
+                    score,
+                })
+            })
+            .collect();
+        files.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| a.path.cmp(b.path))
+        });
+        files
+    }
+
+    /// Dot product of `query` with every row, in row order, split across worker threads. Empty when
+    /// `query` does not have `dims` components.
+    fn scores(&self, query: &[f32]) -> Vec<f32> {
+        let mut scores = vec![0.0f32; self.refs.len()];
+        if scores.is_empty() || query.len() != self.dims {
             return Vec::new();
         }
         let bytes_per = self.dims * 2;
@@ -603,57 +731,18 @@ impl VectorIndex {
             .map(|count| count.get())
             .unwrap_or(1)
             .clamp(1, MAX_SEARCH_WORKERS);
-        let per_worker = n.div_ceil(workers);
-        let vecs = &self.vecs;
-
-        let mut candidates: Vec<(f32, usize)> = std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..workers)
-                .filter_map(|worker| {
-                    let start = worker * per_worker;
-                    if start >= n {
-                        return None;
+        let per_worker = scores.len().div_ceil(workers);
+        std::thread::scope(|scope| {
+            for (worker, out) in scores.chunks_mut(per_worker).enumerate() {
+                let vecs = &self.vecs[worker * per_worker * bytes_per..];
+                scope.spawn(move || {
+                    for (score, vector) in out.iter_mut().zip(vecs.chunks_exact(bytes_per)) {
+                        *score = dot_f16(query, vector);
                     }
-                    let end = (start + per_worker).min(n);
-                    Some(scope.spawn(move || {
-                        let mut scored: Vec<(f32, usize)> = (start..end)
-                            .map(|row| {
-                                let slice = &vecs[row * bytes_per..(row + 1) * bytes_per];
-                                (dot_f16(query, slice), row)
-                            })
-                            .collect();
-                        if scored.len() > k {
-                            scored.select_nth_unstable_by(k - 1, |a, b| {
-                                b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal)
-                            });
-                            scored.truncate(k);
-                        }
-                        scored
-                    }))
-                })
-                .collect();
-            handles
-                .into_iter()
-                .flat_map(|handle| handle.join().expect("vector search worker panicked"))
-                .collect()
+                });
+            }
         });
-
-        candidates.sort_by(|a, b| {
-            b.0.partial_cmp(&a.0)
-                .unwrap_or(Ordering::Equal)
-                .then_with(|| self.path_of(a.1).cmp(self.path_of(b.1)))
-        });
-        candidates.truncate(k);
-        candidates
-            .into_iter()
-            .map(|(score, row)| {
-                let (path_id, ordinal) = self.refs[row];
-                ScoredChunk {
-                    path: self.paths[path_id as usize].clone(),
-                    ordinal,
-                    score,
-                }
-            })
-            .collect()
+        scores
     }
 
     fn path_of(&self, row: usize) -> &str {

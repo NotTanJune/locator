@@ -5,6 +5,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 
 use crate::db::Database;
+use crate::live_index::LiveIndex;
 use crate::scanner::{scan_root, ScanOptions};
 
 pub fn watch_root(root: impl AsRef<Path>) -> Result<()> {
@@ -15,13 +16,30 @@ pub fn watch_root(root: impl AsRef<Path>) -> Result<()> {
     println!("watching {} for lctr index refreshes", root.display());
     println!("press Ctrl-C to stop");
 
-    loop {
-        refresh_once(&root)?;
-        thread::sleep(Duration::from_secs(5));
+    let db_path = refresh_once(&root)?;
+    match LiveIndex::spawn(root.clone(), db_path) {
+        Ok(live) => {
+            let mut seen = live.generation();
+            loop {
+                thread::sleep(Duration::from_secs(1));
+                let current = live.generation();
+                if current != seen {
+                    seen = current;
+                    println!("applied file changes under {}", root.display());
+                }
+            }
+        }
+        Err(error) => {
+            println!("file watcher unavailable ({error:#}); polling every 5s instead");
+            loop {
+                thread::sleep(Duration::from_secs(5));
+                refresh_once(&root)?;
+            }
+        }
     }
 }
 
-fn refresh_once(root: &PathBuf) -> Result<()> {
+fn refresh_once(root: &PathBuf) -> Result<PathBuf> {
     let (db, db_path) = Database::open_for_scan_root(root)?;
     let stats = scan_root(
         &db,
@@ -37,5 +55,5 @@ fn refresh_once(root: &PathBuf) -> Result<()> {
         root.display(),
         db_path.display()
     );
-    Ok(())
+    Ok(db_path)
 }

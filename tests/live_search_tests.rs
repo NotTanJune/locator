@@ -53,3 +53,50 @@ fn live_search_honors_query_mode_filters_and_sorting() {
         vec!["alpha-report.pdf", "beta-report.md"]
     );
 }
+
+#[test]
+fn live_search_ignores_matches_in_the_root_path() {
+    let parent = tempdir().expect("parent");
+    let root = parent.path().join("needleroot");
+    std::fs::create_dir(&root).expect("create root");
+    for name in ["alpha.txt", "beta.md", "needle-note.txt"] {
+        std::fs::write(root.join(name), "x").expect("write file");
+    }
+
+    let results = search_live_with_options(&root, &SearchOptions::new("needle").with_limit(100))
+        .expect("live search succeeds");
+
+    assert_eq!(
+        results.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+        vec!["needle-note.txt"]
+    );
+}
+
+#[test]
+fn live_search_fuzzy_relevance_orders_by_score_not_modified_time() {
+    let root = tempdir().expect("root");
+    let best = root.path().join("abc.txt");
+    let weak = root.path().join("a_x_b_x_c.txt");
+    std::fs::write(&best, "x").expect("write best");
+    std::fs::write(&weak, "x").expect("write weak");
+    let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+    let new = old + std::time::Duration::from_secs(1_000_000);
+    std::fs::File::options()
+        .write(true)
+        .open(&best)
+        .and_then(|f| f.set_modified(old))
+        .expect("set old mtime");
+    std::fs::File::options()
+        .write(true)
+        .open(&weak)
+        .and_then(|f| f.set_modified(new))
+        .expect("set new mtime");
+
+    let options = SearchOptions::new("abc")
+        .with_mode(QueryMode::Fuzzy)
+        .with_sort(SortField::Relevance)
+        .with_limit(50);
+    let results = search_live_with_options(root.path(), &options).expect("live search succeeds");
+
+    assert_eq!(results.first().map(|r| r.name.as_str()), Some("abc.txt"));
+}

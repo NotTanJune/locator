@@ -82,7 +82,6 @@ pub struct ScanSummary<'a> {
     pub stats: &'a ScanStats,
     pub root: &'a Path,
     pub index_path: &'a Path,
-    pub staged: bool,
     pub detail: bool,
 }
 
@@ -332,11 +331,6 @@ fn render_summary_hero(area: Rect, buffer: &mut Buffer, summary: &ScanSummary<'_
     } else {
         0.0
     };
-    let index_mode = if summary.staged {
-        "search-ready index"
-    } else {
-        "updated index"
-    };
     let root = compact_path(&summary.root.display().to_string());
 
     let lines = vec![
@@ -356,7 +350,7 @@ fn render_summary_hero(area: Rect, buffer: &mut Buffer, summary: &ScanSummary<'_
             Span::styled(format!("{mb_per_second:.1} MB/s"), style_muted()),
         ]),
         Line::from(vec![
-            Span::styled(index_mode, style_accent()),
+            Span::styled("search-ready index", style_accent()),
             Span::styled(" for ", style_muted()),
             Span::raw(root),
         ]),
@@ -380,19 +374,12 @@ fn render_summary_hero(area: Rect, buffer: &mut Buffer, summary: &ScanSummary<'_
 }
 
 fn render_scan_flow(area: Rect, buffer: &mut Buffer, stats: &ScanStats) {
-    let optimize_known = stats
-        .profile
-        .fts_rebuild
-        .saturating_add(stats.profile.index_rebuild)
-        .saturating_add(stats.profile.stale_mark)
-        .saturating_add(stats.profile.trigger_recreate);
-    let finalize = stats.profile.cleanup.saturating_sub(optimize_known);
     let flow = Line::from(vec![
         Span::styled("[walk]", style_ok().add_modifier(Modifier::BOLD)),
         Span::styled(" -> ", style_muted()),
         Span::styled("[metadata]", style_ok().add_modifier(Modifier::BOLD)),
         Span::styled(" -> ", style_muted()),
-        Span::styled("[sqlite]", style_warn().add_modifier(Modifier::BOLD)),
+        Span::styled("[name file]", style_warn().add_modifier(Modifier::BOLD)),
         Span::styled(" -> ", style_muted()),
         Span::styled(
             "[search-ready index]",
@@ -404,17 +391,8 @@ fn render_scan_flow(area: Rect, buffer: &mut Buffer, stats: &ScanStats) {
         Line::from(vec![
             Span::styled("walk+metadata ", style_muted()),
             Span::raw(format_seconds(stats.profile.walk)),
-            Span::styled("   sqlite writes ", style_muted()),
-            Span::raw(format_seconds(stats.profile.sqlite_writes)),
-            Span::styled("   filename index ", style_muted()),
-            Span::raw(format_seconds(stats.profile.fts_rebuild)),
-            Span::styled("   sort/filter indexes ", style_muted()),
-            Span::raw(format_seconds(stats.profile.index_rebuild)),
-        ]),
-        Line::from(vec![
-            Span::styled("finish ", style_muted()),
-            Span::raw(format_seconds(finalize)),
-            Span::styled(" after the fast file walk; this is where lctr builds reusable filename and sort indexes", style_muted()),
+            Span::styled("   name file ", style_muted()),
+            Span::raw(format_seconds(stats.profile.name_file_write)),
         ]),
     ];
 
@@ -450,8 +428,7 @@ fn render_timing_chart(area: Rect, buffer: &mut Buffer, stats: &ScanStats) {
     let max_value = [
         stats.profile.discovery,
         stats.profile.walk,
-        stats.profile.sqlite_writes,
-        stats.profile.cleanup,
+        stats.profile.name_file_write,
     ]
     .into_iter()
     .map(|duration| duration.as_millis().max(1) as u64)
@@ -461,8 +438,8 @@ fn render_timing_chart(area: Rect, buffer: &mut Buffer, stats: &ScanStats) {
     let bars = [
         timing_bar("discover", stats.profile.discovery, style_accent()),
         timing_bar("walk", stats.profile.walk, style_ok()),
-        timing_bar("writes", stats.profile.sqlite_writes, style_warn()),
-        timing_bar("optimize", stats.profile.cleanup, style_accent()),
+        // A bar's label is cut to the bar width (8 columns), so it has to be short.
+        timing_bar("write", stats.profile.name_file_write, style_warn()),
     ];
     let chart = BarChart::default()
         .block(panel(" timing breakdown "))
@@ -573,63 +550,12 @@ fn render_profile_detail(area: Rect, buffer: &mut Buffer, stats: &ScanStats) {
 }
 
 fn render_optimizer_profile(area: Rect, buffer: &mut Buffer, stats: &ScanStats) {
-    let known = stats
-        .profile
-        .fts_rebuild
-        .saturating_add(stats.profile.index_rebuild)
-        .saturating_add(stats.profile.stale_mark)
-        .saturating_add(stats.profile.trigger_recreate);
-    let finalize = stats.profile.cleanup.saturating_sub(known);
-    let max_value = [
-        stats.profile.fts_rebuild,
-        stats.profile.index_rebuild,
-        stats.profile.stale_mark,
-        stats.profile.trigger_recreate,
-        finalize,
-    ]
-    .into_iter()
-    .map(|duration| duration.as_millis().max(1) as u64)
-    .max()
-    .unwrap_or(1);
-    let lines = vec![
-        metric_bar_line(
-            "filename index",
-            stats.profile.fts_rebuild.as_millis().max(1) as u64,
-            max_value,
-            format_seconds(stats.profile.fts_rebuild),
-            style_accent(),
-        ),
-        metric_bar_line(
-            "sort/filter",
-            stats.profile.index_rebuild.as_millis().max(1) as u64,
-            max_value,
-            format_seconds(stats.profile.index_rebuild),
-            style_ok(),
-        ),
-        metric_bar_line(
-            "stale cleanup",
-            stats.profile.stale_mark.as_millis().max(1) as u64,
-            max_value,
-            format_seconds(stats.profile.stale_mark),
-            style_warn(),
-        ),
-        metric_bar_line(
-            "triggers",
-            stats.profile.trigger_recreate.as_millis().max(1) as u64,
-            max_value,
-            format_seconds(stats.profile.trigger_recreate),
-            style_muted(),
-        ),
-        metric_bar_line(
-            "finalize",
-            finalize.as_millis().max(1) as u64,
-            max_value,
-            format_seconds(finalize),
-            style_text(),
-        ),
-    ];
+    let lines = vec![Line::from(vec![
+        Span::styled("name file ", style_muted()),
+        Span::raw(format_seconds(stats.profile.name_file_write)),
+    ])];
     Paragraph::new(lines)
-        .block(panel(" post-scan index build "))
+        .block(panel(" index write "))
         .style(style_text())
         .render(area, buffer);
 }

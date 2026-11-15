@@ -145,16 +145,14 @@ pub fn low_value_rule(
     home: Option<&Path>,
     has_manifest: &dyn Fn(&Path) -> bool,
 ) -> Option<&'static str> {
+    // Keeps app data out when the user scans home or a parent of it. A root chosen inside
+    // ~/Library (cloud storage, iCloud Drive) is the user's own documents, so it is kept.
     if let Some(home) = home {
-        if let Ok(under_home) = absolute.strip_prefix(home) {
-            if under_home
-                .components()
-                .next()
-                .and_then(|c| c.as_os_str().to_str())
-                == Some("Library")
-            {
-                return Some("home Library folder");
-            }
+        let library = home.join("Library");
+        if absolute.starts_with(&library)
+            && !relative_root(absolute, relative).starts_with(&library)
+        {
+            return Some("home Library folder");
         }
     }
 
@@ -211,7 +209,7 @@ pub fn low_value_rule(
     None
 }
 
-/// Directory that contains the scan root, given the file's absolute and relative paths.
+/// The scan root, given the file's absolute and relative paths.
 fn relative_root(absolute: &Path, relative: &Path) -> std::path::PathBuf {
     let mut root = absolute.to_path_buf();
     for _ in relative.components() {

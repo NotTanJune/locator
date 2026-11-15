@@ -177,3 +177,26 @@ fn database_search_rejects_semantic_mode_loudly() {
         .expect_err("semantic is not a SQL mode");
     assert!(error.to_string().contains("embed::search"), "{error}");
 }
+
+#[test]
+fn glob_negated_class_matches_anything_but_listed() {
+    let q = CompiledQuery::compile(QueryMode::Glob, "[!a]bc").expect("compile");
+    let mut scorer = QueryScorer::new();
+    assert!(q.is_match(&mut scorer, "xbc"));
+    assert!(!q.is_match(&mut scorer, "abc"));
+    assert!(q.is_match(&mut scorer, "!bc"));
+}
+
+#[test]
+fn fuzzy_positions_are_char_indices_for_decomposed_accents() {
+    let q = CompiledQuery::compile(QueryMode::Fuzzy, "notes").expect("compile");
+    let mut scorer = QueryScorer::new();
+    assert_eq!(
+        q.match_positions(&mut scorer, "cafe\u{301}-notes.txt"),
+        vec![6, 7, 8, 9, 10]
+    );
+    assert_eq!(
+        q.match_positions(&mut scorer, "notes.txt"),
+        vec![0, 1, 2, 3, 4]
+    );
+}

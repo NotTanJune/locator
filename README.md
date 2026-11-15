@@ -1,6 +1,6 @@
 # 🔍 locator
 
-`lctr` is a Rust-built local metadata search CLI/TUI. It stores local SQLite indexes for filenames, paths, file kinds, sizes, and dates. It does not upload data and does not index file contents.
+`lctr` is a Rust-built local metadata search CLI/TUI. It stores local indexes of filenames, paths, and file kinds, and reads sizes and dates from disk when it needs them. It does not upload data and does not index file contents.
 
 ## ✨ Demo
 
@@ -182,10 +182,11 @@ images) is 555 MB, downloaded when a scan finds images.
 
 `lctr` does not collect, upload, sell, or transmit any information from your machine. There is no account, telemetry, analytics, cloud sync, or background service.
 
-Indexes are local SQLite files. By default, a scan writes to the directory you scan:
+An index is two local files: `index.db`, a small SQLite file with your roots, open history, and recent changes, and `index.names`, a compressed list of every indexed path. By default, a scan writes them to the directory you scan:
 
 ```bash
-<ROOT>/.locator/index.sqlite
+<ROOT>/.locator/index.db
+<ROOT>/.locator/index.names
 ```
 
 When `lctr` writes an index into a `.locator` folder it also adds a `.gitignore` containing `*` there (older folders get it on the next scan), so a scanned git project never commits the index or the embeddings file (which holds short snippets of your text).
@@ -193,12 +194,12 @@ When `lctr` writes an index into a `.locator` folder it also adds a `.gitignore`
 If that location is not writable, `lctr` stores a fallback index in local app-support storage for your user account:
 
 ```bash
-~/Library/Application Support/locator/index.sqlite
+~/Library/Application Support/locator/index.db
 ```
 
-When you run `lctr search`, `lctr find`, or `lctr status`, locator first looks for the nearest `.locator/index.sqlite` in the current directory or its parents. If none exists, it uses the default app-support index.
+When you run `lctr search`, `lctr find`, or `lctr status`, locator first looks for the nearest `.locator/index.db` in the current directory or its parents. If none exists, it uses the default app-support index.
 
-The indexed data is metadata only: paths, filenames, extensions, roots, volumes, file kinds, sizes, and dates. `lctr` does not index file contents.
+The indexed data is metadata only: paths, filenames, file kinds, and the roots you scanned. Sizes and dates are read from the files when a result needs them. `lctr` does not index file contents.
 
 Delete an index whenever you want:
 
@@ -219,7 +220,7 @@ Scanner behavior is session-scoped, not a daemon. Common noisy files and directo
 Default scans are tuned for high-throughput local and external-drive indexing:
 
 ```bash
-lctr scan /Volumes/MyDrive --backend dirent --no-eta --stage-index --batch-size 500000 --writer-queue-batches 32 --native-workers 8 --native-output-batch-size 4096 --profile-detail
+lctr scan /Volumes/MyDrive --backend dirent --no-eta --native-workers 8 --native-output-batch-size 4096 --profile-detail
 ```
 
 Useful tuning options:
@@ -230,10 +231,12 @@ lctr scan ~/Documents --backend native
 lctr scan ~/Documents --backend dirent
 lctr scan ~/Documents --backend parallel
 lctr scan ~/Documents --eta
-lctr scan /Volumes/MyDrive --no-stage-index --no-profile-detail
+lctr scan /Volumes/MyDrive --no-profile-detail
 ```
 
-`--stage-index` builds a fresh SQLite database in app-support storage, then copies the finished index into `<ROOT>/.locator/index.sqlite`. If the root is read-only, the finished index stays in app-support fallback storage.
+A scan collects its rows in memory and writes the index once, when the walk ends, so a scan you stop leaves the old index as it was. `--stage-index`, `--no-stage-index`, `--batch-size`, and `--writer-queue-batches` are accepted for old scripts and do nothing. If the root is read-only, the index goes to app-support fallback storage.
+
+An index written by `lctr` 0.4 or earlier is converted the first time a newer `lctr` opens it, and the old `index.sqlite` file is removed.
 
 ### Shell Integration Internals
 
@@ -256,7 +259,7 @@ PowerShell:
 Invoke-Expression (& lctr shell-init powershell)
 ```
 
-With shell integration installed, `lctr scan ~/Documents` scans `~/Documents`, stores the index in `~/Documents/.locator/index.sqlite`, and moves your current shell into `~/Documents` after a successful scan. Plain `lctr scan ~/Documents` cannot change the parent shell directory without this integration.
+With shell integration installed, `lctr scan ~/Documents` scans `~/Documents`, stores the index in `~/Documents/.locator/index.db`, and moves your current shell into `~/Documents` after a successful scan. Plain `lctr scan ~/Documents` cannot change the parent shell directory without this integration.
 
 ### Shell Completions
 
@@ -346,8 +349,8 @@ Reproduce one normal slow scroll, then one fast wheel flick. Exit with `Ctrl-C`,
 | [sist2](https://github.com/sist2app/sist2) | Full file system indexing with media extraction | Web UI + CLI | SQLite or Elasticsearch search index | Yes, including OCR and archives | Docker on Windows, Linux, and macOS; executable path is Linux/WSL focused | `lctr` is lighter, terminal-native, and metadata-only |
 | [Cardinal](https://github.com/cardisoft/cardinal) | Fast macOS file search app | Native GUI | App-managed search index | Yes | macOS | `lctr` is CLI/TUI first and built for repeatable terminal workflows |
 | [fuz](https://github.com/Magnushhoie/fuz) | Fuzzy text, file, and folder search | Terminal fuzzy UI | Live toolchain over `fzf`, `rg`, and `bat` | Yes for text workflows | Shell environments with required tools | `lctr` persists a metadata index for fast repeated filename/path searches |
-| [Television](https://github.com/alexpasmantier/television) | General-purpose terminal fuzzy finder over configurable channels | TUI | Live channel commands and custom sources | Yes through text/content channels | Cross-platform | `lctr` is narrower and more self-contained: persistent directory-local SQLite indexes for filename/path metadata search, especially large folders and external drives |
-| [KatSearch](https://github.com/sveinbjornt/KatSearch) | macOS filesystem catalog search | Native GUI | No persistent index | No | macOS | `lctr` stores portable SQLite indexes and adds scriptable CLI output |
+| [Television](https://github.com/alexpasmantier/television) | General-purpose terminal fuzzy finder over configurable channels | TUI | Live channel commands and custom sources | Yes through text/content channels | Cross-platform | `lctr` is narrower and more self-contained: persistent directory-local indexes for filename/path metadata search, especially large folders and external drives |
+| [KatSearch](https://github.com/sveinbjornt/KatSearch) | macOS filesystem catalog search | Native GUI | No persistent index | No | macOS | `lctr` stores portable indexes and adds scriptable CLI output |
 | [File Find](https://github.com/Pixel-Master/File-Find) | Desktop file search utility | GUI | Cache-based search | Limited raw text search | macOS, Linux, Windows | `lctr` is lower-friction for terminal users and automation |
 | [fsindex](https://github.com/xandwr/fsindex) | Filesystem indexing library | Rust API | Library-managed index | Optional content/chunk features | Rust library | `lctr` is an end-user command, not an embedded library |
 | [WindFind](https://github.com/kingToolbox/WindFind) | Windows-first instant file location | CLI | Compact Windows-focused index | No | Windows | `lctr` aims to bring indexed search to a cross-platform CLI/TUI workflow |

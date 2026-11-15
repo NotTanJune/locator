@@ -25,7 +25,9 @@ use super::chunk::{
 };
 use super::runtime::{document_input, with_embedder, Embedder, EmbedderConfig};
 use super::skip::{detail_for_rule, dir_has_vendor_manifest, never_read_rule, sort_for_embedding};
-use super::store::{sidecar_path_for_index, EmbedStore, FileStamp, FileStatus, StoredChunk};
+use super::store::{
+    sidecar_path_for_index, EmbedStore, FileStamp, FileStatus, StoredChunk, VISION_MISSING_DETAIL,
+};
 use super::vector::truncate_and_normalize;
 use crate::db::{Database, EmbeddableFile};
 
@@ -91,7 +93,7 @@ impl Depth {
 
 #[derive(Debug, Clone)]
 pub struct PassRequest {
-    /// Final `index.sqlite`.
+    /// The index database file, `index.db` by default.
     pub index_path: PathBuf,
     /// Root as passed to scan; canonicalized inside.
     pub root: PathBuf,
@@ -308,6 +310,7 @@ pub fn run_pass_with_embedder(
         .into_iter()
         .filter_map(refresh_from_disk)
         .collect();
+    let index_roots = db.roots()?;
     drop(db);
 
     let sidecar = sidecar_path_for_index(&request.index_path);
@@ -315,7 +318,7 @@ pub fn run_pass_with_embedder(
     store.ensure_compatible(MODEL_ID, request.dims)?;
     let resumed = store.stats()?.files > 0;
     let active: Vec<String> = files.iter().map(|file| file.path.clone()).collect();
-    store.prune_to_active(&root_string, &active)?;
+    store.prune_to_active(&root_string, &active, &index_roots)?;
     store.set_complete(&root_string, false)?;
 
     // Stage by stage: every file gets stage 1 before any file gets stage 2, so the first results
@@ -326,15 +329,7 @@ pub fn run_pass_with_embedder(
     let rule_by_path: HashMap<String, &'static str> = files
         .iter()
         .filter_map(|file| {
-            let absolute = Path::new(&file.path);
-            let relative = absolute.strip_prefix(&root).unwrap_or(absolute);
-            never_read_rule(
-                relative,
-                absolute,
-                home.as_deref(),
-                &dir_has_vendor_manifest,
-            )
-            .map(|rule| (file.path.clone(), rule))
+            rule_for(&file.path, &root, home.as_deref()).map(|rule| (file.path.clone(), rule))
         })
         .collect();
     let stages = request.depth.stages();
@@ -356,6 +351,7 @@ pub fn run_pass_with_embedder(
                 // its chunks.
                 store.needs_embedding(&stamp, end_chunk)?
                     || (rule_by_path.contains_key(&file.path) && !store.is_skipped(&file.path)?)
+                    || (embedder.supports_images() && store.skipped_without_vision(&file.path)?)
             } else {
                 store.needs_deeper(&stamp, end_chunk)?
             };
@@ -461,7 +457,15 @@ pub fn run_pass_with_embedder(
     Ok(summary)
 }
 
-fn refresh_from_disk(file: EmbeddableFile) -> Option<EmbeddableFile> {
+/// The rule that keeps the file at `path` out of the pass unread, if any. `root` is the canonical
+/// scan root.
+pub(crate) fn rule_for(path: &str, root: &Path, home: Option<&Path>) -> Option<&'static str> {
+    let absolute = Path::new(path);
+    let relative = absolute.strip_prefix(root).unwrap_or(absolute);
+    never_read_rule(relative, absolute, home, &dir_has_vendor_manifest)
+}
+
+pub(crate) fn refresh_from_disk(file: EmbeddableFile) -> Option<EmbeddableFile> {
     // Follows symlinks, like the extractor does, so the stamp matches what gets read.
     let metadata = std::fs::metadata(&file.path).ok()?;
     if !metadata.is_file() {
@@ -905,7 +909,7 @@ impl EmbedState {
                             index,
                             FileStatus::Skipped,
                             Vec::new(),
-                            Some("vision model not installed".to_string()),
+                            Some(VISION_MISSING_DETAIL.to_string()),
                             "image",
                         ),
                     );

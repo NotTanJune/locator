@@ -52,7 +52,12 @@ pub mod theme;
 use theme::Theme;
 
 const TUI_RESULT_LIMIT: usize = usize::MAX;
+/// Semantic hits are ranked, stat'd and given snippets one by one, so the TUI asks for a
+/// page instead of the whole embedded corpus.
+const TUI_SEMANTIC_RESULT_LIMIT: usize = 300;
 const NAVIGATION_BURST_WINDOW: Duration = Duration::from_millis(50);
+/// Time the loop spends applying search updates before it yields to keyboard input.
+const RESULT_DRAIN_BUDGET: Duration = Duration::from_millis(4);
 const FRAGMENTED_ESCAPE_WINDOW: Duration = Duration::from_millis(50);
 const INPUT_DRAIN_LIMIT: usize = 4096;
 const INPUT_DRAIN_BUDGET: Duration = Duration::from_millis(5);
@@ -66,8 +71,11 @@ pub(crate) enum Focus {
     Results,
 }
 
+/// Collapses wheel bursts sent as arrow keys to one move per `NAVIGATION_BURST_WINDOW`
+/// while a held key (OS repeat every 25 to 40 ms) still moves at that steady rate.
 #[derive(Default)]
 struct NavigationBurst {
+    /// The key last accepted and the earliest time the same key is accepted again.
     last: Option<(KeyCode, Instant)>,
 }
 
@@ -77,14 +85,22 @@ impl NavigationBurst {
     }
 
     fn accepts(&mut self, code: KeyCode, now: Instant) -> bool {
-        if let Some((last_code, last_at)) = self.last {
-            if last_code == code && now.duration_since(last_at) < NAVIGATION_BURST_WINDOW {
-                self.last = Some((code, now));
-                return false;
+        let next_at = match self.last {
+            Some((last_code, next_at)) if last_code == code => {
+                if now < next_at {
+                    return false;
+                }
+                // Step on a fixed grid while the key is held, so a repeat that lands just
+                // after the window is not pushed back a whole window.
+                if now < next_at + NAVIGATION_BURST_WINDOW {
+                    next_at + NAVIGATION_BURST_WINDOW
+                } else {
+                    now + NAVIGATION_BURST_WINDOW
+                }
             }
-        }
-
-        self.last = Some((code, now));
+            _ => now + NAVIGATION_BURST_WINDOW,
+        };
+        self.last = Some((code, next_at));
         true
     }
 }
@@ -630,6 +646,32 @@ fn is_quit_key(key: KeyEvent) -> bool {
                 && key.modifiers.contains(KeyModifiers::CONTROL)))
 }
 
+/// Poll briefly while results stream in or Finder is revealing, so batches show promptly.
+fn input_poll_timeout(busy: bool) -> Duration {
+    if busy {
+        ACTIVE_POLL_INTERVAL
+    } else {
+        IDLE_POLL_INTERVAL
+    }
+}
+
+/// Hands queued search updates to `apply` until the queue is empty or `budget` has passed, so a
+/// broad query cannot starve keyboard input. `apply` returns false for an update from a
+/// superseded request; those are dropped and never end the drain, so one accepted update is
+/// always applied when it is queued.
+fn drain_search_updates(
+    worker: &mut SearchWorker,
+    budget: Duration,
+    mut apply: impl FnMut(SearchUpdate) -> bool,
+) {
+    let started = Instant::now();
+    while let Some(update) = worker.try_recv() {
+        if apply(update) && started.elapsed() >= budget {
+            break;
+        }
+    }
+}
+
 fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     search_backend: SearchBackend,
@@ -640,6 +682,8 @@ fn run_loop(
     let mut result_paths = HashSet::new();
     let mut reset_pending = false;
     let mut selection_anchor: Option<String> = None;
+    // Whether `results` came from a semantic search, so only those show semantic details.
+    let mut results_semantic = false;
     let mut results_stamp: u64 = 0;
     let mut row_cache = RowCache::empty();
     let mut selected = TableState::default();
@@ -709,11 +753,7 @@ fn run_loop(
             needs_draw = true;
         }
 
-        // Yield to keyboard input even when a broad query keeps producing batches.
-        for _ in 0..8 {
-            let Some(update) = search_worker.try_recv() else {
-                break;
-            };
+        drain_search_updates(&mut search_worker, RESULT_DRAIN_BUDGET, |update| {
             let query = input.as_str();
             match update {
                 SearchUpdate::Reset {
@@ -733,22 +773,15 @@ fn run_loop(
                     results: batch,
                     count,
                 } if search_state.accepts_update(request_id, query, &options) => {
-                    let current_anchor = selected_path(&selected, &results)
-                        .map(str::to_string)
-                        .or_else(|| selection_anchor.clone());
-                    if reset_pending {
-                        results.clear();
-                        result_paths.clear();
-                        selected.select(None);
-                        reset_pending = false;
-                    }
-                    for result in batch {
-                        if result_paths.insert(result.path.clone()) {
-                            results.push(result);
-                        }
-                    }
-                    restore_selection_by_path(&mut selected, &results, current_anchor.as_deref());
-                    selection_anchor = None;
+                    apply_result_batch(
+                        &mut results,
+                        &mut result_paths,
+                        &mut selected,
+                        &mut selection_anchor,
+                        std::mem::take(&mut reset_pending),
+                        batch,
+                    );
+                    results_semantic = request_is_semantic(&options);
                     results_stamp = results_stamp.wrapping_add(1);
                     loading_query = Some(options.query.clone());
                     status = format!("{} results, searching…", format_count(count));
@@ -761,24 +794,18 @@ fn run_loop(
                     final_results,
                     live_backfill,
                 } if search_state.accepts_update(request_id, query, &options) => {
-                    let current_anchor = selected_path(&selected, &results)
-                        .map(str::to_string)
-                        .or_else(|| selection_anchor.clone());
-                    if let Some(final_results) = final_results {
-                        results.clear();
-                        result_paths.clear();
-                        for result in final_results {
-                            if result_paths.insert(result.path.clone()) {
-                                results.push(result);
-                            }
-                        }
-                    } else if reset_pending {
-                        results.clear();
-                        result_paths.clear();
-                    }
+                    let replace = final_results.is_some() || reset_pending;
+                    apply_result_batch(
+                        &mut results,
+                        &mut result_paths,
+                        &mut selected,
+                        &mut selection_anchor,
+                        replace,
+                        final_results.unwrap_or_default(),
+                    );
                     reset_pending = false;
-                    restore_selection_by_path(&mut selected, &results, current_anchor.as_deref());
                     selection_anchor = None;
+                    results_semantic = request_is_semantic(&options);
                     results_stamp = results_stamp.wrapping_add(1);
                     loading_query = None;
                     next_spinner_deadline = Instant::now();
@@ -802,14 +829,15 @@ fn run_loop(
                     status = error;
                     needs_draw = true;
                 }
-                _ => {}
+                _ => return false,
             }
-        }
+            true
+        });
 
         let query = input.as_str();
+        loading_query = still_loading(loading_query.take(), query);
         if search_state.should_auto_submit(query, backend_label, last_edit.elapsed()) {
-            let options = tui_search_options(query)
-                .with_mode(mode)
+            let options = tui_search_options(query, mode)
                 .with_sort(sort)
                 .with_reverse(reverse)
                 .with_filters(filters.clone());
@@ -832,8 +860,7 @@ fn run_loop(
                 live_generation = current;
                 let query = input.as_str();
                 if should_show_results(query) {
-                    let options = tui_search_options(query)
-                        .with_mode(mode)
+                    let options = tui_search_options(query, mode)
                         .with_sort(sort)
                         .with_reverse(reverse)
                         .with_filters(filters.clone());
@@ -881,10 +908,8 @@ fn run_loop(
                     && preview_requested.as_deref() != Some(path.as_str())
                     && preview_pending_since.elapsed() >= PREVIEW_DEBOUNCE
                 {
-                    preview_worker
-                        .tx
-                        .send(path.clone())
-                        .context("request preview")?;
+                    // A dead preview worker costs the preview pane, not the session.
+                    let _ = preview_worker.tx.send(path.clone());
                     preview_requested = Some(path.clone());
                 }
             }
@@ -911,18 +936,16 @@ fn run_loop(
 
                 let query = input.as_str();
                 let has_detail = frame.area().height >= 20;
-                let detail_rows = {
-                    let semantic_details = search_worker.semantic_details();
-                    let semantic_map = semantic_details
-                        .lock()
-                        .unwrap_or_else(|poison| poison.into_inner());
-                    let selected_path = selected
-                        .selected()
-                        .and_then(|index| results.get(index))
-                        .map(|result| result.path.as_str());
-                    let has_hit = selected_has_semantic_hit(&semantic_map, selected_path);
-                    detail_height(frame.area().height, has_hit)
-                };
+                let semantic_details = search_worker.semantic_details();
+                let semantic_map = semantic_details
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner());
+                let selected_hit = semantic_hit(
+                    &semantic_map,
+                    results_semantic,
+                    selected_path(&selected, &results),
+                );
+                let detail_rows = detail_height(frame.area().height, selected_hit.is_some());
                 let top_args = TopPanelArgs {
                     query,
                     root_label: &root_label,
@@ -1020,23 +1043,27 @@ fn run_loop(
                 } else {
                     Style::default().fg(theme.muted)
                 };
-                let search_panel = Paragraph::new(search_bar_line(&top_args)).block(
-                    Block::default()
-                        .title("search")
-                        .title_style(
-                            Style::default()
-                                .fg(theme.accent)
-                                .add_modifier(Modifier::BOLD),
-                        )
-                        .borders(Borders::ALL)
-                        .border_type(BorderType::Rounded)
-                        .border_style(search_border_style)
-                        .style(Style::default().bg(theme.panel_bg)),
-                );
+                let (search_scroll, cursor_x) =
+                    search_bar_scroll(&input, top_chunks[1].width.saturating_sub(2));
+                let search_panel = Paragraph::new(search_bar_line(&top_args))
+                    .scroll((0, search_scroll))
+                    .block(
+                        Block::default()
+                            .title("search")
+                            .title_style(
+                                Style::default()
+                                    .fg(theme.accent)
+                                    .add_modifier(Modifier::BOLD),
+                            )
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded)
+                            .border_style(search_border_style)
+                            .style(Style::default().bg(theme.panel_bg)),
+                    );
                 frame.render_widget(search_panel, top_chunks[1]);
                 if search_focused {
                     frame.set_cursor_position(Position {
-                        x: top_chunks[1].x + 1 + input.cursor_column() as u16,
+                        x: top_chunks[1].x + 1 + cursor_x,
                         y: top_chunks[1].y + 1,
                     });
                 }
@@ -1211,18 +1238,11 @@ fn run_loop(
                     for line in detail_text.lines {
                         detail_lines.push(line);
                     }
-                    let semantic_details = search_worker.semantic_details();
-                    let semantic_map = semantic_details
-                        .lock()
-                        .unwrap_or_else(|poison| poison.into_inner());
-                    if let Some(result) = selected.selected().and_then(|index| results.get(index)) {
-                        detail_lines.extend(semantic_detail_lines(
-                            &result.path,
-                            &semantic_map,
-                            &theme,
-                            usize::from(chunks[2].width),
-                        ));
-                    }
+                    detail_lines.extend(semantic_detail_lines(
+                        selected_hit,
+                        &theme,
+                        usize::from(chunks[2].width),
+                    ));
                     let detail = Paragraph::new(detail_lines)
                         .style(Style::default().fg(theme.muted))
                         .wrap(Wrap { trim: false })
@@ -1245,11 +1265,7 @@ fn run_loop(
         let finder_pending = finder_reveal.reveal_pending();
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64", not(test))))]
         let finder_pending = false;
-        let poll_timeout = if APPLE_SILICON && (loading_query.is_some() || finder_pending) {
-            ACTIVE_POLL_INTERVAL
-        } else {
-            IDLE_POLL_INTERVAL
-        };
+        let poll_timeout = input_poll_timeout(loading_query.is_some() || finder_pending);
         let Some(event) = read_normalized_input(
             &mut input_normalizer,
             &mut input_trace,
@@ -1278,6 +1294,9 @@ fn run_loop(
                         results.len(),
                         initial_delta,
                     )?;
+                    if changed {
+                        selection_anchor = selected_path(&selected, &results).map(str::to_string);
+                    }
                     needs_draw |= changed;
                 }
             }
@@ -1316,6 +1335,7 @@ fn run_loop(
                 }
             }
             needs_draw = true;
+            let selection_before = selected.selected();
             match focus {
                 Focus::Search => match key.code {
                     KeyCode::Backspace if input.backspace() => {
@@ -1366,8 +1386,7 @@ fn run_loop(
                                 }
                             }
                         } else if live_backfill && should_show_results(query) {
-                            let options = tui_search_options(query)
-                                .with_mode(mode)
+                            let options = tui_search_options(query, mode)
                                 .with_sort(sort)
                                 .with_reverse(reverse)
                                 .with_filters(filters.clone());
@@ -1535,6 +1554,10 @@ fn run_loop(
                     }
                     _ => {}
                 },
+            }
+            // A row picked by hand while a re-search streams in becomes the row to keep.
+            if selected.selected() != selection_before {
+                selection_anchor = selected_path(&selected, &results).map(str::to_string);
             }
             if !APPLE_SILICON {
                 if let Some(code) = navigation_code {
@@ -1989,13 +2012,24 @@ fn search_worker_loop(
                             if let Ok(compiled) =
                                 CompiledQuery::compile(options.mode, &options.query)
                             {
+                                let frecency = if options.sort == SortField::Relevance {
+                                    open_search_reader(&db_path)
+                                        .map(|db| {
+                                            db.frecency_for_paths(
+                                                final_results.iter().map(|r| r.path.as_str()),
+                                            )
+                                        })
+                                        .unwrap_or_default()
+                                } else {
+                                    HashMap::new()
+                                };
                                 let mut scorer = QueryScorer::new();
                                 sort_results_compiled(
                                     &mut final_results,
                                     &options,
                                     &compiled,
                                     &mut scorer,
-                                    &HashMap::new(),
+                                    &frecency,
                                 );
                             }
                             let count = final_results.len();
@@ -2046,12 +2080,11 @@ fn semantic_detail_map(hits: &[SemanticHit]) -> HashMap<String, (f32, String)> {
 
 /// Two detail lines for a file that has a semantic hit. Nothing for other files.
 fn semantic_detail_lines(
-    path: &str,
-    details: &HashMap<String, (f32, String)>,
+    hit: Option<&(f32, String)>,
     theme: &Theme,
     width: usize,
 ) -> Vec<Line<'static>> {
-    let Some((score, snippet)) = details.get(path) else {
+    let Some((score, snippet)) = hit else {
         return Vec::new();
     };
     let label = "match ";
@@ -2081,12 +2114,16 @@ fn detail_height(frame_height: u16, has_semantic_hit: bool) -> u16 {
     }
 }
 
-/// True when the selected path has a semantic hit entry.
-fn selected_has_semantic_hit(
-    details: &HashMap<String, (f32, String)>,
+/// The semantic hit for the selected path. The map keeps the last semantic search's hits after
+/// the user switches to a filename mode, so it is read only for semantic results.
+fn semantic_hit<'a>(
+    details: &'a HashMap<String, (f32, String)>,
+    results_semantic: bool,
     selected_path: Option<&str>,
-) -> bool {
-    selected_path.is_some_and(|path| details.contains_key(path))
+) -> Option<&'a (f32, String)> {
+    selected_path
+        .filter(|_| results_semantic)
+        .and_then(|path| details.get(path))
 }
 
 /// Collapses whitespace and cuts to `max_chars` characters, ending with an ellipsis when cut.
@@ -2259,8 +2296,19 @@ fn should_show_results(query: &str) -> bool {
     query.chars().filter(|ch| ch.is_alphanumeric()).count() >= 2
 }
 
-fn tui_search_options(query: &str) -> SearchOptions {
-    SearchOptions::new(query).with_limit(TUI_RESULT_LIMIT)
+fn tui_search_options(query: &str, mode: QueryMode) -> SearchOptions {
+    let limit = if mode == QueryMode::Semantic {
+        TUI_SEMANTIC_RESULT_LIMIT
+    } else {
+        TUI_RESULT_LIMIT
+    };
+    SearchOptions::new(query).with_mode(mode).with_limit(limit)
+}
+
+/// The query still shown as loading. A query edited below two searchable characters gets no
+/// new search and rejects the in-flight completion, so nothing else would clear it.
+fn still_loading(loading_query: Option<String>, query: &str) -> Option<String> {
+    loading_query.filter(|_| should_show_results(query))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2274,8 +2322,9 @@ impl SearchInput {
         self.text.as_str()
     }
 
+    /// Terminal cells before the cursor. Wide glyphs (CJK, most emoji) take two.
     fn cursor_column(&self) -> usize {
-        self.text[..self.cursor].chars().count()
+        Line::from(&self.text[..self.cursor]).width()
     }
 
     fn insert(&mut self, ch: char) {
@@ -2440,7 +2489,10 @@ impl PreviewWorker {
                 while let Ok(newer) = requests.try_recv() {
                     path = newer;
                 }
-                let preview = render(&path);
+                // A decoder panic must not kill the worker and with it every later preview.
+                let preview =
+                    crate::panic_guard::catch_quiet(std::panic::AssertUnwindSafe(|| render(&path)))
+                        .unwrap_or_else(|_| Preview::Info(vec![Line::from("preview failed")]));
                 if responses.send((path, preview)).is_err() {
                     break;
                 }
@@ -2488,7 +2540,10 @@ fn render_preview(frame: &mut Frame, area: Rect, state: &mut PreviewState, theme
 
     match &mut state.render {
         PreviewRender::Lines(lines) => {
-            let paragraph = Paragraph::new(lines.clone()).style(Style::default().fg(theme.text));
+            // Clone only the rows that fit; the pane does not wrap.
+            let visible = lines.iter().take(usize::from(inner.height)).cloned();
+            let paragraph =
+                Paragraph::new(visible.collect::<Vec<_>>()).style(Style::default().fg(theme.text));
             frame.render_widget(paragraph, inner);
         }
         PreviewRender::Image(protocol) => {
@@ -2882,6 +2937,14 @@ fn top_status_line(args: &TopPanelArgs<'_>) -> Line<'static> {
     ])
 }
 
+/// Horizontal scroll and cursor column, in cells, that keep the cursor inside a search box
+/// `width` cells wide, so the end of a long query stays in view while typing.
+fn search_bar_scroll(input: &SearchInput, width: u16) -> (u16, u16) {
+    let cursor = u16::try_from(input.cursor_column()).unwrap_or(u16::MAX);
+    let scroll = cursor.saturating_sub(width.saturating_sub(1));
+    (scroll, cursor - scroll)
+}
+
 fn search_bar_line(args: &TopPanelArgs<'_>) -> Line<'static> {
     if args.query.is_empty() {
         Line::from(Span::styled(
@@ -3041,6 +3104,34 @@ fn restore_selection_by_path(
         }
     }
     normalize_selection(state, results.len());
+}
+
+/// Adds a batch for the active request; `replace` drops the rows of the previous search first.
+/// The selection follows `selection_anchor` (the path selected at the Reset) and the anchor is
+/// kept until its row arrives, so a row past the first batch is not lost to a provisional row.
+fn apply_result_batch(
+    results: &mut Vec<SearchResult>,
+    result_paths: &mut HashSet<String>,
+    selected: &mut TableState,
+    selection_anchor: &mut Option<String>,
+    replace: bool,
+    batch: Vec<SearchResult>,
+) {
+    let anchor = selection_anchor
+        .clone()
+        .or_else(|| selected_path(selected, results).map(str::to_string));
+    if replace {
+        clear_results(results, result_paths, selected);
+    }
+    for result in batch {
+        if result_paths.insert(result.path.clone()) {
+            results.push(result);
+        }
+    }
+    restore_selection_by_path(selected, results, anchor.as_deref());
+    if selected_path(selected, results) == selection_anchor.as_deref() {
+        *selection_anchor = None;
+    }
 }
 
 fn format_count(count: usize) -> String {
@@ -3271,8 +3362,10 @@ mod tests {
         FRAGMENTED_ESCAPE_WINDOW, TUI_RESULT_LIMIT,
     };
     use crate::tui::{
-        detail_height, request_is_semantic, selected_has_semantic_hit, semantic_detail_lines,
-        semantic_detail_map, SearchUpdate,
+        apply_result_batch, detail_height, drain_search_updates, input_poll_timeout,
+        request_is_semantic, search_bar_scroll, semantic_detail_lines, semantic_detail_map,
+        semantic_hit, still_loading, PreviewWorker, SearchUpdate, ACTIVE_POLL_INTERVAL,
+        TUI_SEMANTIC_RESULT_LIMIT,
     };
     use ratatui::text::Line;
     use ratatui::widgets::TableState;
@@ -3529,7 +3622,10 @@ mod tests {
 
     #[test]
     fn tui_search_options_use_larger_result_limit() {
-        assert_eq!(tui_search_options("archive").limit, TUI_RESULT_LIMIT);
+        assert_eq!(
+            tui_search_options("archive", QueryMode::Contains).limit,
+            TUI_RESULT_LIMIT
+        );
         assert!(TUI_RESULT_LIMIT > SearchOptions::new("archive").limit);
     }
 
@@ -3999,8 +4095,271 @@ mod tests {
         assert!(burst.accepts(KeyCode::Down, start));
         assert!(!burst.accepts(KeyCode::Down, start + Duration::from_millis(3)));
         assert!(!burst.accepts(KeyCode::Down, start + Duration::from_millis(49)));
-        assert!(!burst.accepts(KeyCode::Down, start + Duration::from_millis(50)));
+        assert!(burst.accepts(KeyCode::Down, start + Duration::from_millis(50)));
+        assert!(!burst.accepts(KeyCode::Down, start + Duration::from_millis(60)));
         assert!(burst.accepts(KeyCode::Down, start + Duration::from_millis(100)));
+    }
+
+    #[test]
+    fn navigation_burst_moves_a_held_key_at_a_steady_rate() {
+        for repeat_ms in [25u64, 33, 40] {
+            let start = Instant::now();
+            let mut burst = NavigationBurst::default();
+            let accepted = (0..)
+                .map(|n| n * repeat_ms)
+                .take_while(|&at| at < 1_000)
+                .filter(|&at| burst.accepts(KeyCode::Down, start + Duration::from_millis(at)))
+                .count();
+            assert!(
+                (19..=21).contains(&accepted),
+                "{repeat_ms} ms repeat: {accepted} moves in 1 s"
+            );
+        }
+    }
+
+    fn numbered_results(count: usize) -> Vec<SearchResult> {
+        (0..count)
+            .map(|index| test_result(&format!("file-{index:04}.txt"), "text", Some("txt"), 1))
+            .collect()
+    }
+
+    #[test]
+    fn selection_past_the_first_batch_survives_a_re_search() {
+        let full = numbered_results(1_000);
+        let mut results = full.clone();
+        let mut result_paths: HashSet<String> = full.iter().map(|r| r.path.clone()).collect();
+        let mut selected = TableState::default();
+        selected.select(Some(700));
+        // What the Reset handler records.
+        let mut anchor = Some(full[700].path.clone());
+
+        apply_result_batch(
+            &mut results,
+            &mut result_paths,
+            &mut selected,
+            &mut anchor,
+            true,
+            full[..500].to_vec(),
+        );
+        assert_eq!(selected.selected(), Some(0));
+        assert_eq!(anchor.as_deref(), Some(full[700].path.as_str()));
+
+        apply_result_batch(
+            &mut results,
+            &mut result_paths,
+            &mut selected,
+            &mut anchor,
+            false,
+            full[500..].to_vec(),
+        );
+        assert_eq!(selected.selected(), Some(700));
+        assert_eq!(anchor, None);
+    }
+
+    #[test]
+    fn selection_moved_by_hand_during_a_re_search_is_kept() {
+        let full = numbered_results(1_000);
+        let mut results = full.clone();
+        let mut result_paths: HashSet<String> = full.iter().map(|r| r.path.clone()).collect();
+        let mut selected = TableState::default();
+        selected.select(Some(700));
+        let mut anchor = Some(full[700].path.clone());
+        apply_result_batch(
+            &mut results,
+            &mut result_paths,
+            &mut selected,
+            &mut anchor,
+            true,
+            full[..500].to_vec(),
+        );
+
+        // What run_loop does when a key moves the selection.
+        selected.select(Some(3));
+        anchor = Some(results[3].path.clone());
+        apply_result_batch(
+            &mut results,
+            &mut result_paths,
+            &mut selected,
+            &mut anchor,
+            false,
+            full[500..].to_vec(),
+        );
+        assert_eq!(selected.selected(), Some(3));
+    }
+
+    #[test]
+    fn stale_updates_do_not_use_up_the_drain_budget() {
+        let dir = tempdir().expect("temp dir");
+        let mut worker = SearchWorker::spawn(SearchBackend::Live {
+            root: dir.path().to_path_buf(),
+        })
+        .expect("worker spawns");
+        for request_id in [1, 2, 3, 4, 5, 6, 7, 8, 9, 100, 100] {
+            worker
+                .result_tx
+                .send(SearchUpdate::Reset {
+                    request_id,
+                    options: SearchOptions::new("needle"),
+                })
+                .unwrap();
+        }
+        let applied = std::cell::Cell::new(0);
+        let apply = |update| {
+            let accepted = matches!(
+                update,
+                SearchUpdate::Reset {
+                    request_id: 100,
+                    ..
+                }
+            );
+            applied.set(applied.get() + usize::from(accepted));
+            accepted
+        };
+        // A spent budget still applies one accepted update, after skipping every stale one.
+        drain_search_updates(&mut worker, Duration::ZERO, apply);
+        assert_eq!(applied.get(), 1);
+        drain_search_updates(&mut worker, Duration::ZERO, apply);
+        assert_eq!(applied.get(), 2);
+    }
+
+    #[test]
+    fn input_polls_quickly_while_loading_on_every_platform() {
+        assert_eq!(input_poll_timeout(true), ACTIVE_POLL_INTERVAL);
+        assert_eq!(input_poll_timeout(false), super::IDLE_POLL_INTERVAL);
+    }
+
+    #[test]
+    fn hybrid_final_order_keeps_the_frecency_boost() {
+        let dir = tempdir().expect("temp dir");
+        let root = dir.path().canonicalize().expect("canonical root");
+        let db_path = root.join("index.sqlite");
+        let accessed = root.join("a-notes.txt");
+        let newer = root.join("b-notes.txt");
+        std::fs::write(&accessed, b"a").expect("write accessed file");
+        thread::sleep(Duration::from_millis(1_100));
+        std::fs::write(&newer, b"b").expect("write newer file");
+
+        let db = Database::open(&db_path).expect("open database");
+        let root_string = root.to_string_lossy().to_string();
+        for path in [&accessed, &newer] {
+            let modified_at = std::fs::metadata(path)
+                .and_then(|meta| meta.modified())
+                .ok()
+                .map(chrono::DateTime::<Utc>::from);
+            db.upsert_file(&FileRecord {
+                path: path.to_string_lossy().to_string(),
+                name: path.file_name().unwrap().to_string_lossy().to_string(),
+                parent: root_string.clone(),
+                extension: Some("txt".to_string()),
+                root: root_string.clone(),
+                volume: "local".to_string(),
+                kind: "text".to_string(),
+                size_bytes: 1,
+                created_at: None,
+                modified_at,
+            })
+            .expect("insert indexed row");
+        }
+        for _ in 0..5 {
+            db.record_access(&accessed.to_string_lossy())
+                .expect("record access");
+        }
+        drop(db);
+
+        let mut worker =
+            SearchWorker::spawn(SearchBackend::Hybrid { db_path, root }).expect("worker spawns");
+        worker
+            .submit(SearchRequest {
+                options: SearchOptions::new("notes"),
+            })
+            .expect("request sends");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let final_order = loop {
+            assert!(Instant::now() < deadline, "hybrid worker did not complete");
+            match worker.rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(SearchUpdate::Complete {
+                    final_results: Some(results),
+                    ..
+                }) => break results.into_iter().map(|r| r.name).collect::<Vec<_>>(),
+                Ok(SearchUpdate::Error { error, .. }) => panic!("hybrid search failed: {error}"),
+                Ok(_) | Err(_) => {}
+            }
+        };
+        assert_eq!(final_order, vec!["a-notes.txt", "b-notes.txt"]);
+    }
+
+    #[test]
+    fn preview_worker_survives_a_render_panic() {
+        let worker = PreviewWorker::spawn_with(|path| {
+            if path == "bad" {
+                panic!("injected preview panic");
+            }
+            crate::preview::Preview::Info(vec![Line::from("ok")])
+        });
+        worker.tx.send("bad".into()).unwrap();
+        let (path, preview) = worker.rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(path, "bad");
+        let crate::preview::Preview::Info(lines) = preview else {
+            panic!("expected an info preview");
+        };
+        assert_eq!(line_text(&lines[0]), "preview failed");
+
+        worker.tx.send("good".into()).expect("worker still listens");
+        let (path, _) = worker
+            .rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker still renders");
+        assert_eq!(path, "good");
+    }
+
+    #[test]
+    fn semantic_details_are_hidden_for_filename_results() {
+        let theme = Theme::load_with_default("default");
+        let mut details = HashMap::new();
+        details.insert(
+            "/docs/q3.xlsx".to_string(),
+            (0.83_f32, "quarterly budget".to_string()),
+        );
+        let hit = semantic_hit(&details, false, Some("/docs/q3.xlsx"));
+        assert!(hit.is_none());
+        assert!(semantic_detail_lines(hit, &theme, 80).is_empty());
+        assert_eq!(detail_height(36, hit.is_some()), 4);
+        assert!(semantic_hit(&details, true, Some("/docs/q3.xlsx")).is_some());
+    }
+
+    #[test]
+    fn loading_ends_when_the_query_drops_below_two_characters() {
+        assert_eq!(still_loading(Some("ab".to_string()), "a"), None);
+        assert_eq!(still_loading(Some("ab".to_string()), ""), None);
+        assert_eq!(
+            still_loading(Some("ab".to_string()), "abc"),
+            Some("ab".to_string())
+        );
+    }
+
+    #[test]
+    fn search_cursor_uses_display_width_and_stays_inside_the_box() {
+        let mut input = SearchInput::default();
+        input.insert('日');
+        input.insert('本');
+        assert_eq!(input.cursor_column(), 4);
+        assert_eq!(search_bar_scroll(&input, 20), (0, 4));
+
+        let mut long = SearchInput::default();
+        for _ in 0..30 {
+            long.insert('a');
+        }
+        assert_eq!(search_bar_scroll(&long, 10), (21, 9));
+        long.move_left();
+        long.move_left();
+        assert_eq!(search_bar_scroll(&long, 10), (19, 9));
+    }
+
+    #[test]
+    fn semantic_requests_ask_for_a_bounded_page() {
+        let options = tui_search_options("budget", QueryMode::Semantic);
+        assert_eq!(options.mode, QueryMode::Semantic);
+        assert_eq!(options.limit, TUI_SEMANTIC_RESULT_LIMIT);
     }
 
     #[test]
@@ -4036,10 +4395,12 @@ mod tests {
         let db = Database::open(&db_path).expect("create db");
         let root = dir.path().canonicalize().expect("canonical root");
         let root_string = root.to_string_lossy().to_string();
-        db.mark_scan_started(&root_string, 10)
-            .expect("mark started");
-        db.mark_scan_completed(&root_string, 10)
-            .expect("mark complete");
+        db.install_scan(
+            &root_string,
+            crate::name_file::NameFileBuilder::default(),
+            10,
+        )
+        .expect("install scan");
 
         let backend = search_backend_for_directory(dir.path()).expect("backend resolves");
 
@@ -4059,8 +4420,20 @@ mod tests {
         let db = Database::open(&db_path).expect("create db");
         let root = dir.path().canonicalize().expect("canonical root");
         let root_string = root.to_string_lossy().to_string();
-        db.mark_scan_started(&root_string, 10)
-            .expect("mark started");
+        // A root that only has changes written by the watcher is incomplete.
+        db.upsert_file(&FileRecord {
+            path: root.join("one.txt").to_string_lossy().to_string(),
+            name: "one.txt".to_string(),
+            parent: root_string.clone(),
+            extension: Some("txt".to_string()),
+            root: root_string.clone(),
+            volume: "local".to_string(),
+            kind: "text".to_string(),
+            size_bytes: 0,
+            created_at: None,
+            modified_at: None,
+        })
+        .expect("register incomplete root");
 
         let backend = search_backend_for_directory(dir.path()).expect("backend resolves");
 
@@ -4124,7 +4497,7 @@ mod tests {
             "/docs/budget.txt".to_string(),
             (0.8312_f32, "quarterly budget".to_string()),
         );
-        let lines = semantic_detail_lines("/docs/budget.txt", &details, &theme, 80);
+        let lines = semantic_detail_lines(details.get("/docs/budget.txt"), &theme, 80);
         assert_eq!(lines.len(), 2);
         let text: Vec<String> = lines
             .iter()
@@ -4137,7 +4510,7 @@ mod tests {
             .collect();
         assert_eq!(text[0], "similarity 0.83");
         assert_eq!(text[1], "match quarterly budget");
-        assert!(semantic_detail_lines("/docs/other.txt", &details, &theme, 80).is_empty());
+        assert!(semantic_detail_lines(details.get("/docs/other.txt"), &theme, 80).is_empty());
     }
 
     #[test]
@@ -4148,7 +4521,7 @@ mod tests {
             "/docs/long.md".to_string(),
             (0.5_f32, "a very long snippet ".repeat(40)),
         );
-        let lines = semantic_detail_lines("/docs/long.md", &details, &theme, 40);
+        let lines = semantic_detail_lines(details.get("/docs/long.md"), &theme, 40);
         let match_text: String = lines[1]
             .spans
             .iter()
@@ -4173,9 +4546,9 @@ mod tests {
     fn selected_hit_lookup_uses_the_exact_path_key() {
         let mut details = HashMap::new();
         details.insert("/docs/a.md".to_string(), (0.9_f32, "x".to_string()));
-        assert!(selected_has_semantic_hit(&details, Some("/docs/a.md")));
-        assert!(!selected_has_semantic_hit(&details, Some("/docs/b.md")));
-        assert!(!selected_has_semantic_hit(&details, None));
+        assert!(semantic_hit(&details, true, Some("/docs/a.md")).is_some());
+        assert!(semantic_hit(&details, true, Some("/docs/b.md")).is_none());
+        assert!(semantic_hit(&details, true, None).is_none());
     }
 
     #[test]

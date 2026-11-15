@@ -64,7 +64,6 @@ fn write_tree(root: &Path) {
 fn scan_into_index(root: &Path, index: &Path) {
     let db = Database::open(index).expect("open index");
     scan_root(&db, root, ScanOptions::default()).expect("scan");
-    db.checkpoint().expect("checkpoint");
 }
 
 /// Counts the texts it embeds, can cancel the pass after a count, and can pause the pass at a count

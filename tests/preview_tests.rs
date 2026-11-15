@@ -127,6 +127,32 @@ fn directory_listing_is_capped() {
     assert!(info_text(preview).contains("showing first 5000 entries"));
 }
 
+#[test]
+fn large_image_is_downscaled_before_it_reaches_the_ui() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("wide.png");
+    image::GrayImage::new(3_000, 1_500)
+        .save(&path)
+        .expect("write png");
+    let Preview::Image { image, meta } = preview_for(&path, 50) else {
+        panic!("expected an image preview");
+    };
+    assert_eq!((image.width(), image.height()), (1_024, 512));
+    assert_eq!(meta[0].to_string(), "image 3000x1500");
+}
+
+#[test]
+fn long_text_lines_are_cut_before_highlighting() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("bundle.min.js");
+    fs::write(&path, "var a=1;".repeat(200_000)).expect("write minified file");
+    let Preview::Text(lines) = preview_for(&path, 300) else {
+        panic!("expected a text preview");
+    };
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0].width(), 500);
+}
+
 /// Minimal PDF whose page content is a bare `c` operator, which panics inside pdf-extract.
 fn pdf_with_operandless_curve() -> Vec<u8> {
     let content = "c";
@@ -170,4 +196,22 @@ fn malformed_pdf_panic_becomes_an_error() {
         Err("pdf text extraction panicked".to_string())
     );
     assert!(info_text(preview_for(&pdf, 50)).contains("pdf text could not be extracted"));
+}
+
+#[test]
+fn large_jpeg_is_decoded_at_reduced_size_and_reports_its_real_size() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("photo.jpg");
+    image::RgbImage::from_fn(4_000, 2_000, |x, _| image::Rgb([(x / 16) as u8, 0, 0]))
+        .save(&path)
+        .unwrap();
+
+    let Preview::Image { image, meta } = preview_for(&path, 50) else {
+        panic!("expected an image preview");
+    };
+    assert_eq!((image.width(), image.height()), (1_024, 512));
+    assert_eq!(meta[0].to_string(), "image 4000x2000");
+    // Left edge dark, right edge bright: the reduced decode kept the picture.
+    let row = image.to_rgb8();
+    assert!(row.get_pixel(8, 256)[0] < 16 && row.get_pixel(1_015, 256)[0] > 230);
 }

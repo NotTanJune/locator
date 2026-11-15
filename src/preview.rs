@@ -4,6 +4,7 @@
 //! metadata fallback for binaries. Heavy work (decode, highlight) is bounded and
 //! the TUI caches the result per selected path so it is not recomputed each tick.
 
+use std::borrow::Cow;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -17,9 +18,18 @@ use syntect::util::LinesWithEndings;
 /// Maximum bytes read for text/binary sniffing and PDF size guarding.
 const MAX_PREVIEW_BYTES: u64 = 2 * 1024 * 1024;
 
-/// Images are decoded in full before downscaling, so cap the file size we are
-/// willing to decode. Larger than the text cap because real photos are big.
+/// Formats other than JPEG are decoded in full before downscaling, so cap the file size
+/// we are willing to decode. Larger than the text cap because real photos are big.
 const MAX_IMAGE_PREVIEW_BYTES: u64 = 50 * 1024 * 1024;
+
+/// Decoded images are shrunk to fit this many pixels per side before they leave the worker
+/// thread. A terminal pane shows far fewer pixels, and the UI thread hashes and resizes
+/// whatever it receives (a 12000x8000 photo is 288 MB decoded).
+const MAX_IMAGE_PREVIEW_SIDE: u32 = 1024;
+
+/// Text lines are cut to this many characters before highlighting. Syntect's cost grows with
+/// line length, and a minified file can be one 2 MB line; the pane shows far less.
+const MAX_PREVIEW_LINE_CHARS: usize = 500;
 
 /// Directory previews stop reading after this many entries so a huge folder
 /// cannot stall the UI thread. Sorting applies to the entries read.
@@ -140,26 +150,63 @@ fn image_preview(path: &Path, metadata: &std::fs::Metadata) -> Preview {
             human_size(metadata.len())
         )));
     }
-    match image::ImageReader::open(path)
-        .ok()
-        .and_then(|reader| reader.with_guessed_format().ok())
-        .and_then(|reader| reader.decode().ok())
-    {
-        Some(image) => {
-            let meta = vec![
-                Line::from(Span::styled(
-                    format!("image {}x{}", image.width(), image.height()),
-                    Style::default().fg(Color::Cyan),
-                )),
-                Line::from(format_size_line(metadata.len())),
-            ];
-            Preview::Image {
-                image: Box::new(image),
-                meta,
-            }
-        }
-        None => Preview::Info(info_lines("image could not be decoded")),
+    let Some((mut image, (width, height))) = decode_for_preview(path) else {
+        return Preview::Info(info_lines("image could not be decoded"));
+    };
+    let meta = vec![
+        Line::from(Span::styled(
+            format!("image {width}x{height}"),
+            Style::default().fg(Color::Cyan),
+        )),
+        Line::from(format_size_line(metadata.len())),
+    ];
+    if image.width() > MAX_IMAGE_PREVIEW_SIDE || image.height() > MAX_IMAGE_PREVIEW_SIDE {
+        image = image.thumbnail(MAX_IMAGE_PREVIEW_SIDE, MAX_IMAGE_PREVIEW_SIDE);
     }
+    Preview::Image {
+        image: Box::new(image),
+        meta,
+    }
+}
+
+/// Decodes an image for the pane and returns it with the size of the original.
+fn decode_for_preview(path: &Path) -> Option<(image::DynamicImage, (u32, u32))> {
+    if let Some(scaled) = decode_scaled_jpeg(path) {
+        return Some(scaled);
+    }
+    let image = image::ImageReader::open(path)
+        .ok()?
+        .with_guessed_format()
+        .ok()?
+        .decode()
+        .ok()?;
+    let size = (image.width(), image.height());
+    Some((image, size))
+}
+
+/// Decodes a JPEG at 1/2, 1/4 or 1/8 size when the pane needs no more, so a 96 MP photo
+/// never exists at full size in memory. `None` for anything else, including the JPEG
+/// kinds this decoder does not turn into 8-bit grey or RGB.
+fn decode_scaled_jpeg(path: &Path) -> Option<(image::DynamicImage, (u32, u32))> {
+    let file = std::io::BufReader::new(std::fs::File::open(path).ok()?);
+    let mut decoder = jpeg_decoder::Decoder::new(file);
+    decoder.read_info().ok()?;
+    let info = decoder.info()?;
+    let original = (u32::from(info.width), u32::from(info.height));
+    let side = MAX_IMAGE_PREVIEW_SIDE as u16;
+    let (width, height) = decoder.scale(side, side).ok()?;
+    let (width, height) = (u32::from(width), u32::from(height));
+    let pixels = decoder.decode().ok()?;
+    let image = match info.pixel_format {
+        jpeg_decoder::PixelFormat::L8 => {
+            image::DynamicImage::ImageLuma8(image::GrayImage::from_raw(width, height, pixels)?)
+        }
+        jpeg_decoder::PixelFormat::RGB24 => {
+            image::DynamicImage::ImageRgb8(image::RgbImage::from_raw(width, height, pixels)?)
+        }
+        _ => return None,
+    };
+    Some((image, original))
 }
 
 /// `pdf_extract::extract_text` that turns a panic (common on malformed PDFs) into `Err`
@@ -249,7 +296,12 @@ fn highlight_text(text: &str, extension: &str, max_lines: usize) -> Vec<Line<'st
 
     let mut lines = Vec::new();
     for raw_line in LinesWithEndings::from(text).take(max_lines) {
-        match highlighter.highlight_line(raw_line, &hl.syntaxes) {
+        let cut = raw_line.char_indices().nth(MAX_PREVIEW_LINE_CHARS);
+        let raw_line = match cut {
+            Some((end, _)) => Cow::Owned(format!("{}\n", &raw_line[..end])),
+            None => Cow::Borrowed(raw_line),
+        };
+        match highlighter.highlight_line(&raw_line, &hl.syntaxes) {
             Ok(ranges) => lines.push(syntect_line_to_ratatui(&ranges)),
             Err(_) => lines.push(Line::from(raw_line.trim_end_matches('\n').to_string())),
         }

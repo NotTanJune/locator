@@ -33,7 +33,6 @@ fn write_corpus(root: &Path) {
 fn index_and_embed(root: &Path, index: &Path) {
     let db = Database::open(index).expect("open index");
     scan_root(&db, root, ScanOptions::default()).expect("scan");
-    db.checkpoint().expect("checkpoint");
     drop(db);
     let request = PassRequest {
         index_path: index.to_path_buf(),
@@ -150,6 +149,50 @@ fn extension_filter_applies_to_semantic_results() {
 }
 
 #[test]
+fn filtered_query_fills_the_limit_from_files_ranked_below_many_others() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("docs");
+    fs::create_dir_all(&root).expect("root");
+    for index in 0..300 {
+        fs::write(root.join(format!("note-{index:03}.txt")), "tomato basil").expect("txt");
+    }
+    for index in 0..5 {
+        fs::write(
+            root.join(format!("recipe-{index}.md")),
+            "tomato basil garlic onion",
+        )
+        .expect("md");
+    }
+    let index = dir.path().join("index.sqlite");
+    index_and_embed(&root, &index);
+
+    let mut searcher = SemanticSearcher::open(&index)
+        .expect("open")
+        .expect("has embeddings");
+    let mut embedder = HashEmbedder;
+    let mut options = query("tomato basil").with_limit(50);
+    options.filters.exts = vec!["md".to_string()];
+    let hits = searcher.search(&mut embedder, &options).expect("search");
+    assert_eq!(hits.len(), 5);
+    assert!(hits.iter().all(|hit| hit.result.path.ends_with(".md")));
+
+    // An unfiltered page is a prefix of the full ranking.
+    let all = searcher
+        .search(&mut embedder, &query("tomato basil").with_limit(usize::MAX))
+        .expect("all");
+    let page = searcher
+        .search(&mut embedder, &query("tomato basil").with_limit(10))
+        .expect("page");
+    assert_eq!(all.len(), 305);
+    let paths = |hits: &[locator::embed::SemanticHit]| -> Vec<(String, f32)> {
+        hits.iter()
+            .map(|hit| (hit.result.path.clone(), hit.score))
+            .collect()
+    };
+    assert_eq!(paths(&page), paths(&all[..10]));
+}
+
+#[test]
 fn deleted_file_drops_out_of_results() {
     let dir = tempfile::tempdir().expect("tempdir");
     let root = dir.path().join("docs");
@@ -161,7 +204,6 @@ fn deleted_file_drops_out_of_results() {
     fs::remove_file(root.join("soup.md")).expect("delete");
     let db = Database::open(&index).expect("open index");
     scan_root(&db, &root, ScanOptions::default()).expect("rescan");
-    db.checkpoint().expect("checkpoint");
     drop(db);
 
     let mut searcher = SemanticSearcher::open(&index)
@@ -228,7 +270,6 @@ fn search_sees_files_committed_by_another_connection_after_the_check_interval() 
     fs::write(root.join("zebra.txt"), "zebra crossing near the school").expect("zebra");
     let db = Database::open(&index).expect("open index");
     scan_root(&db, &root, ScanOptions::default()).expect("rescan");
-    db.checkpoint().expect("checkpoint");
     drop(db);
     let canonical = root.canonicalize().expect("canonical");
     let zebra_path = canonical.join("zebra.txt").to_string_lossy().to_string();

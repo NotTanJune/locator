@@ -114,8 +114,11 @@ impl QueryScorer {
             idx_buf,
         } = self;
         idx_buf.clear();
-        let needle = Utf32Str::new(needle_lower, needle_buf);
-        let hay = Utf32Str::new(hay_lower, hay_buf);
+        // `Utf32Str::new` collapses graphemes (and may use byte offsets), so its
+        // indices are not char indices. Feed plain chars to keep them aligned with
+        // the text the UI highlights. Scoring paths keep the faster `new`.
+        let needle = chars_utf32(needle_lower, needle_buf);
+        let hay = chars_utf32(hay_lower, hay_buf);
         if matcher.fuzzy_indices(hay, needle, idx_buf).is_none() {
             return Vec::new();
         }
@@ -125,8 +128,19 @@ impl QueryScorer {
     }
 }
 
+fn chars_utf32<'a>(s: &'a str, buf: &'a mut Vec<char>) -> Utf32Str<'a> {
+    if s.is_ascii() {
+        return Utf32Str::Ascii(s.as_bytes());
+    }
+    buf.clear();
+    buf.extend(s.chars());
+    Utf32Str::Unicode(buf)
+}
+
 /// A query compiled once for a given mode + string. Regex/glob are compiled a
-/// single time here rather than per candidate.
+/// single time here rather than per candidate. Give each thread its own clone: threads
+/// that share one `Regex` queue for its scratch space.
+#[derive(Clone)]
 pub enum CompiledQuery {
     Empty,
     Contains(String),
@@ -525,6 +539,41 @@ impl SearchFilters {
         self.name = Some(trimmed.to_string());
         Ok(self)
     }
+
+    /// True when a size or date bound is set. A scan stores names only, so these bounds can
+    /// be checked only against metadata read from disk.
+    pub fn has_metadata_bounds(&self) -> bool {
+        self.min_size.is_some()
+            || self.max_size.is_some()
+            || self.created_after.is_some()
+            || self.created_before.is_some()
+            || self.modified_after.is_some()
+            || self.modified_before.is_some()
+    }
+
+    /// Checks the size and date bounds against a file's metadata. A missing timestamp fails
+    /// any bound on that timestamp.
+    pub fn metadata_bounds_match(
+        &self,
+        size_bytes: u64,
+        created_at: Option<DateTime<Utc>>,
+        modified_at: Option<DateTime<Utc>>,
+    ) -> bool {
+        self.min_size.is_none_or(|min| size_bytes >= min)
+            && self.max_size.is_none_or(|max| size_bytes <= max)
+            && self
+                .created_after
+                .is_none_or(|bound| created_at.is_some_and(|created| created >= bound))
+            && self
+                .created_before
+                .is_none_or(|bound| created_at.is_some_and(|created| created <= bound))
+            && self
+                .modified_after
+                .is_none_or(|bound| modified_at.is_some_and(|modified| modified >= bound))
+            && self
+                .modified_before
+                .is_none_or(|bound| modified_at.is_some_and(|modified| modified <= bound))
+    }
 }
 
 pub fn parse_date(value: &str) -> Result<DateTime<Utc>> {
@@ -578,6 +627,10 @@ fn glob_regex(pattern: &str) -> Result<Regex> {
             '?' => regex.push('.'),
             '[' => {
                 let mut class = String::from("[");
+                // Shell-style negation `[!a]` is `[^a]` in regex.
+                if chars.next_if_eq(&'!').is_some() {
+                    class.push('^');
+                }
                 let mut closed = false;
                 for next in chars.by_ref() {
                     class.push(next);

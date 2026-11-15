@@ -12,8 +12,7 @@ use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use locator::db::{
-    delete_index_files, existing_db_path_for_working_dir, fallback_db_path_for_root,
-    local_db_path_for_root, staging_db_path_for_root, Database,
+    delete_index_files, existing_db_path_for_working_dir, local_db_path_for_root, Database,
 };
 use locator::query::{QueryMode, SearchFilters, SearchOptions, SortField};
 use locator::scan_ui::{
@@ -40,19 +39,20 @@ enum Commands {
         // Unset: use the configured default (`lctr config set backend ...`).
         #[arg(long, value_enum)]
         backend: Option<ScanBackend>,
-        #[arg(long, default_value_t = 500_000)]
-        batch_size: usize,
-        #[arg(long, default_value_t = 64)]
-        writer_queue_batches: usize,
         #[arg(long, default_value_t = 16)]
         native_buffer_mb: usize,
         #[arg(long, default_value_t = 8)]
         native_workers: usize,
         #[arg(long, default_value_t = 4096)]
         native_output_batch_size: usize,
-        #[arg(long)]
+        // Accepted for old scripts. A scan now writes one file at its end, so these do nothing.
+        #[arg(long, hide = true)]
+        batch_size: Option<usize>,
+        #[arg(long, hide = true)]
+        writer_queue_batches: Option<usize>,
+        #[arg(long, hide = true)]
         stage_index: bool,
-        #[arg(long)]
+        #[arg(long, hide = true)]
         no_stage_index: bool,
         #[arg(long)]
         profile_detail: bool,
@@ -245,13 +245,13 @@ fn main() -> Result<()> {
         Commands::Scan {
             root,
             backend,
-            batch_size,
-            writer_queue_batches,
+            batch_size: _,
+            writer_queue_batches: _,
             native_buffer_mb,
             native_workers,
             native_output_batch_size,
-            stage_index,
-            no_stage_index,
+            stage_index: _,
+            no_stage_index: _,
             profile_detail,
             no_profile_detail,
             eta,
@@ -260,24 +260,19 @@ fn main() -> Result<()> {
             depth,
             no_update_check,
         } => {
-            let use_stage_index =
-                !no_stage_index && (stage_index || std::env::var_os("LCTR_DB").is_none());
             let show_profile_detail = profile_detail || !no_profile_detail;
-            let staged_target = if use_stage_index {
-                Some(staged_target_path_for_root(&root)?)
-            } else {
-                None
-            };
-            let (db, db_path) = if staged_target.is_some() {
-                let staging_path = staging_db_path_for_root(&root)?;
-                delete_index_files(&staging_path)?;
-                (
-                    Database::open_fresh_staged_scan(&staging_path)?,
-                    staging_path,
-                )
-            } else {
-                Database::open_for_scan_root(&root)?
-            };
+            locator::db::remove_old_staging_files(&root);
+            let (db, db_path) = Database::open_for_scan_root(&root)?;
+            if std::env::var_os("LCTR_DB").is_none() {
+                let local_path = local_db_path_for_root(&root)?;
+                if let Some(dir) = local_path.parent().filter(|_| db_path != local_path) {
+                    println!(
+                        "using fallback index {} because {} is not writable",
+                        db_path.display(),
+                        dir.display()
+                    );
+                }
+            }
             let spinner = scan_spinner();
             spinner.set_message(format!(
                 "preparing scan for {} using {}",
@@ -288,12 +283,9 @@ fn main() -> Result<()> {
             let live_color = io::stderr().is_terminal();
             let options = ScanOptions {
                 backend: backend.unwrap_or_else(config_default_backend),
-                batch_size,
-                writer_queue_batches,
                 native_buffer_bytes: native_buffer_mb.saturating_mul(1024 * 1024),
                 native_workers,
                 native_output_batch_size,
-                fresh_index: use_stage_index,
                 estimate_totals: show_eta,
                 ..Default::default()
             };
@@ -315,27 +307,12 @@ fn main() -> Result<()> {
             renderer_running.store(false, Ordering::Relaxed);
             let _ = renderer.join();
             let stats = scan_result?;
-            let final_index_path = staged_target.clone().unwrap_or_else(|| db_path.clone());
-            let used_stage_index = staged_target.is_some();
-            if let Some(target) = staged_target {
-                if let Err(error) = db.import_access_from(&target) {
-                    spinner.suspend(|| {
-                        eprintln!(
-                            "warning: could not keep open history from {}: {error:#}",
-                            target.display()
-                        )
-                    });
-                }
-                db.checkpoint()?;
-                drop(db);
-                copy_finished_index(&db_path, &target)?;
-            }
+            drop(db);
             spinner.finish_and_clear();
             let summary = ScanSummary {
                 stats: &stats,
                 root: &root,
-                index_path: &final_index_path,
-                staged: used_stage_index,
+                index_path: &db_path,
                 detail: show_profile_detail,
             };
             if em {
@@ -349,7 +326,7 @@ fn main() -> Result<()> {
                 println!("{}", render_scan_summary(&summary));
             }
             if em {
-                locator::embed::run_scan_embedding(&final_index_path, &root, depth.as_deref())?;
+                locator::embed::run_scan_embedding(&db_path, &root, depth.as_deref())?;
             }
             if no_update_check {
                 locator::update_check::persist_disable();
@@ -527,17 +504,17 @@ fn handle_config(action: Option<ConfigCommand>) -> Result<()> {
             locator::config_ui::run()?;
         }
         Some(ConfigCommand::List) => {
-            let config = Config::load();
+            let config = Config::load_with_warning()?;
             println!("# {}", Config::path()?.display());
             for (key, value) in config.entries() {
                 println!("{key} = {value}");
             }
         }
         Some(ConfigCommand::Get { key }) => {
-            println!("{}", Config::load().get(&key)?);
+            println!("{}", Config::load_with_warning()?.get(&key)?);
         }
         Some(ConfigCommand::Set { key, value }) => {
-            let mut config = Config::load();
+            let mut config = Config::load_with_warning()?;
             config.set(&key, &value)?;
             config.save()?;
             println!("set {key} = {}", config.get(&key)?);
@@ -590,51 +567,6 @@ fn handle_embed(action: EmbedCommand) -> Result<()> {
     }
 }
 
-fn copy_finished_index(source: &Path, target: &Path) -> Result<()> {
-    if let Some(parent) = target.parent() {
-        locator::db::create_index_dir(parent)?;
-    }
-    // Copy into the target's directory first so the final install is a
-    // same-filesystem rename, which is atomic. The staging DB may live on a
-    // different volume, so a direct rename(source, target) could fail (EXDEV).
-    let tmp = target.with_extension("sqlite.tmp");
-    let _ = fs::remove_file(&tmp);
-    fs::copy(source, &tmp).with_context(|| format!("copy staged index to {}", tmp.display()))?;
-    // Remove stale -wal/-shm sidecars of the old index before installing the
-    // new file; a fresh DB next to old sidecars can confuse SQLite recovery.
-    delete_index_files(target)?;
-    fs::rename(&tmp, target).with_context(|| format!("install index at {}", target.display()))?;
-    delete_index_files(source)?;
-    Ok(())
-}
-
-fn staged_target_path_for_root(root: &Path) -> Result<PathBuf> {
-    let local_target = local_db_path_for_root(root)?;
-    if let Some(parent) = local_target.parent() {
-        match locator::db::create_index_dir(parent) {
-            Ok(()) => return Ok(local_target),
-            Err(error) if is_readonly_or_permission_error(&error) => {
-                let fallback = fallback_db_path_for_root(root)?;
-                println!(
-                    "using fallback staged target {} because {} is not writable",
-                    fallback.display(),
-                    parent.display()
-                );
-                return Ok(fallback);
-            }
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Ok(local_target)
-}
-
-fn is_readonly_or_permission_error(error: &std::io::Error) -> bool {
-    matches!(
-        error.kind(),
-        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem
-    )
-}
-
 fn print_shell_init(shell: &str) -> Result<()> {
     println!("{}", shell_init_script(shell)?);
     Ok(())
@@ -648,6 +580,19 @@ fn shell_init_script(shell: &str) -> Result<String> {
         _ => anyhow::bail!("unsupported shell '{shell}', expected zsh, bash, fish, or powershell"),
     }
 }
+
+/// Long flags of `lctr scan` that take a value. The shell wrappers skip them
+/// (and their value) when looking for the root directory; a unit test checks
+/// this list against the clap definition.
+const SCAN_VALUE_FLAGS: [&str; 7] = [
+    "--backend",
+    "--batch-size",
+    "--writer-queue-batches",
+    "--native-buffer-mb",
+    "--native-workers",
+    "--native-output-batch-size",
+    "--depth",
+];
 
 fn posix_shell_init(shell: &str) -> Result<String> {
     let arg_count = if shell == "zsh" { "$#" } else { "${#args[@]}" };
@@ -665,19 +610,10 @@ fn posix_shell_init(shell: &str) -> Result<String> {
     while (( i <= {arg_count} )); do
       local arg="{arg_at}"
       case "$arg" in
-        --backend)
+        {value_flags})
           (( i += 2 ))
           ;;
-        --backend=*)
-          (( i += 1 ))
-          ;;
-        --no-eta)
-          (( i += 1 ))
-          ;;
-        --batch-size|--writer-queue-batches|--native-buffer-mb|--native-workers|--native-output-batch-size)
-          (( i += 2 ))
-          ;;
-        --batch-size=*|--writer-queue-batches=*|--native-buffer-mb=*|--native-workers=*|--native-output-batch-size=*)
+        {value_flags_eq})
           (( i += 1 ))
           ;;
         --eta|--no-eta|--stage-index|--no-stage-index|--profile-detail|--no-profile-detail)
@@ -709,6 +645,8 @@ fn posix_shell_init(shell: &str) -> Result<String> {
 }}"#,
         arg_count = arg_count,
         arg_at = arg_at,
+        value_flags = SCAN_VALUE_FLAGS.join("|"),
+        value_flags_eq = SCAN_VALUE_FLAGS.map(|f| format!("{f}=*")).join("|"),
         next_arg = if shell == "zsh" {
             "\"${argv[$(( i + 1 ))]}\""
         } else {
@@ -725,9 +663,9 @@ fn fish_shell_init() -> Result<String> {
         while test $i -le (count $argv)
             set -l arg $argv[$i]
             switch $arg
-                case --backend --batch-size --writer-queue-batches --native-buffer-mb --native-workers --native-output-batch-size
+                case @VALUE_FLAGS@
                     set i (math $i + 2)
-                case '--backend=*' '--batch-size=*' '--writer-queue-batches=*' '--native-buffer-mb=*' '--native-workers=*' '--native-output-batch-size=*' --no-eta --eta --stage-index --no-stage-index --profile-detail --no-profile-detail
+                case @VALUE_FLAGS_EQ@ --no-eta --eta --stage-index --no-stage-index --profile-detail --no-profile-detail
                     set i (math $i + 1)
                 case --
                     set root $argv[(math $i + 1)]
@@ -750,7 +688,11 @@ fn fish_shell_init() -> Result<String> {
 
     command lctr $argv
 end"#
-    .to_string())
+    .replace("@VALUE_FLAGS@", &SCAN_VALUE_FLAGS.join(" "))
+    .replace(
+        "@VALUE_FLAGS_EQ@",
+        &SCAN_VALUE_FLAGS.map(|f| format!("'{f}=*'")).join(" "),
+    ))
 }
 
 fn powershell_init() -> Result<String> {
@@ -761,11 +703,11 @@ fn powershell_init() -> Result<String> {
         while ($i -lt $args.Count) {
             $arg = $args[$i]
             switch -Regex ($arg) {
-                '^(--backend|--batch-size|--writer-queue-batches|--native-buffer-mb|--native-workers|--native-output-batch-size)$' {
+                '^(@VALUE_FLAGS@)$' {
                     $i += 2
                     continue
                 }
-                '^(--backend|--batch-size|--writer-queue-batches|--native-buffer-mb|--native-workers|--native-output-batch-size)=' {
+                '^(@VALUE_FLAGS@)=' {
                     $i += 1
                     continue
                 }
@@ -799,7 +741,7 @@ fn powershell_init() -> Result<String> {
 
     & lctr @args
 }"#
-    .to_string())
+    .replace("@VALUE_FLAGS@", &SCAN_VALUE_FLAGS.join("|")))
 }
 
 fn setup_shell_integration(
@@ -1069,4 +1011,36 @@ fn scan_spinner() -> ProgressBar {
             .tick_strings(&[".", "o", "O", "o"]),
     );
     spinner
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn scan_value_flags_match_clap_definition() {
+        let cmd = Cli::command();
+        let scan = cmd.find_subcommand("scan").expect("scan subcommand");
+        let mut from_clap: Vec<String> = scan
+            .get_arguments()
+            .filter(|arg| arg.get_action().takes_values())
+            .filter_map(|arg| arg.get_long().map(|long| format!("--{long}")))
+            .collect();
+        from_clap.sort();
+        let mut listed: Vec<String> = SCAN_VALUE_FLAGS.iter().map(|f| f.to_string()).collect();
+        listed.sort();
+        assert_eq!(listed, from_clap);
+    }
+
+    #[test]
+    fn shell_scripts_skip_depth_value() {
+        for shell in ["zsh", "bash", "fish", "powershell"] {
+            let script = shell_init_script(shell).unwrap();
+            assert!(
+                script.contains("--depth"),
+                "{shell} wrapper ignores --depth"
+            );
+        }
+    }
 }

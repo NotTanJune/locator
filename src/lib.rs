@@ -5,6 +5,7 @@ pub mod embed;
 pub mod embed_ui;
 pub mod live_index;
 pub mod live_search;
+pub mod name_file;
 pub mod open;
 mod panic_guard;
 pub mod preview;

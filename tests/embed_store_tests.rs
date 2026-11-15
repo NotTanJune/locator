@@ -2,6 +2,7 @@ use std::time::Instant;
 
 use locator::embed::store::{
     sidecar_path_for_index, EmbedStore, FileStamp, FileStatus, StoredChunk, VectorIndex,
+    VISION_MISSING_DETAIL,
 };
 use locator::embed::vector::{decode_f16, encode_f16, truncate_and_normalize};
 
@@ -236,7 +237,11 @@ fn prune_removes_vanished_files_only_under_the_given_root() {
     }
 
     let removed = store
-        .prune_to_active("/one", &["/one/keep.txt".to_string()])
+        .prune_to_active(
+            "/one",
+            &["/one/keep.txt".to_string()],
+            &["/one".to_string(), "/two".to_string()],
+        )
         .expect("prune");
     assert_eq!(removed, 1);
 
@@ -251,6 +256,98 @@ fn prune_removes_vanished_files_only_under_the_given_root() {
         ])
         .expect("snippets");
     assert_eq!(remaining, vec!["/one/keep.txt", "", "/two/other.txt"]);
+}
+
+#[test]
+fn prune_drops_roots_missing_from_the_index_and_retags_nested_files() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = open_store(dir.path(), DIMS);
+    let mut rng = Rng(10);
+    for (root, path) in [
+        ("/a", "/a/top.txt"),
+        ("/a/sub", "/a/sub/kept.txt"),
+        ("/a/sub", "/a/sub/gone.txt"),
+        ("/removed", "/removed/x.txt"),
+    ] {
+        store
+            .write_file(
+                root,
+                &stamp(path, 1, 1),
+                FileStatus::Done,
+                &[chunk(0, path, rng.normalized(DIMS))],
+                None,
+            )
+            .expect("write");
+    }
+
+    // `/a` now covers `/a/sub/kept.txt`; `/a/sub/gone.txt` is gone; `/removed` left the index.
+    let removed = store
+        .prune_to_active(
+            "/a",
+            &["/a/top.txt".to_string(), "/a/sub/kept.txt".to_string()],
+            &["/a".to_string()],
+        )
+        .expect("prune");
+    assert_eq!(removed, 2);
+    assert_eq!(store.roots().expect("roots"), vec!["/a".to_string()]);
+    assert_eq!(store.stats().expect("stats").chunks, 2);
+    let remaining = store
+        .snippets_for(&[
+            ("/a/sub/kept.txt".to_string(), 0),
+            ("/a/sub/gone.txt".to_string(), 0),
+            ("/removed/x.txt".to_string(), 0),
+        ])
+        .expect("snippets");
+    assert_eq!(remaining, vec!["/a/sub/kept.txt", "", ""]);
+
+    // A nested root still in the index keeps its files, even those not active under `/a`.
+    store
+        .write_file(
+            "/a/sub",
+            &stamp("/a/sub/own.txt", 1, 1),
+            FileStatus::Done,
+            &[chunk(0, "own", rng.normalized(DIMS))],
+            None,
+        )
+        .expect("write own");
+    store
+        .prune_to_active(
+            "/a",
+            &["/a/top.txt".to_string()],
+            &["/a".to_string(), "/a/sub".to_string()],
+        )
+        .expect("prune again");
+    assert_eq!(
+        store
+            .snippets_for(&[("/a/sub/own.txt".to_string(), 0)])
+            .expect("own"),
+        vec!["own"]
+    );
+}
+
+#[test]
+fn skipped_without_vision_matches_only_the_vision_skip() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = open_store(dir.path(), DIMS);
+    for (path, detail) in [
+        ("/r/a.png", VISION_MISSING_DETAIL),
+        ("/r/b.svg", "low value"),
+    ] {
+        store
+            .write_file(
+                "/r",
+                &stamp(path, 1, 1),
+                FileStatus::Skipped,
+                &[],
+                Some(detail),
+            )
+            .expect("write");
+    }
+    assert!(store.skipped_without_vision("/r/a.png").expect("a"));
+    assert!(!store.skipped_without_vision("/r/b.svg").expect("b"));
+    assert!(!store
+        .skipped_without_vision("/r/missing.png")
+        .expect("missing"));
 }
 
 #[test]
@@ -328,6 +425,64 @@ fn top_k_matches_brute_force_on_a_thousand_vectors() {
             .map(|(_, path)| path.as_str())
             .collect();
         assert_eq!(got, want);
+    }
+}
+
+#[test]
+fn best_per_file_matches_the_best_chunk_of_every_file_in_score_order() {
+    let mut rng = Rng(43);
+    let rows: Vec<(String, u32, Vec<u8>)> = (0..200)
+        .flat_map(|file| (0..4u32).map(move |ordinal| (file, ordinal)))
+        .map(|(file, ordinal)| {
+            (
+                format!("/d/{file:03}.txt"),
+                ordinal,
+                encode_f16(&rng.normalized(DIMS)),
+            )
+        })
+        .collect();
+    let index = VectorIndex::from_rows(DIMS, rows).expect("index");
+    let query = rng.normalized(DIMS);
+
+    // Reference: the first hit per path in the full chunk ranking.
+    let mut seen = std::collections::HashSet::new();
+    let want: Vec<(String, u32, f32)> = index
+        .top_k(&query, index.len())
+        .into_iter()
+        .filter(|hit| seen.insert(hit.path.clone()))
+        .map(|hit| (hit.path, hit.ordinal, hit.score))
+        .collect();
+    let got: Vec<(String, u32, f32)> = index
+        .best_per_file(&query)
+        .into_iter()
+        .map(|file| (file.path.to_string(), file.ordinal, file.score))
+        .collect();
+    assert_eq!(got.len(), 200);
+    assert_eq!(got, want);
+}
+
+#[test]
+fn load_keeps_every_chunk_of_every_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = open_store(dir.path(), DIMS);
+    let mut rng = Rng(12);
+    let mut vectors = Vec::new();
+    for path in ["/r/a.txt", "/r/b.txt"] {
+        let chunks: Vec<StoredChunk> = (0..3)
+            .map(|ordinal| chunk(ordinal, "x", rng.normalized(DIMS)))
+            .collect();
+        for stored in &chunks {
+            vectors.push((path, stored.ordinal, stored.vector.clone()));
+        }
+        store
+            .write_file("/r", &stamp(path, 1, 1), FileStatus::Done, &chunks, None)
+            .expect("write");
+    }
+    let index = VectorIndex::load(&store).expect("load");
+    assert_eq!(index.len(), 6);
+    for (path, ordinal, vector) in vectors {
+        let top = &index.top_k(&vector, 1)[0];
+        assert_eq!((top.path.as_str(), top.ordinal), (path, ordinal));
     }
 }
 

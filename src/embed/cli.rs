@@ -11,10 +11,11 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 
+use super::chunk::{classify_and_extract, Extracted};
 use super::model::{self, DownloadProgress, TEXT_MODEL, VISION_MODEL};
 use super::pipeline::{
-    depth_text, pass_done_text, run_pass, stage_label, Depth, PassEvent, PassRequest, PassSummary,
-    PassTiming, MODEL_ID,
+    depth_text, pass_done_text, refresh_from_disk, rule_for, run_pass, stage_label, Depth,
+    PassEvent, PassRequest, PassSummary, PassTiming, MODEL_ID,
 };
 use super::runtime::fake_from_env;
 use super::store::{sidecar_path_for_index, EmbedStore};
@@ -88,14 +89,30 @@ pub fn run_scan_embedding(index_path: &Path, root: &Path, depth: Option<&str>) -
     Ok(())
 }
 
-fn count_images(index_path: &Path, root: &Path) -> Result<usize> {
+/// Images under `root` that the pass would send to the vision model: a supported format within
+/// the size limit and not kept out by a rule. `root` is canonical.
+#[doc(hidden)]
+pub fn count_images(index_path: &Path, root: &Path) -> Result<usize> {
     let db = Database::open_readonly(index_path)
         .with_context(|| format!("open index {}", index_path.display()))?;
     let root_string = root.to_string_lossy().to_string();
+    let home = dirs::home_dir();
+    // Sizes come from disk, as in the pass: the index's size is not reliable.
     Ok(db
         .embeddable_files(&root_string)?
-        .iter()
+        .into_iter()
         .filter(|file| file.kind == "image")
+        .filter_map(refresh_from_disk)
+        .filter(|file| {
+            // For an image this only checks the format and size; nothing is read.
+            classify_and_extract(
+                Path::new(&file.path),
+                &file.kind,
+                file.extension.as_deref(),
+                file.size_bytes,
+            ) == Extracted::Image
+                && rule_for(&file.path, root, home.as_deref()).is_none()
+        })
         .count())
 }
 

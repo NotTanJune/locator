@@ -1,22 +1,17 @@
 //! Semantic search: embed the query, score every stored chunk, keep the best chunk per file,
 //! and hydrate the surviving files from the main index so the results are ordinary `SearchResult`s.
 
-use std::collections::HashSet;
 use std::path::Path;
 
 use anyhow::{anyhow, bail, Context, Result};
 
 use super::model::{self, TEXT_MODEL};
 use super::runtime::{fake_from_env, query_input, with_embedder, Embedder, EmbedderConfig};
-use super::store::{sidecar_path_for_index, EmbedStore, VectorIndex};
+use super::store::{sidecar_path_for_index, EmbedStore, ScoredFile, VectorIndex};
 use super::vector::truncate_and_normalize;
 use crate::db::{Database, SearchResult};
 use crate::live_search::matches_filters;
 use crate::query::SearchOptions;
-
-/// Candidate chunks pulled from the vector index, relative to the requested limit.
-const CANDIDATE_FACTOR: usize = 5;
-const MIN_CANDIDATES: usize = 100;
 
 #[derive(Debug, Clone)]
 pub struct SemanticHit {
@@ -100,52 +95,35 @@ impl SemanticSearcher {
             .pop()
             .ok_or_else(|| anyhow!("embedder returned no query vector"))?;
         let query_vector = truncate_and_normalize(&raw, self.dims);
-        let candidates = options
-            .limit
-            .saturating_mul(CANDIDATE_FACTOR)
-            .max(MIN_CANDIDATES)
-            .min(self.index.len());
-        let scored = self.index.top_k(&query_vector, candidates);
 
-        // Best chunk per file: `scored` is sorted by score, so the first hit for a path wins.
-        let mut seen: HashSet<String> = HashSet::new();
-        let mut best: Vec<(String, u32, f32)> = Vec::new();
-        for hit in scored {
-            if seen.insert(hit.path.clone()) {
-                best.push((hit.path, hit.ordinal, hit.score));
-            }
-        }
-
+        // Files in score order; hydration and filters drop some, so walk until `limit` are kept.
         let db = Database::open_readonly(&self.index_path)
             .with_context(|| format!("open index {}", self.index_path.display()))?;
-        let mut kept: Vec<(SearchResult, f32, u32, String)> = Vec::new();
-        for (path, ordinal, score) in best {
-            let Some(result) = db.result_for_path(&path)? else {
+        let mut lookup = db.path_lookup()?;
+        let mut kept: Vec<(SearchResult, ScoredFile<'_>)> = Vec::new();
+        for file in self.index.best_per_file(&query_vector) {
+            if kept.len() == options.limit {
+                break;
+            }
+            let Some(result) = lookup.result_for(file.path) else {
                 continue;
             };
-            if !matches_filters(&result, &options.filters) {
-                continue;
+            if matches_filters(&result, &options.filters) {
+                kept.push((result, file));
             }
-            kept.push((result, score, ordinal, path));
         }
-        kept.sort_by(|a, b| {
-            b.1.partial_cmp(&a.1)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| a.3.cmp(&b.3))
-        });
-        kept.truncate(options.limit);
 
         let keys: Vec<(String, u32)> = kept
             .iter()
-            .map(|(_, _, ordinal, path)| (path.clone(), *ordinal))
+            .map(|(_, file)| (file.path.to_string(), file.ordinal))
             .collect();
         let snippets = self.store.snippets_for(&keys)?;
         Ok(kept
             .into_iter()
             .zip(snippets)
-            .map(|((result, score, _, _), snippet)| SemanticHit {
+            .map(|((result, file), snippet)| SemanticHit {
                 result,
-                score,
+                score: file.score,
                 snippet,
             })
             .collect())

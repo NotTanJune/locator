@@ -1,9 +1,10 @@
 //! Live filesystem watcher that keeps a persistent index current while the
 //! search TUI is open. A background thread receives `notify` events, debounces
-//! them, and applies per-path upserts / soft-deletes to the same SQLite file
-//! the search reads (WAL makes the concurrent reader + writer safe). A
-//! generation counter is bumped on every applied batch so the TUI knows when to
-//! refresh its current query.
+//! them, and records per-path upserts and removals in the `changes` table of the
+//! same SQLite file the search reads (WAL makes the concurrent reader + writer
+//! safe). The name file stays as it is until a compaction folds the changes into
+//! a new one. A generation counter is bumped on every applied batch so the TUI
+//! knows when to refresh its current query.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -17,7 +18,9 @@ use anyhow::{Context, Result};
 use notify::{RecursiveMode, Watcher};
 
 use crate::db::{Database, FileRecord};
-use crate::scanner::{is_skip_name, kind_for, system_time_to_utc, volume_for};
+use crate::scanner::{
+    is_skip_file_name, is_skip_name, kind_for, pruned_walk, system_time_to_utc, volume_for,
+};
 
 /// How long to wait for a quiet period before applying a batch of events. Bursts
 /// (e.g. a build writing many files) coalesce into a single apply.
@@ -63,7 +66,11 @@ impl LiveIndex {
             .name("lctr-live-index".into())
             .spawn(move || {
                 let outcome = (|| -> Result<()> {
-                    let db = Database::open(&db_path).context("open index for live watching")?;
+                    let mut index = WatchedIndex {
+                        db: Database::open(&db_path).context("open index for live watching")?,
+                        id: file_id(&db_path),
+                        path: db_path,
+                    };
                     if thread_stop.load(Ordering::Relaxed) {
                         return Ok(());
                     }
@@ -78,7 +85,7 @@ impl LiveIndex {
                     let _ = ready_tx.send(Ok(()));
                     watch_loop(
                         &rx,
-                        &db,
+                        &mut index,
                         &root.to_string_lossy(),
                         &thread_stop,
                         &thread_generation,
@@ -127,9 +134,31 @@ impl Drop for LiveIndex {
     }
 }
 
+/// The index the watcher writes to, with the identity of its file on disk.
+struct WatchedIndex {
+    db: Database,
+    id: Option<FileId>,
+    path: PathBuf,
+}
+
+impl WatchedIndex {
+    /// A scan replaces the name file and leaves the database file in place, so the database
+    /// file changes identity only when the index is deleted and created again. The open
+    /// handle would keep writing to the unlinked old file, so reopen when the file at `path`
+    /// is a different one.
+    fn follow_replacement(&mut self) -> Result<()> {
+        let current = file_id(&self.path);
+        if current.is_some() && current != self.id {
+            self.db = Database::open(&self.path).context("reopen replaced index")?;
+            self.id = current;
+        }
+        Ok(())
+    }
+}
+
 fn watch_loop(
     rx: &mpsc::Receiver<notify::Result<notify::Event>>,
-    db: &Database,
+    index: &mut WatchedIndex,
     root: &str,
     stop: &AtomicBool,
     generation: &AtomicU64,
@@ -154,12 +183,17 @@ fn watch_loop(
             }
         }
 
+        if index.follow_replacement().is_err() {
+            write_errors.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+
         let mut changed = false;
         for path in paths {
             if stop.load(Ordering::Relaxed) {
                 break;
             }
-            match apply_path(db, root, &path) {
+            match apply_path(&index.db, root, &path) {
                 Applied::Changed => changed = true,
                 Applied::Unchanged => {}
                 Applied::Failed => {
@@ -168,6 +202,9 @@ fn watch_loop(
             }
         }
         if changed {
+            if index.db.compact_name_file_if_needed().is_err() {
+                write_errors.fetch_add(1, Ordering::Relaxed);
+            }
             generation.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -202,13 +239,27 @@ fn apply_path(db: &Database, root: &str, path: &Path) -> Applied {
     }
 
     match std::fs::symlink_metadata(path) {
-        Ok(metadata) => match record_for(root, path, &metadata) {
-            Some(record) => match db.upsert_file(&record) {
+        Ok(metadata) => {
+            let mut records = Vec::new();
+            if metadata.is_dir() {
+                // A renamed or moved-in directory only reports the directory
+                // itself, so index everything beneath it too.
+                for entry in pruned_walk(path).flatten() {
+                    if let Ok(meta) = std::fs::symlink_metadata(entry.path()) {
+                        records.extend(record_for(root, &entry.path(), &meta));
+                    }
+                }
+            } else {
+                records.extend(record_for(root, path, &metadata));
+            }
+            if records.is_empty() {
+                return Applied::Unchanged;
+            }
+            match db.upsert_files(&records) {
                 Ok(()) => Applied::Changed,
                 Err(_) => Applied::Failed,
-            },
-            None => Applied::Unchanged,
-        },
+            }
+        }
         // Missing on disk: a delete or rename-away. Soft-delete it (and anything
         // beneath, if it was a directory).
         Err(_) => match db.mark_path_deleted(&path.to_string_lossy()) {
@@ -219,15 +270,48 @@ fn apply_path(db: &Database, root: &str, path: &Path) -> Applied {
     }
 }
 
+/// Identity of the index file on disk, used to notice it being replaced.
+type FileId = (u64, u64);
+
+#[cfg(unix)]
+fn file_id(path: &Path) -> Option<FileId> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.dev(), meta.ino()))
+}
+
+/// No inode here; creation time (replacement creates a new file) is the best
+/// portable identity.
+#[cfg(not(unix))]
+fn file_id(path: &Path) -> Option<FileId> {
+    let created = std::fs::metadata(path).ok()?.created().ok()?;
+    let nanos = created
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some((nanos as u64, 0))
+}
+
 /// Skip events under pruned directories (node_modules, target, .git, ...),
 /// matching the scanner, which prunes only entries *below* the scanned root.
 /// Components of the root itself are never considered, so a project living
 /// at e.g. `~/build/app` still gets live updates.
 fn path_is_pruned(root: &Path, path: &Path) -> bool {
     let relative = path.strip_prefix(root).unwrap_or(path);
-    relative
+    let mut names = relative
         .components()
-        .any(|component| is_skip_name(&component.as_os_str().to_string_lossy()))
+        .map(|component| component.as_os_str().to_string_lossy());
+    // The directory rules (`build`, `target`, ...) do not apply to a regular file that
+    // merely has such a name, as in the scanner.
+    let Some(last) = names.next_back() else {
+        return false;
+    };
+    names.any(|name| is_skip_name(&name))
+        || if path.is_dir() {
+            is_skip_name(&last)
+        } else {
+            is_skip_file_name(&last)
+        }
 }
 
 fn record_for(root: &str, path: &Path, metadata: &std::fs::Metadata) -> Option<FileRecord> {
@@ -301,7 +385,7 @@ mod tests {
 
     /// Verify that `apply_path` returns `Applied::Failed` when the database
     /// write fails. Strategy: open a valid `Database`, then concurrently drop
-    /// the `files` table via a second raw connection. SQLite will return
+    /// the `changes` table via a second raw connection. SQLite will return
     /// SQLITE_SCHEMA on the first statement the original connection tries to
     /// prepare after the schema change, causing `upsert_file` to return `Err`.
     #[test]
@@ -313,12 +397,12 @@ mod tests {
         // Open the DB through the normal path (creates schema).
         let db = Database::open(&db_path).expect("open db");
 
-        // Drop the files table via a parallel raw connection so the existing
+        // Drop the changes table via a parallel raw connection so the existing
         // `db` handle sees SQLITE_SCHEMA on its next write.
         {
             let conn = Connection::open(&db_path).expect("raw connection");
-            conn.execute_batch("DROP TABLE IF EXISTS files; DROP TABLE IF EXISTS files_fts;")
-                .expect("drop tables");
+            conn.execute_batch("DROP TABLE IF EXISTS changes;")
+                .expect("drop table");
         }
 
         let target = dir.path().join("new_file.txt");
@@ -327,7 +411,7 @@ mod tests {
         let result = apply_path(&db, &root, &target);
         assert!(
             matches!(result, Applied::Failed),
-            "expected Failed after files table dropped"
+            "expected Failed after changes table dropped"
         );
     }
 

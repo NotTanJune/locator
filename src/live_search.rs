@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
-use crate::db::{sort_results, SearchBatch, SearchResult, SEARCH_BATCH_SIZE};
+use crate::db::{sort_results_compiled, SearchBatch, SearchResult, SEARCH_BATCH_SIZE};
 use crate::query::{CompiledQuery, QueryScorer, SearchFilters, SearchOptions};
 use crate::scanner::{kind_for, pruned_walk, system_time_to_utc};
 
@@ -152,13 +153,16 @@ fn search_live_streaming_batches_with_limit(
         else {
             continue;
         };
+        // Match before stat: most walked files do not match. The path is taken
+        // relative to the root so the root's own name never matches.
+        let relative = path.strip_prefix(&root).unwrap_or(&path).to_string_lossy();
+        if !compiled.matches_any(&mut scorer, [name.as_str(), relative.as_ref()]) {
+            continue;
+        }
         let Some(result) = result_from_path(path, name) else {
             continue;
         };
         if !matches_filters(&result, &options.filters) {
-            continue;
-        }
-        if !compiled.matches_any(&mut scorer, [result.name.as_str(), result.path.as_str()]) {
             continue;
         }
         if max_results.is_some_and(|limit| results.len() >= limit) {
@@ -183,7 +187,13 @@ fn search_live_streaming_batches_with_limit(
             count: results.len(),
         })?;
     }
-    sort_results(&mut results, options);
+    sort_results_compiled(
+        &mut results,
+        options,
+        &compiled,
+        &mut scorer,
+        &HashMap::new(),
+    );
     Ok((LiveSearchStatus::Complete, results))
 }
 
@@ -223,44 +233,7 @@ pub(crate) fn matches_filters(result: &SearchResult, filters: &SearchFilters) ->
     {
         return false;
     }
-    if filters
-        .min_size
-        .is_some_and(|min_size| result.size_bytes < min_size)
-    {
-        return false;
-    }
-    if filters
-        .max_size
-        .is_some_and(|max_size| result.size_bytes > max_size)
-    {
-        return false;
-    }
-    if filters.created_after.is_some_and(|created_after| {
-        result
-            .created_at
-            .is_none_or(|created| created < created_after)
-    }) {
-        return false;
-    }
-    if filters.created_before.is_some_and(|created_before| {
-        result
-            .created_at
-            .is_none_or(|created| created > created_before)
-    }) {
-        return false;
-    }
-    if filters.modified_after.is_some_and(|modified_after| {
-        result
-            .modified_at
-            .is_none_or(|modified| modified < modified_after)
-    }) {
-        return false;
-    }
-    if filters.modified_before.is_some_and(|modified_before| {
-        result
-            .modified_at
-            .is_none_or(|modified| modified > modified_before)
-    }) {
+    if !filters.metadata_bounds_match(result.size_bytes, result.created_at, result.modified_at) {
         return false;
     }
     if let Some(name) = &filters.name {

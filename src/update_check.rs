@@ -37,15 +37,11 @@ pub fn current_version() -> &'static str {
 }
 
 fn cache_file() -> Option<PathBuf> {
-    Some(dirs::config_dir()?.join("locator").join("update_check"))
+    Some(crate::config::dir()?.join("update_check"))
 }
 
 fn disable_marker_file() -> Option<PathBuf> {
-    Some(
-        dirs::config_dir()?
-            .join("locator")
-            .join("update_check_disabled"),
-    )
+    Some(crate::config::dir()?.join("update_check_disabled"))
 }
 
 fn read_cache() -> Option<(u64, String)> {
@@ -74,7 +70,8 @@ pub fn checks_disabled() -> bool {
             return true;
         }
     }
-    disable_marker_file().map(|p| p.exists()).unwrap_or(false)
+    !crate::config::Config::load().update_check
+        || disable_marker_file().map(|p| p.exists()).unwrap_or(false)
 }
 
 pub fn persist_disable() {
@@ -179,29 +176,32 @@ fn detect_install_source(exe_path: &str, homebrew_prefix: &str, windows: bool) -
 }
 
 fn semver_gt(latest: &str, current: &str) -> bool {
-    let parse = |s: &str| -> Vec<u64> {
-        s.split('.')
-            .map(|part| {
-                // strip any non-digit suffix (e.g. pre-release like "1alpha")
-                let digits: String = part.chars().take_while(|c| c.is_ascii_digit()).collect();
-                digits.parse::<u64>().unwrap_or(0)
-            })
-            .collect()
+    // Split "1.2.3-rc.1+build" into the numeric core and the pre-release tag.
+    let split = |s: &str| -> (Vec<u64>, Option<String>) {
+        let s = s.split('+').next().unwrap_or(s);
+        let (core, pre) = match s.split_once('-') {
+            Some((core, pre)) => (core, Some(pre.to_string())),
+            None => (s, None),
+        };
+        let nums = core
+            .split('.')
+            .map(|part| part.parse::<u64>().unwrap_or(0))
+            .collect();
+        (nums, pre)
     };
-    let l = parse(latest);
-    let c = parse(current);
+    let ((mut l, lpre), (mut c, cpre)) = (split(latest), split(current));
     let len = l.len().max(c.len());
-    for i in 0..len {
-        let lv = l.get(i).copied().unwrap_or(0);
-        let cv = c.get(i).copied().unwrap_or(0);
-        if lv > cv {
-            return true;
-        }
-        if lv < cv {
-            return false;
-        }
+    l.resize(len, 0);
+    c.resize(len, 0);
+    if l != c {
+        return l > c;
     }
-    false
+    // Same core: a release is newer than its own pre-release.
+    match (lpre, cpre) {
+        (None, Some(_)) => true,
+        (Some(l), Some(c)) => l > c,
+        _ => false,
+    }
 }
 
 fn detect_update_cmd_for(exe_path: &str, homebrew_prefix: &str, windows: bool) -> String {
@@ -518,6 +518,15 @@ pub fn check_async(force_disabled: bool) -> mpsc::Receiver<Option<UpdateStatus>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_semver_gt_release_beats_its_prerelease() {
+        assert!(semver_gt("0.5.0", "0.5.0-rc.1"));
+        assert!(!semver_gt("0.5.0-rc.1", "0.5.0"));
+        assert!(!semver_gt("0.5.0-rc.1", "0.5.0-rc.1"));
+        assert!(semver_gt("0.5.0-rc.2", "0.5.0-rc.1"));
+        assert!(semver_gt("0.5.1-rc.1", "0.5.0"));
+    }
 
     #[test]
     fn test_semver_gt_minor_bump() {

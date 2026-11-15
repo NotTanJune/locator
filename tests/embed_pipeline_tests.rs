@@ -8,11 +8,13 @@ use std::time::Duration;
 
 use anyhow::{bail, Result};
 use locator::db::Database;
+use locator::embed::cli::count_images;
 use locator::embed::fake::HashEmbedder;
 use locator::embed::pipeline::{
     run_pass, run_pass_with_embedder, PassEvent, PassRequest, PassSummary,
 };
 use locator::embed::runtime::{document_input, query_input, Embedder};
+use locator::embed::skip::never_read_rule;
 use locator::embed::store::{
     sidecar_path_for_index, EmbedStore, FileStamp, FileStatus, StoredChunk, VectorIndex,
 };
@@ -65,7 +67,6 @@ fn write_standard_tree(root: &Path) {
 fn scan_into_index(root: &Path, index: &Path) {
     let db = Database::open(index).expect("open index");
     scan_root(&db, root, ScanOptions::default()).expect("scan");
-    db.checkpoint().expect("checkpoint");
 }
 
 fn request(fixture: &Fixture) -> PassRequest {
@@ -95,6 +96,24 @@ fn canonical(root: &Path) -> String {
         .expect("canonical")
         .to_string_lossy()
         .to_string()
+}
+
+/// The fake embedder without vision support, as when the vision model is not installed.
+struct NoVision(HashEmbedder);
+
+impl Embedder for NoVision {
+    fn backend_label(&self) -> &str {
+        "fake"
+    }
+    fn supports_images(&self) -> bool {
+        false
+    }
+    fn embed_batch(&mut self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
+        self.0.embed_batch(inputs)
+    }
+    fn embed_image(&mut self, _path: &Path) -> Result<Vec<f32>> {
+        bail!("no vision model")
+    }
 }
 
 /// Records every input it is asked to embed, then delegates to the fake embedder.
@@ -478,21 +497,6 @@ fn image_is_embedded_when_vision_is_available_and_skipped_otherwise() {
     let (summary, _) = run_fake(&fx);
     assert_eq!(summary.files_embedded, 1);
 
-    struct NoVision(HashEmbedder);
-    impl Embedder for NoVision {
-        fn backend_label(&self) -> &str {
-            "fake"
-        }
-        fn supports_images(&self) -> bool {
-            false
-        }
-        fn embed_batch(&mut self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
-            self.0.embed_batch(inputs)
-        }
-        fn embed_image(&mut self, _path: &Path) -> Result<Vec<f32>> {
-            bail!("no vision model")
-        }
-    }
     let other = fixture();
     image::RgbImage::from_pixel(4, 4, image::Rgb([0, 200, 0]))
         .save(other.root.join("green.png"))
@@ -666,4 +670,169 @@ fn file_that_now_holds_a_private_key_loses_its_chunks_on_next_pass() {
     let (detail, chunk_count, chunks) = file_row(&fx, "deploy.txt");
     assert_eq!(detail.as_deref(), Some("private key"));
     assert_eq!((chunk_count, chunks), (0, 0));
+}
+
+fn run_without_vision(fixture: &Fixture) -> PassSummary {
+    let (tx, _rx) = mpsc::channel();
+    run_pass_with_embedder(
+        &request(fixture),
+        tx,
+        Arc::new(AtomicBool::new(false)),
+        &mut NoVision(HashEmbedder),
+    )
+    .expect("pass")
+}
+
+#[test]
+fn image_skipped_without_vision_is_embedded_once_vision_is_available() {
+    let fx = fixture();
+    image::RgbImage::from_pixel(4, 4, image::Rgb([200, 0, 0]))
+        .save(fx.root.join("red.png"))
+        .expect("png");
+    scan_into_index(&fx.root, &fx.index);
+    assert_eq!(run_without_vision(&fx).files_skipped, 1);
+
+    let (summary, _) = run_fake(&fx);
+    assert_eq!(summary.files_embedded, 1);
+    assert_eq!(summary.files_unchanged, 0);
+    let store = store_for(&fx);
+    assert_eq!(store.chunk_count().expect("chunks"), 1);
+    let image = Path::new(&canonical(&fx.root))
+        .join("red.png")
+        .to_string_lossy()
+        .to_string();
+    assert!(!store.is_skipped(&image).expect("is_skipped"));
+
+    // Without vision again, the skipped row is not rewritten on every pass.
+    let other = fixture();
+    image::RgbImage::from_pixel(4, 4, image::Rgb([0, 200, 0]))
+        .save(other.root.join("green.png"))
+        .expect("png");
+    scan_into_index(&other.root, &other.index);
+    run_without_vision(&other);
+    assert_eq!(run_without_vision(&other).files_unchanged, 1);
+}
+
+#[test]
+fn home_library_rule_skips_library_only_when_the_root_is_outside_it() {
+    let home = Path::new("/Users/me");
+    let no_manifest = |_: &Path| false;
+    let relative = Path::new("notes/plan.md");
+    for root in [
+        "/Users/me/Library/CloudStorage/Dropbox",
+        "/Users/me/Library/CloudStorage/GoogleDrive-me@example.com/My Drive",
+        "/Users/me/Library/Mobile Documents/com~apple~CloudDocs",
+        "/Users/me/Library",
+    ] {
+        let absolute = Path::new(root).join(relative);
+        assert_eq!(
+            never_read_rule(relative, &absolute, Some(home), &no_manifest),
+            None,
+            "root {root}"
+        );
+    }
+
+    // Scanning home or a parent of it still keeps ~/Library out.
+    let absolute = Path::new("/Users/me/Library/Caches/app/x.txt");
+    for root in ["/Users/me", "/Users"] {
+        let relative = absolute.strip_prefix(root).expect("under root");
+        assert_eq!(
+            never_read_rule(relative, absolute, Some(home), &no_manifest),
+            Some("home Library folder"),
+            "root {root}"
+        );
+    }
+}
+
+#[test]
+fn image_count_includes_only_images_the_pass_can_embed() {
+    let fx = fixture();
+    let pixel = image::RgbImage::from_pixel(2, 2, image::Rgb([1, 2, 3]));
+    pixel.save(fx.root.join("photo.png")).expect("png");
+    pixel.save(fx.root.join("photo.jpg")).expect("jpg");
+    // Formats the vision path does not read.
+    for name in ["photo.heic", "photo.webp", "photo.tiff"] {
+        fs::write(fx.root.join(name), b"not decoded").expect("write");
+    }
+    // Kept out by a rule.
+    fs::create_dir_all(fx.root.join("out")).expect("out");
+    pixel
+        .save(fx.root.join("out").join("logo.png"))
+        .expect("rule png");
+    // Over the image size limit.
+    fs::File::create(fx.root.join("huge.png"))
+        .expect("huge")
+        .set_len(26 * 1_048_576)
+        .expect("set_len");
+    scan_into_index(&fx.root, &fx.index);
+
+    let root = fx.root.canonicalize().expect("canonical");
+    assert_eq!(count_images(&fx.index, &root).expect("count"), 2);
+}
+
+#[test]
+fn nested_root_files_are_pruned_by_the_parent_root_pass() {
+    let fx = fixture();
+    let nested = fx.root.join("sub");
+    fs::create_dir_all(&nested).expect("sub");
+    fs::write(nested.join("keep.txt"), "kept nested notes").expect("keep");
+    fs::write(nested.join("gone.txt"), "deleted nested notes").expect("gone");
+    fs::write(fx.root.join("top.txt"), "top level notes").expect("top");
+
+    scan_into_index(&nested, &fx.index);
+    let (tx, _rx) = mpsc::channel();
+    let nested_request = PassRequest {
+        root: nested.clone(),
+        ..request(&fx)
+    };
+    run_pass(&nested_request, tx, Arc::new(AtomicBool::new(false))).expect("nested pass");
+
+    // The parent pass takes over the nested files without embedding them again.
+    scan_into_index(&fx.root, &fx.index);
+    let (summary, _) = run_fake(&fx);
+    assert_eq!(summary.files_embedded, 1);
+    assert_eq!(summary.files_unchanged, 2);
+
+    fs::remove_file(nested.join("gone.txt")).expect("delete");
+    scan_into_index(&fx.root, &fx.index);
+    run_fake(&fx);
+
+    let store = store_for(&fx);
+    let gone = Path::new(&canonical(&nested))
+        .join("gone.txt")
+        .to_string_lossy()
+        .to_string();
+    assert_eq!(store.snippets_for(&[(gone, 0)]).expect("snippet")[0], "");
+    assert_eq!(store.stats().expect("stats").files, 2);
+    assert_eq!(store.roots().expect("roots"), vec![canonical(&fx.root)]);
+}
+
+#[test]
+fn removed_root_is_pruned_on_the_next_pass_of_another_root() {
+    let fx = fixture();
+    fs::write(fx.root.join("a.txt"), "first root notes").expect("a");
+    let other = fx.root.parent().expect("parent").join("other");
+    fs::create_dir_all(&other).expect("other");
+    fs::write(other.join("b.txt"), "second root notes").expect("b");
+
+    scan_into_index(&fx.root, &fx.index);
+    run_fake(&fx);
+    scan_into_index(&other, &fx.index);
+    let (tx, _rx) = mpsc::channel();
+    let other_request = PassRequest {
+        root: other.clone(),
+        ..request(&fx)
+    };
+    run_pass(&other_request, tx, Arc::new(AtomicBool::new(false))).expect("other pass");
+    assert_eq!(store_for(&fx).stats().expect("stats").files, 2);
+
+    let db = Database::open(&fx.index).expect("open index");
+    db.remove_root(&canonical(&other)).expect("remove root");
+    drop(db);
+    run_fake(&fx);
+
+    let store = store_for(&fx);
+    assert_eq!(store.stats().expect("stats").files, 1);
+    assert_eq!(store.chunk_count().expect("chunks"), 1);
+    assert_eq!(store.roots().expect("roots"), vec![canonical(&fx.root)]);
 }

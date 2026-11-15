@@ -74,8 +74,6 @@ fn default_scan_options_prioritize_fast_first_scan() {
 
     assert!(!options.estimate_totals);
     assert_eq!(options.backend, locator::scanner::ScanBackend::ParallelWalk);
-    assert_eq!(options.batch_size, 500_000);
-    assert_eq!(options.writer_queue_batches, 64);
     assert_eq!(options.native_buffer_bytes, 16 * 1024 * 1024);
     assert_eq!(options.native_workers, 8);
     assert_eq!(options.native_output_batch_size, 4096);
@@ -180,28 +178,7 @@ fn scanner_records_scan_profile_timings() {
     let stats = scan_root(&db, dir.path(), ScanOptions::default()).expect("scan succeeds");
 
     assert!(stats.profile.total >= stats.profile.walk);
-    assert_eq!(stats.profile.batches, 1);
     assert_eq!(stats.profile.indexed_files, 1);
-}
-
-#[test]
-fn fresh_index_scan_skips_stale_mark() {
-    let dir = tempdir().expect("temp dir");
-    fs::write(dir.path().join("one.txt"), "one").expect("write file");
-
-    let db = Database::open_in_memory().expect("db opens");
-    let stats = scan_root(
-        &db,
-        dir.path(),
-        ScanOptions {
-            fresh_index: true,
-            ..Default::default()
-        },
-    )
-    .expect("scan succeeds");
-
-    assert_eq!(stats.indexed_files, 1);
-    assert_eq!(stats.profile.stale_mark.as_secs(), 0);
 }
 
 #[test]
@@ -349,4 +326,57 @@ fn dirent_backend_indexes_files_and_reports_dirent_progress() {
             .len(),
         1
     );
+}
+
+fn assert_files_named_like_build_dirs_are_indexed(backend: locator::scanner::ScanBackend) {
+    let dir = tempdir().expect("temp dir");
+    let root = dir.path().canonicalize().expect("canonical root");
+    for name in ["build", "dist", "target", "build.sh"] {
+        fs::write(root.join(name), "#!/bin/sh\n").expect("write file");
+    }
+    fs::write(root.join(".DS_Store"), "noise").expect("write noise");
+    fs::write(root.join("._build"), "noise").expect("write appledouble");
+    fs::create_dir(root.join("sub")).expect("create sub");
+    fs::write(root.join("sub").join("dist"), "x").expect("write nested file");
+    fs::create_dir(root.join("node_modules")).expect("create noise dir");
+    fs::write(root.join("node_modules").join("kept.txt"), "x").expect("write skipped");
+
+    let db = Database::open_in_memory().expect("db opens");
+    let stats = scan_root(
+        &db,
+        &root,
+        ScanOptions {
+            backend,
+            ..Default::default()
+        },
+    )
+    .expect("scan succeeds");
+
+    assert_eq!(stats.indexed_files, 5);
+    for path in ["build", "dist", "target", "sub/dist"] {
+        let full = &root.join(path);
+        assert!(
+            db.result_for_path(&full.to_string_lossy())
+                .expect("lookup")
+                .is_some(),
+            "{path} should be indexed"
+        );
+    }
+}
+
+#[test]
+fn parallel_walk_indexes_files_named_like_build_directories() {
+    assert_files_named_like_build_dirs_are_indexed(locator::scanner::ScanBackend::ParallelWalk);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn native_backend_indexes_files_named_like_build_directories() {
+    assert_files_named_like_build_dirs_are_indexed(locator::scanner::ScanBackend::Native);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn dirent_backend_indexes_files_named_like_build_directories() {
+    assert_files_named_like_build_dirs_are_indexed(locator::scanner::ScanBackend::Dirent);
 }

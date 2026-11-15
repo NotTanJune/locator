@@ -21,9 +21,6 @@ pub struct Config {
     pub preview: bool,
     /// Check GitHub for newer releases.
     pub update_check: bool,
-    /// Also index full paths (not just filenames) for substring search. Enables
-    /// directory-name substring matching at the cost of a much slower scan.
-    pub index_paths: bool,
     /// Width of stored semantic-search vectors (128, 256, 512, or 768). Changing it re-embeds on the next `scan --em`.
     pub embed_dims: u16,
     /// How deep `scan --em` embeds each file: quick, balanced or deep (see `lctr scan --depth`).
@@ -38,7 +35,6 @@ impl Default for Config {
             backend: "parallel".to_string(),
             preview: true,
             update_check: true,
-            index_paths: false,
             embed_dims: 768,
             embed_depth: "quick".to_string(),
         }
@@ -46,13 +42,12 @@ impl Default for Config {
 }
 
 /// All settable keys, for `config` listing and validation.
-pub const KEYS: [&str; 8] = [
+pub const KEYS: [&str; 7] = [
     "icons",
     "theme",
     "backend",
     "preview",
     "update_check",
-    "index_paths",
     "embed_dims",
     "embed_depth",
 ];
@@ -60,32 +55,90 @@ pub const KEYS: [&str; 8] = [
 const EMBED_DIMS_VALUES: [&str; 4] = ["128", "256", "512", "768"];
 const EMBED_DEPTH_VALUES: [&str; 3] = ["quick", "balanced", "deep"];
 
+/// Directory holding `config.toml` and the update-check files. `LCTR_CONFIG_DIR` wins.
+pub fn dir() -> Option<PathBuf> {
+    match std::env::var_os("LCTR_CONFIG_DIR") {
+        Some(dir) => Some(PathBuf::from(dir)),
+        None => Some(dirs::config_dir()?.join("locator")),
+    }
+}
+
 impl Config {
     pub fn path() -> Result<PathBuf> {
-        if let Some(dir) = std::env::var_os("LCTR_CONFIG_DIR") {
-            return Ok(PathBuf::from(dir).join("config.toml"));
-        }
-        let base = dirs::config_dir().context("locate config directory")?;
-        Ok(base.join("locator").join("config.toml"))
+        Ok(dir()
+            .context("locate config directory")?
+            .join("config.toml"))
     }
 
     /// Load config, returning defaults if the file is missing or unparsable.
+    /// Runs on every database open, so it never prints.
     pub fn load() -> Self {
-        Self::path()
-            .ok()
-            .and_then(|path| std::fs::read_to_string(path).ok())
-            .and_then(|text| toml::from_str(&text).ok())
+        Self::load_reporting()
+            .map(|(config, _)| config)
             .unwrap_or_default()
+    }
+
+    /// Load config keeping every valid key. Returns the names of keys that were
+    /// present but invalid (those keep their default). A file that is not valid
+    /// TOML is an error, so callers never overwrite it with defaults.
+    pub fn load_reporting() -> Result<(Self, Vec<String>)> {
+        let path = Self::path()?;
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((Self::default(), Vec::new()))
+            }
+            Err(e) => return Err(e).with_context(|| format!("read config {}", path.display())),
+        };
+        let table: toml::Table = text.parse().with_context(|| {
+            format!(
+                "config {} is not valid TOML; fix it by hand or run `lctr config reset`",
+                path.display()
+            )
+        })?;
+        let mut config = Self::default();
+        let mut ignored = Vec::new();
+        for (key, value) in table {
+            if !KEYS.contains(&key.as_str()) {
+                continue;
+            }
+            // Deserialize the key alone so a bad value cannot affect the others.
+            let single = toml::Table::from_iter([(key.clone(), value)]);
+            let valid = single
+                .try_into::<Self>()
+                .ok()
+                .and_then(|one| config.set(&key, &one.get(&key).ok()?).ok());
+            if valid.is_none() {
+                ignored.push(key);
+            }
+        }
+        Ok((config, ignored))
+    }
+
+    /// Like `load_reporting`, warning on stderr about ignored keys (for `lctr config` commands).
+    pub fn load_with_warning() -> Result<Self> {
+        let (config, ignored) = Self::load_reporting()?;
+        if !ignored.is_empty() {
+            eprintln!(
+                "warning: ignoring invalid config value(s) for: {} (using defaults)",
+                ignored.join(", ")
+            );
+        }
+        Ok(config)
     }
 
     pub fn save(&self) -> Result<()> {
         let path = Self::path()?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("create config directory {}", parent.display()))?;
-        }
+        let parent = path.parent().context("config path has no directory")?;
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("create config directory {}", parent.display()))?;
         let text = toml::to_string_pretty(self).context("serialize config")?;
-        std::fs::write(&path, text).with_context(|| format!("write config {}", path.display()))
+        let tmp = parent.join(format!(".config.toml.{}.tmp", std::process::id()));
+        std::fs::write(&tmp, text).with_context(|| format!("write config {}", tmp.display()))?;
+        std::fs::rename(&tmp, &path).with_context(|| {
+            let _ = std::fs::remove_file(&tmp);
+            format!("replace config {}", path.display())
+        })
     }
 
     pub fn get(&self, key: &str) -> Result<String> {
@@ -95,7 +148,6 @@ impl Config {
             "backend" => self.backend.clone(),
             "preview" => self.preview.to_string(),
             "update_check" => self.update_check.to_string(),
-            "index_paths" => self.index_paths.to_string(),
             "embed_dims" => self.embed_dims.to_string(),
             "embed_depth" => self.embed_depth.clone(),
             other => return Err(unknown_key(other)),
@@ -107,7 +159,6 @@ impl Config {
             "icons" => self.icons = parse_bool(value)?,
             "preview" => self.preview = parse_bool(value)?,
             "update_check" => self.update_check = parse_bool(value)?,
-            "index_paths" => self.index_paths = parse_bool(value)?,
             "theme" => self.theme = validate_one_of(value, &THEME_VALUES, "theme")?,
             "backend" => self.backend = validate_one_of(value, &BACKEND_VALUES, "backend")?,
             "embed_dims" => {
@@ -138,7 +189,6 @@ pub fn key_label(key: &str) -> &'static str {
         "backend" => "Scan backend",
         "preview" => "Preview pane",
         "update_check" => "Update check",
-        "index_paths" => "Index full paths",
         "embed_dims" => "Embedding dimensions",
         "embed_depth" => "Embedding depth",
         _ => "",
@@ -159,9 +209,6 @@ pub fn key_description(key: &str) -> &'static str {
             "Show the syntax-highlighted file preview pane (with inline images) when the terminal is wide enough."
         }
         "update_check" => "Check GitHub at most once a day for a newer lctr release.",
-        "index_paths" => {
-            "Index full file paths, not just filenames, so substring search also matches directory names. Makes the scan's optimize phase much slower (paths are ~7x more text). Off = filename search only, fast scans. Takes effect on the next scan."
-        }
         "embed_dims" => {
             "Size of stored embedding vectors for semantic search. Smaller is faster and uses less disk, larger is more accurate. Changing it re-embeds on the next `scan --em`."
         }

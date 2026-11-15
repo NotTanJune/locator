@@ -1,8 +1,6 @@
 use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{self, SyncSender};
-use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
@@ -11,16 +9,14 @@ use clap::ValueEnum;
 use jwalk::WalkDir;
 
 use crate::db::{Database, FileRecord};
+use crate::name_file::NameFileBuilder;
 
 #[derive(Debug, Clone)]
 pub struct ScanOptions {
     pub idle_timeout: Duration,
-    pub batch_size: usize,
-    pub writer_queue_batches: usize,
     pub native_buffer_bytes: usize,
     pub native_workers: usize,
     pub native_output_batch_size: usize,
-    pub fresh_index: bool,
     pub estimate_totals: bool,
     pub backend: ScanBackend,
 }
@@ -29,12 +25,9 @@ impl Default for ScanOptions {
     fn default() -> Self {
         Self {
             idle_timeout: Duration::from_secs(300),
-            batch_size: 500_000,
-            writer_queue_batches: 64,
             native_buffer_bytes: 16 * 1024 * 1024,
             native_workers: 8,
             native_output_batch_size: 4096,
-            fresh_index: false,
             estimate_totals: false,
             backend: ScanBackend::ParallelWalk,
         }
@@ -56,14 +49,8 @@ pub struct ScanProfile {
     pub total: Duration,
     pub discovery: Duration,
     pub walk: Duration,
-    pub sqlite_writes: Duration,
-    pub cleanup: Duration,
     pub record_handling: Duration,
-    pub writer_wait: Duration,
-    pub stale_mark: Duration,
-    pub fts_rebuild: Duration,
-    pub index_rebuild: Duration,
-    pub trigger_recreate: Duration,
+    pub name_file_write: Duration,
     pub native_dirs_opened: u64,
     pub native_entries_seen: u64,
     pub native_files_seen: u64,
@@ -75,7 +62,6 @@ pub struct ScanProfile {
     pub native_parse: Duration,
     pub native_emit: Duration,
     pub native_queue_wait: Duration,
-    pub batches: u64,
     pub indexed_files: u64,
     pub indexed_bytes: u64,
 }
@@ -252,16 +238,9 @@ pub fn scan_root_with_progress(
         None
     };
 
-    let scan_token = Utc::now().timestamp_millis();
-    db.mark_scan_started(&root_string, scan_token)?;
-    db.begin_bulk_scan()?;
-    let mut batch = Vec::with_capacity(options.batch_size);
-    let mut writer = ScanWriter::new(
-        db,
-        scan_token,
-        options.writer_queue_batches,
-        options.fresh_index,
-    )?;
+    let scan_token = db.next_scan_token(&root_string)?;
+    // The rows stay in memory until the walk ends; nothing is written before `install_scan`.
+    let mut rows = NameFileBuilder::default();
     let mut error_summaries = BTreeMap::<ScanErrorKind, ScanErrorSummary>::new();
     let mut last_progress_emit = Instant::now() - Duration::from_secs(1);
     let walk_start = Instant::now();
@@ -269,7 +248,7 @@ pub fn scan_root_with_progress(
     let mut handle_record = |record: FileRecord,
                              stats: &mut ScanStats,
                              profile: &mut ScanProfile,
-                             batch: &mut Vec<FileRecord>|
+                             rows: &mut NameFileBuilder|
      -> Result<()> {
         let record_start = Instant::now();
         stats.indexed_files += 1;
@@ -288,12 +267,7 @@ pub fn scan_root_with_progress(
             );
             last_progress_emit = Instant::now();
         }
-        batch.push(record);
-
-        if batch.len() >= options.batch_size {
-            let full_batch = std::mem::replace(batch, Vec::with_capacity(options.batch_size));
-            writer.write_batch(full_batch, profile)?;
-        }
+        rows.push(&record.path, &record.kind)?;
         profile.record_handling += record_start.elapsed();
         Ok(())
     };
@@ -309,11 +283,11 @@ pub fn scan_root_with_progress(
                 backend,
                 |entry| match entry {
                     NativeScanEntry::File(record) => {
-                        handle_record(record, &mut stats, &mut profile, &mut batch)
+                        handle_record(record, &mut stats, &mut profile, &mut rows)
                     }
                     NativeScanEntry::Files(records) => {
                         for record in records {
-                            handle_record(record, &mut stats, &mut profile, &mut batch)?;
+                            handle_record(record, &mut stats, &mut profile, &mut rows)?;
                         }
                         Ok(())
                     }
@@ -355,17 +329,12 @@ pub fn scan_root_with_progress(
                     }
                 };
 
-                handle_record(record, &mut stats, &mut profile, &mut batch)?;
+                handle_record(record, &mut stats, &mut profile, &mut rows)?;
             }
         }
     }
     profile.walk = walk_start.elapsed();
 
-    if !batch.is_empty() {
-        writer.write_batch(batch, &mut profile)?;
-    }
-    writer.finish(&mut profile)?;
-    profile.walk = profile.walk.saturating_sub(profile.sqlite_writes);
     emit_progress(
         &mut on_progress,
         ScanProgressInput {
@@ -377,22 +346,9 @@ pub fn scan_root_with_progress(
             backend,
         },
     );
-    let cleanup_start = Instant::now();
-    if !options.fresh_index {
-        let stale_start = Instant::now();
-        db.mark_stale_under_root(&root_string, scan_token)?;
-        profile.stale_mark = stale_start.elapsed();
-    }
-    let bulk_profile = if options.fresh_index {
-        db.finish_fresh_staged_scan_profile()?
-    } else {
-        db.finish_bulk_scan_profile()?
-    };
-    profile.fts_rebuild = bulk_profile.fts_rebuild;
-    profile.index_rebuild = bulk_profile.index_rebuild;
-    profile.trigger_recreate = bulk_profile.trigger_recreate;
-    db.mark_scan_completed(&root_string, scan_token)?;
-    profile.cleanup = cleanup_start.elapsed();
+    let write_start = Instant::now();
+    db.install_scan(&root_string, rows, scan_token)?;
+    profile.name_file_write = write_start.elapsed();
     emit_progress(
         &mut on_progress,
         ScanProgressInput {
@@ -535,7 +491,7 @@ pub fn pruned_walk(root: &Path) -> impl Iterator<Item = jwalk::Result<jwalk::Dir
         .process_read_dir(|_depth, _path, _state, children| {
             children.iter_mut().for_each(|child| {
                 if let Ok(entry) = child {
-                    if is_skip_name(&entry.file_name.to_string_lossy()) {
+                    if is_skipped_entry(entry.file_type().is_dir(), &entry.file_name) {
                         entry.read_children_path = None;
                     }
                 }
@@ -543,7 +499,7 @@ pub fn pruned_walk(root: &Path) -> impl Iterator<Item = jwalk::Result<jwalk::Dir
             children.retain(|child| {
                 child
                     .as_ref()
-                    .map(|entry| !is_skip_name(&entry.file_name.to_string_lossy()))
+                    .map(|entry| !is_skipped_entry(entry.file_type().is_dir(), &entry.file_name))
                     .unwrap_or(true)
             });
         })
@@ -571,12 +527,39 @@ fn lower_process_priority() {
     }
 }
 
+/// True when an entry named `name` is skipped, given what kind of entry it is.
+/// Build-output names (`build`, `dist`, ...) skip directories only.
+fn is_skipped_entry(is_dir: bool, name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy();
+    if is_dir {
+        is_skip_name(&name)
+    } else {
+        is_skip_file_name(&name)
+    }
+}
+
+/// Skip rules for a path component whose kind is unknown (a directory name
+/// or a file name). Callers that know the entry is a regular file should use
+/// [`is_skip_file_name`] so files named like build directories stay indexed.
 pub(crate) fn is_skip_name(name: &str) -> bool {
     is_skip_name_bytes(name.as_bytes())
 }
 
+/// Skip rules for a regular file: only OS noise files.
+pub(crate) fn is_skip_file_name(name: &str) -> bool {
+    is_skip_file_name_bytes(name.as_bytes())
+}
+
+pub(crate) fn is_skip_file_name_bytes(name: &[u8]) -> bool {
+    name.starts_with(b"._")
+        || matches!(
+            name,
+            b".DS_Store" | b".VolumeIcon.icns" | b".apdisk" | b".metadata_never_index"
+        )
+}
+
 pub(crate) fn is_skip_name_bytes(name: &[u8]) -> bool {
-    if name.starts_with(b"._") {
+    if is_skip_file_name_bytes(name) {
         return true;
     }
 
@@ -698,7 +681,7 @@ pub(crate) fn system_time_to_utc(time: SystemTime) -> Option<DateTime<Utc>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_skip_name, is_skip_name_bytes, kind_for_extension};
+    use super::{is_skip_file_name, is_skip_name, is_skip_name_bytes, kind_for_extension};
 
     #[test]
     fn byte_skip_name_matches_string_skip_name_for_known_noise() {
@@ -718,6 +701,13 @@ mod tests {
     }
 
     #[test]
+    fn build_output_names_skip_directories_but_not_files() {
+        assert!(is_skip_name("build") && !is_skip_file_name("build"));
+        assert!(is_skip_name("dist") && !is_skip_file_name("dist"));
+        assert!(is_skip_file_name(".DS_Store") && is_skip_file_name("._x"));
+    }
+
+    #[test]
     fn extension_kind_classification_avoids_path_parsing() {
         assert_eq!(kind_for_extension(Some("pdf")), "pdf");
         assert_eq!(kind_for_extension(Some("jpg")), "image");
@@ -725,112 +715,6 @@ mod tests {
         assert_eq!(kind_for_extension(Some("txt")), "text");
         assert_eq!(kind_for_extension(Some("zip")), "archive");
         assert_eq!(kind_for_extension(None), "file");
-    }
-}
-
-#[derive(Debug, Clone, Copy, Default)]
-struct WriteProfile {
-    sqlite_writes: Duration,
-    batches: u64,
-}
-
-enum ScanWriter<'a> {
-    Direct {
-        db: &'a Database,
-        scan_token: i64,
-        insert_only: bool,
-    },
-    Pipelined {
-        tx: SyncSender<Vec<FileRecord>>,
-        handle: thread::JoinHandle<Result<WriteProfile>>,
-    },
-}
-
-impl<'a> ScanWriter<'a> {
-    fn new(
-        db: &'a Database,
-        scan_token: i64,
-        queue_batches: usize,
-        insert_only: bool,
-    ) -> Result<Self> {
-        let Some(db_path) = db.path().map(Path::to_path_buf) else {
-            return Ok(Self::Direct {
-                db,
-                scan_token,
-                insert_only,
-            });
-        };
-
-        let (tx, rx) = mpsc::sync_channel::<Vec<FileRecord>>(queue_batches.max(1));
-        let handle = thread::spawn(move || -> Result<WriteProfile> {
-            let writer_db = if insert_only {
-                Database::open_existing_for_staged_writer(&db_path)?
-            } else {
-                Database::open_existing_without_migrate(&db_path)?
-            };
-            let mut profile = WriteProfile::default();
-            for batch in rx {
-                if batch.is_empty() {
-                    continue;
-                }
-                let write_start = Instant::now();
-                if insert_only {
-                    writer_db.insert_light_files_with_indexed_at(&batch, scan_token)?;
-                } else {
-                    writer_db.upsert_light_files_with_indexed_at(&batch, scan_token)?;
-                }
-                profile.sqlite_writes += write_start.elapsed();
-                profile.batches += 1;
-            }
-            Ok(profile)
-        });
-
-        Ok(Self::Pipelined { tx, handle })
-    }
-
-    fn write_batch(&mut self, batch: Vec<FileRecord>, profile: &mut ScanProfile) -> Result<()> {
-        if batch.is_empty() {
-            return Ok(());
-        }
-
-        match self {
-            Self::Direct {
-                db,
-                scan_token,
-                insert_only,
-            } => {
-                let write_start = Instant::now();
-                if *insert_only {
-                    db.insert_light_files_with_indexed_at(&batch, *scan_token)?;
-                } else {
-                    db.upsert_light_files_with_indexed_at(&batch, *scan_token)?;
-                }
-                profile.sqlite_writes += write_start.elapsed();
-                profile.batches += 1;
-                Ok(())
-            }
-            Self::Pipelined { tx, .. } => {
-                let wait_start = Instant::now();
-                tx.send(batch).context("send scan batch to writer")?;
-                profile.writer_wait += wait_start.elapsed();
-                Ok(())
-            }
-        }
-    }
-
-    fn finish(self, profile: &mut ScanProfile) -> Result<()> {
-        match self {
-            Self::Direct { .. } => Ok(()),
-            Self::Pipelined { tx, handle } => {
-                drop(tx);
-                let write_profile = handle
-                    .join()
-                    .map_err(|_| anyhow::anyhow!("scan writer thread panicked"))??;
-                profile.sqlite_writes += write_profile.sqlite_writes;
-                profile.batches += write_profile.batches;
-                Ok(())
-            }
-        }
     }
 }
 
@@ -1017,8 +901,8 @@ mod native {
     use anyhow::Result;
 
     use super::{
-        is_skip_name, is_skip_name_bytes, kind_for_extension, volume_for, NativeProfile,
-        NativeScanEntry, ScanBackend,
+        is_skip_file_name, is_skip_file_name_bytes, is_skip_name, is_skip_name_bytes,
+        kind_for_extension, volume_for, NativeProfile, NativeScanEntry, ScanBackend,
     };
     use crate::db::FileRecord;
 
@@ -1425,25 +1309,25 @@ mod native {
         if name_bytes == b"." || name_bytes == b".." {
             return Ok(None);
         }
-        if is_skip_name_bytes(name_bytes) {
-            return Ok(None);
-        }
         let name = std::ffi::OsStr::from_bytes(name_bytes);
 
         let dtype = entry.d_type;
         if dtype == DT_DIR {
-            return Ok(Some(ParsedEntry::Directory(parent.join(name))));
+            return Ok(dir_entry(parent, name));
         }
         if dtype == DT_UNKNOWN {
             profile.unknown_type += 1;
             let kind = dirent_unknown_kind(parent_fd, name)?;
             if kind == VDIR {
-                return Ok(Some(ParsedEntry::Directory(parent.join(name))));
+                return Ok(dir_entry(parent, name));
             }
             if !matches!(kind, VREG | VLNK) {
                 return Ok(None);
             }
         } else if !matches!(dtype, DT_REG | DT_LNK) {
+            return Ok(None);
+        }
+        if is_skip_file_name_bytes(name_bytes) {
             return Ok(None);
         }
 
@@ -1453,6 +1337,10 @@ mod native {
             volume,
             name_bytes,
         )))
+    }
+
+    fn dir_entry(parent: &Path, name: &std::ffi::OsStr) -> Option<ParsedEntry> {
+        (!is_skip_name_bytes(name.as_bytes())).then(|| ParsedEntry::Directory(parent.join(name)))
     }
 
     fn dirent_unknown_kind(parent_fd: libc::c_int, name: &std::ffi::OsStr) -> std::io::Result<u32> {
@@ -1595,10 +1483,6 @@ mod native {
         if name == "." || name == ".." {
             return None;
         }
-        if is_skip_name(&name.to_string_lossy()) {
-            return None;
-        }
-
         let obj_type = if returned.commonattr & libc::ATTR_CMN_OBJTYPE != 0 {
             read_value::<u32>(entry, &mut offset)?
         } else {
@@ -1606,10 +1490,13 @@ mod native {
         };
 
         if obj_type == VDIR {
+            if is_skip_name(&name.to_string_lossy()) {
+                return None;
+            }
             let path = parent.join(&name);
             return Some(ParsedEntry::Directory(path));
         }
-        if !matches!(obj_type, VREG | VLNK) {
+        if !matches!(obj_type, VREG | VLNK) || is_skip_file_name(&name.to_string_lossy()) {
             return None;
         }
 

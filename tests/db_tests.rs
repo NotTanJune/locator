@@ -1,9 +1,9 @@
 use chrono::{TimeZone, Utc};
-use locator::config::Config;
 use locator::db::{
-    db_path_for_working_dir, default_db_path, existing_db_path_for_working_dir,
+    db_path_for_working_dir, default_db_path, delete_index_files, existing_db_path_for_working_dir,
     fallback_db_path_for_root, local_db_path_for_root, Database, FileRecord, ScanCompletion,
 };
+use locator::name_file::{name_file_path, NameFile, NameFileBuilder};
 use locator::query::{QueryMode, SearchFilters, SearchOptions, SortField};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -13,11 +13,10 @@ use tempfile::tempdir;
 
 static LCTR_ENV_LOCK: Mutex<()> = Mutex::new(());
 
-/// Every test in this file holds this lock. Opening a database reads the global user config
-/// (`Config::load`, through `fts_index_paths`), and the tests that point `LCTR_CONFIG_DIR` or
-/// `LCTR_DATA_DIR` at a temporary folder change what that read returns. A test that does not hold
-/// the lock can see the setting flip in the middle of a write. A poisoned lock (an earlier test
-/// panicked) is still taken, so one failure does not cascade into the rest.
+/// Every test in this file holds this lock. Some tests point `LCTR_CONFIG_DIR` or `LCTR_DATA_DIR` at a temporary folder, and those
+/// variables are global to the process. A test that does not hold the lock can see them change
+/// while it runs. A poisoned lock (an earlier test panicked) is still taken, so one failure does
+/// not cascade into the rest.
 fn env_guard() -> std::sync::MutexGuard<'static, ()> {
     LCTR_ENV_LOCK
         .lock()
@@ -60,6 +59,53 @@ fn record_for_path(path: &Path, ext: Option<&str>, size: u64, modified_year: i32
         created_at: Some(Utc.with_ymd_and_hms(2023, 1, 1, 0, 0, 0).unwrap()),
         modified_at: Some(Utc.with_ymd_and_hms(modified_year, 1, 1, 0, 0, 0).unwrap()),
     }
+}
+
+/// Installs `rows` (path and kind) as the rows of a finished scan of `root`, the way a scan
+/// stores them.
+fn install(db: &Database, root: &str, rows: &[(&str, &str)], token: i64) {
+    let mut builder = NameFileBuilder::default();
+    for (path, kind) in rows {
+        builder.push(path, kind).expect("push row");
+    }
+    db.install_scan(root, builder, token).expect("install scan");
+}
+
+/// A row the watcher would record for `path` under `root`.
+fn live_record(root: &str, path: &str, kind: &str, size: u64) -> FileRecord {
+    let name = path.rsplit('/').next().expect("a name");
+    FileRecord {
+        path: path.into(),
+        name: name.into(),
+        parent: path[..path.len() - name.len()].trim_end_matches('/').into(),
+        extension: name.rsplit_once('.').map(|(_, ext)| ext.to_string()),
+        root: root.into(),
+        volume: "local".into(),
+        kind: kind.into(),
+        size_bytes: size,
+        created_at: None,
+        modified_at: None,
+    }
+}
+
+/// The path of every active row, sorted.
+fn all_paths(db: &Database) -> Vec<String> {
+    let mut paths: Vec<String> = db
+        .search("", &SearchFilters::new(), 1_000_000)
+        .expect("list every row")
+        .into_iter()
+        .map(|result| result.path)
+        .collect();
+    paths.sort();
+    paths
+}
+
+/// The number of rows in the `changes` table of the database file at `db_path`.
+fn change_count(db_path: &Path) -> i64 {
+    rusqlite::Connection::open(db_path)
+        .expect("raw connection")
+        .query_row("SELECT COUNT(*) FROM changes", [], |row| row.get(0))
+        .expect("count changes")
 }
 
 #[test]
@@ -205,19 +251,24 @@ fn option_search_uses_contains_mode_for_infix_filename_matches() {
 }
 
 #[test]
-fn marks_missing_root_records_deleted() {
+fn installing_a_scan_keeps_rows_the_watcher_wrote_during_the_scan() {
     let _guard = env_guard();
     let db = Database::open_in_memory().expect("db opens");
-    db.upsert_file(&record("/tmp/old.pdf", "old.pdf", Some("pdf"), 10, 2024))
-        .expect("insert");
+    let scan_token = Utc::now().timestamp_millis() - 60_000;
+    let gone = record("/tmp/gone.pdf", "gone.pdf", Some("pdf"), 10, 2024);
+    db.upsert_files_with_indexed_at(std::slice::from_ref(&gone), scan_token - 1)
+        .expect("row from an older scan");
+    // The watcher stamps rows with the current time, which is after the scan started.
+    db.upsert_file(&record("/tmp/new.pdf", "new.pdf", Some("pdf"), 10, 2024))
+        .expect("watcher row");
 
-    db.mark_missing_under_root("/tmp", &[])
-        .expect("mark missing");
-    let results = db
-        .search("old", &SearchFilters::new(), 20)
-        .expect("search works");
+    install(&db, "/tmp", &[("/tmp/scanned.pdf", "pdf")], scan_token);
 
-    assert!(results.is_empty());
+    assert_eq!(
+        all_paths(&db),
+        ["/tmp/new.pdf", "/tmp/scanned.pdf"],
+        "the scan covers the older row and the watcher row stays"
+    );
 }
 
 #[test]
@@ -259,17 +310,15 @@ fn stores_large_sizes_as_sqlite_safe_values() {
 }
 
 #[test]
-fn light_bulk_upsert_writes_searchable_name_path_rows() {
+fn installed_scan_rows_are_searchable_with_a_name_and_a_path_only() {
     let _guard = env_guard();
     let db = Database::open_in_memory().expect("db opens");
-    let records = vec![
-        record("/tmp/a.pdf", "a.pdf", Some("pdf"), 42, 2024),
-        record("/tmp/b.txt", "b.txt", Some("txt"), 84, 2024),
-    ];
-
-    db.upsert_light_files_with_indexed_at(&records, 1234)
-        .expect("light insert");
-    db.finish_bulk_scan().expect("finish bulk scan");
+    install(
+        &db,
+        "/tmp",
+        &[("/tmp/a.pdf", "pdf"), ("/tmp/b.txt", "txt")],
+        1234,
+    );
 
     let results = db
         .search("a", &SearchFilters::new(), 20)
@@ -283,17 +332,15 @@ fn light_bulk_upsert_writes_searchable_name_path_rows() {
 }
 
 #[test]
-fn light_bulk_insert_writes_searchable_name_path_rows() {
+fn installed_scan_rows_are_found_by_interactive_search() {
     let _guard = env_guard();
     let db = Database::open_in_memory().expect("db opens");
-    let records = vec![
-        record("/tmp/a.pdf", "a.pdf", Some("pdf"), 42, 2024),
-        record("/tmp/b.txt", "b.txt", Some("txt"), 84, 2024),
-    ];
-
-    db.insert_light_files_with_indexed_at(&records, 1234)
-        .expect("light insert");
-    db.finish_bulk_scan().expect("finish bulk scan");
+    install(
+        &db,
+        "/tmp",
+        &[("/tmp/a.pdf", "pdf"), ("/tmp/b.txt", "txt")],
+        1234,
+    );
 
     let results = db
         .search_interactive("a", 20)
@@ -304,74 +351,11 @@ fn light_bulk_insert_writes_searchable_name_path_rows() {
 }
 
 #[test]
-fn fresh_staged_scan_defers_indexes_until_finish() {
-    let _guard = env_guard();
-    let dir = tempdir().expect("temp dir");
-    let db_path = dir.path().join("index.sqlite");
-    let db = Database::open_fresh_staged_scan(&db_path).expect("db opens");
-    let records = vec![
-        record("/tmp/a.pdf", "a.pdf", Some("pdf"), 42, 2024),
-        record("/tmp/b.txt", "b.txt", Some("txt"), 84, 2024),
-    ];
-
-    assert!(!sqlite_index_exists(
-        &db_path,
-        "idx_files_deleted_name_lower"
-    ));
-
-    db.insert_light_files_with_indexed_at(&records, 1234)
-        .expect("light insert");
-    db.finish_fresh_staged_scan_profile()
-        .expect("finish fresh staged scan");
-
-    let results = db
-        .search("a", &SearchFilters::new(), 20)
-        .expect("fts search works");
-
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0].path, "/tmp/a.pdf");
-
-    drop(db);
-
-    assert!(sqlite_index_exists(
-        &db_path,
-        "idx_files_deleted_name_lower"
-    ));
-    assert!(sqlite_index_exists(&db_path, "idx_files_path_unique"));
-
-    let db = Database::open(&db_path).expect("db reopens");
-    db.upsert_light_files_with_indexed_at(
-        &[record("/tmp/a.pdf", "a.pdf", Some("pdf"), 99, 2025)],
-        5678,
-    )
-    .expect("future upsert uses staged unique path index");
-}
-
-#[test]
-fn bulk_scan_keeps_secondary_indexes_by_default() {
-    let _guard = env_guard();
-    let dir = tempdir().expect("temp dir");
-    let db_path = dir.path().join("index.sqlite");
-    let db = Database::open(&db_path).expect("db opens");
-
-    assert!(sqlite_index_exists(
-        &db_path,
-        "idx_files_deleted_name_lower"
-    ));
-    db.begin_bulk_scan().expect("begin bulk scan");
-
-    assert!(sqlite_index_exists(
-        &db_path,
-        "idx_files_deleted_name_lower"
-    ));
-}
-
-#[test]
-fn bulk_scan_defers_fts_until_rebuild() {
+fn rows_written_while_a_scan_runs_are_found_after_it_is_installed() {
     let _guard = env_guard();
     let db = Database::open_in_memory().expect("db opens");
+    let scan_token = Utc::now().timestamp_millis() - 60_000;
 
-    db.begin_bulk_scan().expect("begin bulk scan");
     db.upsert_file(&record(
         "/tmp/deferred.pdf",
         "deferred.pdf",
@@ -379,14 +363,9 @@ fn bulk_scan_defers_fts_until_rebuild() {
         10,
         2024,
     ))
-    .expect("insert while fts deferred");
+    .expect("insert while the scan runs");
+    install(&db, "/tmp", &[("/tmp/other.pdf", "pdf")], scan_token);
 
-    assert!(db
-        .search("deferred", &SearchFilters::new(), 20)
-        .expect("search works")
-        .is_empty());
-
-    db.finish_bulk_scan().expect("finish bulk scan");
     let results = db
         .search("deferred", &SearchFilters::new(), 20)
         .expect("search works");
@@ -394,30 +373,8 @@ fn bulk_scan_defers_fts_until_rebuild() {
     assert_eq!(results.len(), 1);
 }
 
-fn sqlite_index_exists(db_path: &std::path::Path, name: &str) -> bool {
-    let conn = rusqlite::Connection::open(db_path).expect("open raw db");
-    conn.query_row(
-        "SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1",
-        [name],
-        |_| Ok(()),
-    )
-    .is_ok()
-}
-
 #[test]
-fn mark_missing_handles_large_seen_path_lists() {
-    let _guard = env_guard();
-    let db = Database::open_in_memory().expect("db opens");
-    let seen_paths = (0..40_000)
-        .map(|index| format!("/tmp/file-{index}.txt"))
-        .collect::<Vec<_>>();
-
-    db.mark_missing_under_root("/tmp", &seen_paths)
-        .expect("large seen path list does not exceed SQLite variable limit");
-}
-
-#[test]
-fn opening_legacy_contentless_fts_database_migrates_to_deletable_fts() {
+fn opening_a_database_with_the_old_trigram_index_drops_it() {
     let _guard = env_guard();
     let dir = tempdir().expect("temp dir");
     let db_path = dir.path().join("legacy.sqlite");
@@ -428,6 +385,7 @@ fn opening_legacy_contentless_fts_database_migrates_to_deletable_fts() {
                 id INTEGER PRIMARY KEY,
                 path TEXT NOT NULL UNIQUE,
                 name TEXT NOT NULL,
+                name_lower TEXT,
                 parent TEXT NOT NULL,
                 extension TEXT,
                 root TEXT NOT NULL,
@@ -439,22 +397,49 @@ fn opening_legacy_contentless_fts_database_migrates_to_deletable_fts() {
                 indexed_at INTEGER NOT NULL,
                 deleted INTEGER NOT NULL DEFAULT 0
              );
+             CREATE INDEX idx_files_extension ON files(extension);
+             CREATE INDEX idx_files_deleted_name_lower ON files(deleted, name_lower);
              CREATE VIRTUAL TABLE files_fts
-             USING fts5(name, path, content='', tokenize='unicode61');",
+             USING fts5(name, content='files', content_rowid='id',
+                        tokenize='trigram', detail=none, columnsize=0);
+             CREATE TRIGGER files_ai AFTER INSERT ON files BEGIN
+                INSERT INTO files_fts(rowid, name) VALUES (new.id, new.name);
+             END;
+             CREATE TRIGGER files_ad AFTER DELETE ON files BEGIN
+                INSERT INTO files_fts(files_fts, rowid, name) VALUES('delete', old.id, old.name);
+             END;
+             CREATE TRIGGER files_au AFTER UPDATE ON files BEGIN
+                INSERT INTO files_fts(files_fts, rowid, name) VALUES('delete', old.id, old.name);
+                INSERT INTO files_fts(rowid, name) VALUES (new.id, new.name);
+             END;
+             INSERT INTO files (path, name, name_lower, parent, extension, root, volume, kind,
+                                size_bytes, indexed_at)
+             VALUES ('/tmp/legacy.pdf', 'legacy.pdf', 'legacy.pdf', '/tmp', 'pdf', '/tmp',
+                     'local', 'pdf', 10, 1);",
         )
         .expect("create legacy schema");
     }
 
     let db = Database::open(&db_path).expect("migrates legacy db");
-    let file = record("/tmp/legacy.pdf", "legacy.pdf", Some("pdf"), 10, 2024);
-    db.upsert_file(&file).expect("first insert works");
-    db.upsert_file(&file)
-        .expect("second insert can replace FTS row");
+
+    let conn = rusqlite::Connection::open(&db_path).expect("raw conn for schema check");
+    let leftovers: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name IN
+             ('files','files_fts','files_ai','files_ad','files_au','idx_files_extension',
+              'idx_files_deleted_name_lower','pending_changes')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count legacy objects");
+    assert_eq!(leftovers, 0);
 
     let results = db
         .search("legacy", &SearchFilters::new(), 10)
         .expect("search works");
     assert_eq!(results.len(), 1);
+    assert_eq!(results[0].path, "/tmp/legacy.pdf");
+    assert_eq!(db.roots().expect("roots"), ["/tmp"]);
 }
 
 #[test]
@@ -482,7 +467,7 @@ fn interactive_search_prioritizes_filename_matches() {
     let _guard = env_guard();
     let db = Database::open_in_memory().expect("db opens");
     db.upsert_files(&[
-        record("/tmp/archive/report", "notes.txt", Some("txt"), 10, 2024),
+        record("/tmp/report/notes.txt", "notes.txt", Some("txt"), 10, 2024),
         record("/tmp/report.pdf", "report.pdf", Some("pdf"), 10, 2024),
         record(
             "/tmp/report-final.pdf",
@@ -594,7 +579,7 @@ fn default_db_path_is_available_for_background_workers() {
 
     assert_eq!(
         path.file_name().and_then(|name| name.to_str()),
-        Some("index.sqlite")
+        Some("index.db")
     );
 }
 
@@ -633,13 +618,14 @@ fn scan_completion_tracks_incomplete_and_complete_roots() {
         ScanCompletion::Unknown
     );
 
-    db.mark_scan_started("/tmp", 10).expect("mark started");
+    db.upsert_file(&record("/tmp/a.pdf", "a.pdf", Some("pdf"), 1, 2024))
+        .expect("a watcher row registers the root");
     assert_eq!(
         db.scan_completion_for_root("/tmp").expect("status"),
         ScanCompletion::Incomplete
     );
 
-    db.mark_scan_completed("/tmp", 10).expect("mark complete");
+    install(&db, "/tmp", &[("/tmp/a.pdf", "pdf")], 10);
     assert_eq!(
         db.scan_completion_for_root("/tmp").expect("status"),
         ScanCompletion::Complete
@@ -678,103 +664,7 @@ fn fallback_db_path_for_root_is_stable_and_root_specific() {
 
     assert_eq!(first, repeated);
     assert_ne!(first, second);
-    assert!(first.ends_with("index.sqlite"));
-}
-
-#[test]
-fn fts_rebuilds_when_index_paths_toggles() {
-    let _guard = env_guard();
-
-    // Use LCTR_CONFIG_DIR to redirect Config::path() to a temp directory.
-    // This is much narrower than redirecting HOME (which would affect dirs::
-    // config_dir() and break other concurrent tests that don't hold this lock).
-    let config_dir = tempdir().expect("config dir");
-    let prev_cfg = std::env::var_os("LCTR_CONFIG_DIR");
-    std::env::set_var("LCTR_CONFIG_DIR", config_dir.path());
-
-    // Sanity: default index_paths should be false (no config file yet).
-    assert!(
-        !Config::load().index_paths,
-        "expected index_paths=false by default"
-    );
-    // Sanity: Config::path() resolves under our temp dir.
-    let cfg_path = Config::path().expect("config path");
-    assert!(
-        cfg_path.starts_with(config_dir.path()),
-        "config path {:?} should be under {:?}",
-        cfg_path,
-        config_dir.path()
-    );
-
-    let db_dir = tempdir().expect("db dir");
-    let db_path = db_dir.path().join("index.sqlite");
-
-    // ── Phase 1: open DB with index_paths = false (default) ───────────────
-    let db = Database::open(&db_path).expect("open db");
-
-    // Insert a record where the marker string appears in the PATH but NOT in
-    // the filename.
-    let marker_dir = db_dir.path().join("zqxdistinct");
-    std::fs::create_dir_all(&marker_dir).expect("create marker dir");
-    let marker_file = marker_dir.join("report.txt");
-    std::fs::write(&marker_file, b"content").expect("write marker file");
-
-    let record = locator::db::FileRecord {
-        path: marker_file.to_string_lossy().to_string(),
-        name: "report.txt".to_string(),
-        parent: marker_dir.to_string_lossy().to_string(),
-        extension: Some("txt".to_string()),
-        root: db_dir.path().to_string_lossy().to_string(),
-        volume: "local".to_string(),
-        kind: "text".to_string(),
-        size_bytes: 7,
-        created_at: None,
-        modified_at: None,
-    };
-    db.upsert_file(&record).expect("upsert record");
-    drop(db);
-
-    // Search for the marker — must NOT be found (FTS indexes name only, and
-    // "zqxdistinct" does not appear in "report.txt").
-    let db = Database::open(&db_path).expect("reopen db phase 1");
-    let results = db
-        .search_with_options(&SearchOptions::new("zqxdistinct").with_limit(10))
-        .expect("search phase 1");
-    assert!(
-        results.is_empty(),
-        "premise failed: zqxdistinct found without index_paths ({} result(s)); \
-         FTS may already cover paths — test oracle needs review",
-        results.len()
-    );
-    drop(db);
-
-    // ── Phase 2: flip index_paths = true, reopen ──────────────────────────
-    let mut cfg = Config::default();
-    cfg.set("index_paths", "true").expect("set index_paths");
-    cfg.save().expect("save config");
-    assert!(
-        Config::load().index_paths,
-        "config should have index_paths=true"
-    );
-
-    // Reopening runs migrate() → recreate_fts_if_needed() which detects the
-    // column mismatch and rebuilds with name+path.
-    let db = Database::open(&db_path).expect("reopen db phase 2");
-    let results = db
-        .search_with_options(&SearchOptions::new("zqxdistinct").with_limit(10))
-        .expect("search phase 2");
-    assert_eq!(
-        results.len(),
-        1,
-        "expected 1 result after FTS rebuild with index_paths=true; got {}",
-        results.len()
-    );
-
-    // ── Cleanup (restore before lock releases) ────────────────────────────
-    match prev_cfg {
-        Some(v) => std::env::set_var("LCTR_CONFIG_DIR", v),
-        None => std::env::remove_var("LCTR_CONFIG_DIR"),
-    }
+    assert!(first.ends_with("index.db"));
 }
 
 #[test]
@@ -842,68 +732,6 @@ fn legacy_search_filters_fts_false_positives() {
 }
 
 #[test]
-fn fts_upgrades_from_detail_full_on_open() {
-    let _guard = env_guard();
-    // Create a DB file, then use a raw rusqlite connection to drop files_fts
-    // and recreate it with the OLD detail=full shape (no detail=none).
-    // Repopulate, close, reopen via Database::open, and assert a Contains
-    // search still works -- proving the auto-rebuild on open fired.
-    let dir = tempdir().expect("temp dir");
-    let db_path = dir.path().join("upgrade_test.sqlite");
-
-    {
-        let db = Database::open(&db_path).expect("db opens");
-        db.upsert_file(&record(
-            "/tmp/hello-world.rs",
-            "hello-world.rs",
-            Some("rs"),
-            100,
-            2024,
-        ))
-        .expect("insert file");
-    }
-
-    // Degrade the FTS table back to detail=full to simulate an old index.
-    {
-        let conn = rusqlite::Connection::open(&db_path).expect("raw conn opens");
-        conn.execute_batch(
-            "DROP TABLE IF EXISTS files_fts;
-             CREATE VIRTUAL TABLE files_fts
-             USING fts5(name, content='files', content_rowid='id', tokenize='trigram');
-             INSERT INTO files_fts(rowid, name) SELECT id, name FROM files;",
-        )
-        .expect("recreate old-shape fts");
-    }
-
-    // Reopen via Database::open -- should detect missing detail=none and rebuild.
-    let db = Database::open(&db_path).expect("db reopens");
-
-    // Prove the rebuild actually fired: the recreated table's schema must
-    // carry detail=none (the old shape we planted above did not).
-    {
-        let conn = rusqlite::Connection::open(&db_path).expect("raw conn for schema check");
-        let create_sql: String = conn
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE type='table' AND name='files_fts'",
-                [],
-                |row| row.get(0),
-            )
-            .expect("files_fts schema");
-        assert!(
-            create_sql.contains("detail=none"),
-            "files_fts was not rebuilt to detail=none; schema: {create_sql}"
-        );
-    }
-
-    let results = db
-        .search_with_options(&SearchOptions::new("hello").with_mode(QueryMode::Contains))
-        .expect("search after upgrade");
-
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0].name, "hello-world.rs");
-}
-
-#[test]
 fn import_access_from_copies_previous_history() {
     let _guard = env_guard();
     let tmp = tempdir().expect("tmp");
@@ -916,7 +744,7 @@ fn import_access_from_copies_previous_history() {
     old_db.record_access("/tmp/b.txt").expect("record b");
     drop(old_db);
 
-    let new_db = Database::open_fresh_staged_scan(&new_path).expect("open staged");
+    let new_db = Database::open(&new_path).expect("open new");
     assert_eq!(new_db.import_access_from(&old_path).unwrap(), 2);
     drop(new_db);
 
@@ -939,8 +767,7 @@ fn import_access_from_copies_previous_history() {
 fn import_access_from_missing_or_legacy_previous_is_noop() {
     let _guard = env_guard();
     let tmp = tempdir().expect("tmp");
-    let new_db =
-        Database::open_fresh_staged_scan(tmp.path().join("new.sqlite")).expect("open staged");
+    let new_db = Database::open(tmp.path().join("new.sqlite")).expect("open new");
 
     let missing = tmp.path().join("does-not-exist.sqlite");
     assert_eq!(new_db.import_access_from(&missing).unwrap(), 0);
@@ -1141,4 +968,1011 @@ fn embeddings_sidecar_in_a_local_index_dir_is_ignored_by_git() {
         std::fs::read_to_string(local.join(".gitignore")).expect("gitignore written"),
         "*\n"
     );
+}
+
+#[test]
+fn compacting_writes_a_name_file_that_matches_the_rows() {
+    let _guard = env_guard();
+    let dir = tempdir().expect("temp dir");
+    let db_path = dir.path().join("index.sqlite");
+    let db = Database::open(&db_path).expect("db opens");
+    db.upsert_files(&[
+        record("/tmp/a.txt", "a.txt", Some("txt"), 1, 2024),
+        record("/tmp/b.txt", "b.txt", Some("txt"), 2, 2024),
+        record("/tmp/gone.txt", "gone.txt", Some("txt"), 3, 2024),
+    ])
+    .expect("upsert");
+    db.mark_path_deleted("/tmp/gone.txt").expect("soft delete");
+
+    db.compact_name_file().expect("compact");
+
+    let file = NameFile::open(&name_file_path(&db_path)).expect("name file opens");
+    let mut paths = Vec::new();
+    file.reader().for_each(0..file.len(), &mut |row| {
+        paths.push(row.path.to_string());
+        true
+    });
+    paths.sort();
+    assert_eq!(paths, ["/tmp/a.txt", "/tmp/b.txt"]);
+}
+
+#[test]
+fn delete_index_files_removes_the_name_file() {
+    let _guard = env_guard();
+    let dir = tempdir().expect("temp dir");
+    let db_path = dir.path().join("index.sqlite");
+    {
+        let db = Database::open(&db_path).expect("db opens");
+        db.upsert_file(&record("/tmp/a.txt", "a.txt", Some("txt"), 1, 2024))
+            .expect("upsert");
+        db.compact_name_file().expect("compact");
+    }
+    let names = name_file_path(&db_path);
+    let stale_tmp = dir.path().join("index.names.tmp");
+    std::fs::write(&stale_tmp, b"x").expect("write tmp");
+    assert!(names.exists());
+
+    delete_index_files(&db_path).expect("delete index files");
+
+    assert!(!names.exists());
+    assert!(!stale_tmp.exists());
+    assert!(!db_path.exists());
+}
+
+#[test]
+fn upserts_and_deletes_are_recorded_as_changes() {
+    let _guard = env_guard();
+    let dir = tempdir().expect("temp dir");
+    let db_path = dir.path().join("index.sqlite");
+    let db = Database::open(&db_path).expect("db opens");
+    db.upsert_file(&record("/tmp/a.txt", "a.txt", Some("txt"), 1, 2024))
+        .expect("upsert");
+    db.mark_path_deleted("/tmp/dir")
+        .expect("delete a directory");
+
+    let conn = rusqlite::Connection::open(&db_path).expect("raw connection");
+    let mut stmt = conn
+        .prepare("SELECT path, kind FROM changes ORDER BY path")
+        .expect("prepare");
+    let changes: Vec<(String, Option<String>)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("rows");
+    assert_eq!(
+        changes,
+        [
+            ("/tmp/a.txt".to_string(), Some("txt".to_string())),
+            ("/tmp/dir".to_string(), None)
+        ]
+    );
+}
+
+#[test]
+fn compacting_clears_the_changes_and_sets_a_snapshot_id() {
+    let _guard = env_guard();
+    let dir = tempdir().expect("temp dir");
+    let db_path = dir.path().join("index.sqlite");
+    let db = Database::open(&db_path).expect("db opens");
+    db.upsert_file(&record("/tmp/a.txt", "a.txt", Some("txt"), 1, 2024))
+        .expect("upsert");
+    db.mark_path_deleted("/tmp/dir")
+        .expect("delete a directory");
+
+    db.compact_name_file().expect("compact");
+
+    let conn = rusqlite::Connection::open(&db_path).expect("raw connection");
+    let pending: i64 = conn
+        .query_row("SELECT COUNT(*) FROM changes", [], |row| row.get(0))
+        .expect("count");
+    assert_eq!(pending, 0);
+    let snapshot: i64 = conn
+        .query_row(
+            "SELECT value FROM search_state WHERE key = 'snapshot_id'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("snapshot id");
+    assert_ne!(snapshot, 0);
+}
+
+#[test]
+fn next_scan_token_never_repeats_for_a_root() {
+    let _guard = env_guard();
+    let db = Database::open_in_memory().expect("db opens");
+    let now = chrono::Utc::now().timestamp_millis();
+
+    let first = db.next_scan_token("/tmp/a").expect("token for a new root");
+    assert!(
+        (first - now).abs() < 5_000,
+        "token {first} is not near {now}"
+    );
+
+    let far_future = now + 24 * 60 * 60 * 1000;
+    install(&db, "/tmp/a", &[], far_future);
+    assert_eq!(db.next_scan_token("/tmp/a").unwrap(), far_future + 1);
+
+    let other = db
+        .next_scan_token("/tmp/b")
+        .expect("token for another root");
+    assert!(
+        (other - now).abs() < 5_000,
+        "token {other} is not near {now}"
+    );
+}
+
+#[test]
+fn install_scan_replaces_only_its_root() {
+    let _guard = env_guard();
+    let db = Database::open_in_memory().expect("db opens");
+    install(
+        &db,
+        "/a",
+        &[
+            ("/a/one.txt", "text"),
+            ("/a/two.txt", "text"),
+            ("/a/three.txt", "text"),
+        ],
+        1,
+    );
+    install(&db, "/b", &[("/b/x.txt", "text"), ("/b/y.txt", "text")], 1);
+
+    install(&db, "/a", &[("/a/one.txt", "text")], 2);
+
+    assert_eq!(all_paths(&db), ["/a/one.txt", "/b/x.txt", "/b/y.txt"]);
+    assert_eq!(db.roots().expect("roots"), ["/a", "/b"]);
+    for root in ["/a", "/b"] {
+        assert_eq!(
+            db.scan_completion_for_root(root).expect("status"),
+            ScanCompletion::Complete
+        );
+    }
+}
+
+/// A scan installed with `token` over a root that already holds a row from before the scan,
+/// a live row and a removal. Returns the database path and the database.
+fn rescan_fixture(dir: &Path) -> (std::path::PathBuf, Database) {
+    let db_path = dir.join("index.sqlite");
+    let db = Database::open(&db_path).expect("db opens");
+    install(
+        &db,
+        "/r",
+        &[("/r/old.txt", "text"), ("/r/dir/inner.txt", "text")],
+        1,
+    );
+    (db_path, db)
+}
+
+#[test]
+fn a_rescan_keeps_changes_made_while_it_ran() {
+    let _guard = env_guard();
+    let dir = tempdir().expect("temp dir");
+    let (db_path, db) = rescan_fixture(dir.path());
+    let token = 1_000;
+    // Stamped at the token or later: the watcher wrote these while the scan walked.
+    db.upsert_files_with_indexed_at(&[live_record("/r", "/r/live.txt", "text", 5)], token)
+        .expect("live row at the token");
+    // Stamped before the token: the scan already covers it.
+    db.upsert_files_with_indexed_at(&[live_record("/r", "/r/early.txt", "text", 5)], token - 1)
+        .expect("live row before the token");
+    // A removal is stamped with the current time in milliseconds, far above the token.
+    assert_eq!(db.mark_path_deleted("/r/old.txt").expect("remove"), 1);
+    assert_eq!(change_count(&db_path), 3);
+
+    // The walk saw `old.txt` before it was removed, and never saw `live.txt`.
+    install(
+        &db,
+        "/r",
+        &[("/r/old.txt", "text"), ("/r/dir/inner.txt", "text")],
+        token,
+    );
+
+    assert_eq!(
+        all_paths(&db),
+        ["/r/dir/inner.txt", "/r/live.txt"],
+        "the removal still hides old.txt and the live row still shows"
+    );
+    assert_eq!(change_count(&db_path), 2, "the older live row is gone");
+}
+
+#[test]
+fn a_rescan_drops_changes_older_than_its_token() {
+    let _guard = env_guard();
+    let dir = tempdir().expect("temp dir");
+    let (db_path, db) = rescan_fixture(dir.path());
+    db.upsert_files_with_indexed_at(&[live_record("/r", "/r/live.txt", "text", 5)], 100)
+        .expect("live row");
+    assert_eq!(db.mark_path_deleted("/r/old.txt").expect("remove"), 1);
+
+    // The scan started after both changes, so what it saw is the truth.
+    install(
+        &db,
+        "/r",
+        &[("/r/old.txt", "text"), ("/r/dir/inner.txt", "text")],
+        i64::MAX,
+    );
+
+    assert_eq!(all_paths(&db), ["/r/dir/inner.txt", "/r/old.txt"]);
+    assert_eq!(change_count(&db_path), 0);
+}
+
+fn embeddable_paths(db: &Database, root: &str) -> Vec<String> {
+    db.embeddable_files(root)
+        .expect("embeddable files")
+        .into_iter()
+        .map(|file| file.path)
+        .collect()
+}
+
+#[test]
+fn an_outer_scan_takes_over_a_nested_root_it_walked() {
+    let _guard = env_guard();
+    let db = Database::open_in_memory().expect("db opens");
+    install(
+        &db,
+        "/r/sub",
+        &[("/r/sub/a.txt", "text"), ("/r/sub/b.txt", "text")],
+        1,
+    );
+    install(
+        &db,
+        "/r",
+        &[("/r/top.txt", "text"), ("/r/sub/a.txt", "text")],
+        2,
+    );
+
+    assert_eq!(db.roots().expect("roots"), ["/r"]);
+    assert_eq!(all_paths(&db), ["/r/sub/a.txt", "/r/top.txt"]);
+    assert_eq!(embeddable_paths(&db, "/r"), ["/r/sub/a.txt", "/r/top.txt"]);
+}
+
+#[test]
+fn an_outer_scan_leaves_a_nested_root_it_did_not_walk() {
+    let _guard = env_guard();
+    let db = Database::open_in_memory().expect("db opens");
+    install(
+        &db,
+        "/r/build/app",
+        &[
+            ("/r/build/app/x.txt", "text"),
+            ("/r/build/app/y.txt", "text"),
+        ],
+        1,
+    );
+    install(&db, "/r", &[("/r/a.txt", "text"), ("/r/b.txt", "text")], 2);
+
+    assert_eq!(db.roots().expect("roots"), ["/r", "/r/build/app"]);
+    assert_eq!(
+        all_paths(&db),
+        [
+            "/r/a.txt",
+            "/r/b.txt",
+            "/r/build/app/x.txt",
+            "/r/build/app/y.txt"
+        ]
+    );
+    assert_eq!(embeddable_paths(&db, "/r"), ["/r/a.txt", "/r/b.txt"]);
+    assert_eq!(
+        embeddable_paths(&db, "/r/build/app"),
+        ["/r/build/app/x.txt", "/r/build/app/y.txt"]
+    );
+}
+
+/// Rows in the name file and changes of every kind, for the compaction tests. Returns the
+/// database path and the database. The active rows are `/r/b.txt`, `/r/new.txt` and
+/// `/r/d2.txt`.
+fn changed_fixture(dir: &Path) -> (std::path::PathBuf, Database) {
+    let db_path = dir.join("index.sqlite");
+    let db = Database::open(&db_path).expect("db opens");
+    install(
+        &db,
+        "/r",
+        &[
+            ("/r/a.txt", "text"),
+            ("/r/b.txt", "text"),
+            ("/r/d", "folder"),
+            ("/r/d/c.txt", "text"),
+            ("/r/d/e.txt", "text"),
+        ],
+        1,
+    );
+    db.upsert_file(&live_record("/r", "/r/new.txt", "text", 9))
+        .expect("new file");
+    db.upsert_file(&live_record("/r", "/r/d2.txt", "text", 9))
+        .expect("sibling with the folder's prefix");
+    db.mark_path_deleted("/r/d").expect("remove the folder");
+    db.mark_path_deleted("/r/a.txt").expect("remove a file");
+    (db_path, db)
+}
+
+#[test]
+fn compacting_folds_changes_and_empties_the_table() {
+    let _guard = env_guard();
+    let dir = tempdir().expect("temp dir");
+    let (db_path, db) = changed_fixture(dir.path());
+    let expected = ["/r/b.txt", "/r/d2.txt", "/r/new.txt"];
+    assert_eq!(all_paths(&db), expected);
+    assert_eq!(db.count_active().expect("count"), 3);
+    assert!(change_count(&db_path) > 0);
+
+    db.compact_name_file().expect("compact");
+
+    assert_eq!(all_paths(&db), expected);
+    assert_eq!(db.count_active().expect("count"), 3);
+    assert_eq!(change_count(&db_path), 0);
+    for (query, found) in [
+        ("new", 1),
+        ("c.txt", 0),
+        ("a.txt", 0),
+        ("d2", 1),
+        ("b.txt", 1),
+    ] {
+        let results = db
+            .search_with_options(&SearchOptions::new(query))
+            .expect("search works");
+        assert_eq!(results.len(), found, "query {query}");
+    }
+}
+
+#[test]
+fn folded_changes_applied_again_change_nothing() {
+    let _guard = env_guard();
+    let dir = tempdir().expect("temp dir");
+    let (db_path, db) = changed_fixture(dir.path());
+    let queries = ["", "txt", "new", "c.txt", "d2", "/r/d"];
+    let snapshot = |db: &Database| -> Vec<Vec<String>> {
+        queries
+            .iter()
+            .map(|query| {
+                let mut paths: Vec<String> = db
+                    .search(query, &SearchFilters::new(), 100)
+                    .expect("search works")
+                    .into_iter()
+                    .map(|result| result.path)
+                    .collect();
+                paths.sort();
+                paths
+            })
+            .collect()
+    };
+    let before = snapshot(&db);
+    let before_options = db
+        .search_with_options(&SearchOptions::new("r").with_limit(100))
+        .expect("option search")
+        .len();
+
+    let conn = rusqlite::Connection::open(&db_path).expect("raw connection");
+    type ChangeRow = (String, Option<String>, i64, Option<i64>, Option<i64>, i64);
+    let saved: Vec<ChangeRow> = conn
+        .prepare("SELECT path, kind, size_bytes, created_at, modified_at, changed_at FROM changes")
+        .expect("prepare")
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+            ))
+        })
+        .expect("query")
+        .collect::<Result<_, _>>()
+        .expect("rows");
+    assert!(!saved.is_empty());
+
+    db.compact_name_file().expect("compact");
+    assert_eq!(change_count(&db_path), 0);
+    for row in &saved {
+        conn.execute(
+            "INSERT INTO changes (path, kind, size_bytes, created_at, modified_at, changed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![row.0, row.1, row.2, row.3, row.4, row.5],
+        )
+        .expect("put the change back");
+    }
+    assert_eq!(change_count(&db_path), saved.len() as i64);
+
+    assert_eq!(snapshot(&db), before);
+    assert_eq!(
+        db.search_with_options(&SearchOptions::new("r").with_limit(100))
+            .expect("option search")
+            .len(),
+        before_options
+    );
+    assert_eq!(db.count_active().expect("count"), 3);
+}
+
+#[test]
+fn a_file_recreated_under_a_removed_folder_is_found() {
+    let _guard = env_guard();
+    let dir = tempdir().expect("temp dir");
+    let db_path = dir.path().join("index.sqlite");
+    let db = Database::open(&db_path).expect("db opens");
+    install(
+        &db,
+        "/r",
+        &[
+            ("/r/d/x.txt", "text"),
+            ("/r/d/y.txt", "text"),
+            ("/r/z.txt", "text"),
+        ],
+        1,
+    );
+    assert_eq!(db.mark_path_deleted("/r/d").expect("remove folder"), 2);
+    assert_eq!(all_paths(&db), ["/r/z.txt"]);
+
+    db.upsert_file(&live_record("/r", "/r/d/x.txt", "text", 3))
+        .expect("recreate one file");
+
+    let expected = ["/r/d/x.txt", "/r/z.txt"];
+    assert_eq!(all_paths(&db), expected);
+    assert_eq!(db.count_active().expect("count"), 2);
+
+    db.compact_name_file().expect("compact");
+    assert_eq!(all_paths(&db), expected);
+    drop(db);
+    let db = Database::open(&db_path).expect("reopen");
+    assert_eq!(all_paths(&db), expected);
+}
+
+#[test]
+fn remove_root_drops_its_rows_and_its_registration() {
+    let _guard = env_guard();
+    let dir = tempdir().expect("temp dir");
+    let db_path = dir.path().join("index.sqlite");
+    let db = Database::open(&db_path).expect("db opens");
+    install(
+        &db,
+        "/a",
+        &[
+            ("/a/x.txt", "text"),
+            ("/a/y.txt", "text"),
+            ("/a/z.txt", "text"),
+        ],
+        1,
+    );
+    install(&db, "/a/n", &[("/a/n/q.txt", "text")], 1);
+    install(&db, "/b", &[("/b/w.txt", "text")], 1);
+    db.upsert_file(&live_record("/a", "/a/live.txt", "text", 1))
+        .expect("live row owned by the root");
+    db.mark_path_deleted("/b/gone.txt").expect("a removal");
+
+    let dropped = db.remove_root("/a").expect("remove root");
+
+    assert_eq!(dropped, 4, "three scanned rows and one live row");
+    assert_eq!(all_paths(&db), ["/a/n/q.txt", "/b/w.txt"]);
+    assert_eq!(db.roots().expect("roots"), ["/a/n", "/b"]);
+    assert_eq!(
+        db.scan_completion_for_root("/a").expect("status"),
+        ScanCompletion::Unknown
+    );
+    assert_eq!(change_count(&db_path), 0);
+}
+
+#[test]
+fn an_abandoned_scan_changes_nothing() {
+    let _guard = env_guard();
+    let dir = tempdir().expect("temp dir");
+    let db_path = dir.path().join("index.sqlite");
+    let db = Database::open(&db_path).expect("db opens");
+    install(
+        &db,
+        "/r",
+        &[("/r/old.txt", "text"), ("/r/older.txt", "text")],
+        1,
+    );
+    let names = name_file_path(&db_path);
+    let file_before = std::fs::read(&names).expect("read the name file");
+
+    let mut abandoned = NameFileBuilder::default();
+    abandoned.push("/r/fresh.txt", "text").expect("push");
+    drop(abandoned);
+
+    assert_eq!(std::fs::read(&names).expect("read again"), file_before);
+    assert_eq!(all_paths(&db), ["/r/old.txt", "/r/older.txt"]);
+    assert_eq!(
+        db.scan_completion_for_root("/r").expect("status"),
+        ScanCompletion::Complete
+    );
+    drop(db);
+    let db = Database::open(&db_path).expect("reopen");
+    assert_eq!(all_paths(&db), ["/r/old.txt", "/r/older.txt"]);
+    assert_eq!(
+        db.scan_completion_for_root("/r").expect("status"),
+        ScanCompletion::Complete
+    );
+}
+
+#[test]
+fn a_missing_name_file_marks_roots_incomplete() {
+    let _guard = env_guard();
+    let dir = tempdir().expect("temp dir");
+    let db_path = dir.path().join("index.sqlite");
+    {
+        let db = Database::open(&db_path).expect("db opens");
+        install(&db, "/r", &[("/r/a.txt", "text")], 1);
+        assert_eq!(
+            db.scan_completion_for_root("/r").expect("status"),
+            ScanCompletion::Complete
+        );
+    }
+    std::fs::remove_file(name_file_path(&db_path)).expect("delete the name file");
+
+    let db = Database::open(&db_path).expect("reopen");
+
+    assert_eq!(
+        db.scan_completion_for_root("/r").expect("status"),
+        ScanCompletion::Incomplete
+    );
+    let results = db
+        .search("a", &SearchFilters::new(), 10)
+        .expect("a search with no name file is not an error");
+    assert!(results.is_empty());
+    let results = db
+        .search_with_options(&SearchOptions::new("a"))
+        .expect("an option search with no name file is not an error");
+    assert!(results.is_empty());
+}
+
+#[test]
+fn the_index_holds_no_row_table() {
+    let _guard = env_guard();
+    let dir = tempdir().expect("temp dir");
+    let db_path = dir.path().join("index.sqlite");
+    {
+        let db = Database::open(&db_path).expect("db opens");
+        let paths: Vec<String> = (0..20_000)
+            .map(|index| format!("/data/folder-{:03}/report-{index:05}.txt", index % 200))
+            .collect();
+        let rows: Vec<(&str, &str)> = paths.iter().map(|path| (path.as_str(), "text")).collect();
+        install(&db, "/data", &rows, 1);
+        assert_eq!(db.count_active().expect("count"), 20_000);
+    }
+
+    let conn = rusqlite::Connection::open(&db_path).expect("raw connection");
+    let files_tables: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'files'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count tables");
+    assert_eq!(files_tables, 0);
+    drop(conn);
+
+    let wal = std::path::PathBuf::from(format!("{}-wal", db_path.display()));
+    let db_bytes = std::fs::metadata(&db_path).expect("db metadata").len()
+        + std::fs::metadata(&wal).map_or(0, |meta| meta.len());
+    let names_bytes = std::fs::metadata(name_file_path(&db_path))
+        .expect("name file metadata")
+        .len();
+    assert!(db_bytes < 200 * 1024, "database is {db_bytes} bytes");
+    assert!(names_bytes < 400 * 1024, "name file is {names_bytes} bytes");
+}
+
+#[test]
+fn path_lookup_sees_the_file_and_the_changes() {
+    let _guard = env_guard();
+    let dir = tempdir().expect("temp dir");
+    let root = dir.path();
+    let path = |name: &str| root.join(name).to_string_lossy().to_string();
+    std::fs::create_dir(root.join("gone")).expect("create folder");
+    for name in ["in-file.txt", "live.txt", "removed.txt", "gone/inside.txt"] {
+        std::fs::write(root.join(name), "four").expect("write file");
+    }
+    let root_text = root.to_string_lossy().to_string();
+    let db = Database::open_in_memory()
+        .expect("db opens")
+        .with_search_path_verification();
+    install(
+        &db,
+        &root_text,
+        &[
+            (&path("in-file.txt"), "text"),
+            (&path("removed.txt"), "text"),
+            (&path("gone/inside.txt"), "text"),
+        ],
+        1,
+    );
+    db.upsert_file(&live_record(&root_text, &path("live.txt"), "text", 99))
+        .expect("live change");
+    db.upsert_file(&live_record(&root_text, &path("vanished.txt"), "text", 99))
+        .expect("live change whose file is gone");
+    db.mark_path_deleted(&path("removed.txt")).expect("remove");
+    db.mark_path_deleted(&path("gone")).expect("remove folder");
+
+    let mut lookup = db.path_lookup().expect("lookup");
+
+    let in_file = lookup
+        .result_for(&path("in-file.txt"))
+        .expect("in the file");
+    assert_eq!(in_file.kind, "text");
+    assert_eq!(in_file.size_bytes, 4, "size comes from the disk");
+    let live = lookup.result_for(&path("live.txt")).expect("live change");
+    assert_eq!(live.size_bytes, 4, "a live row is hydrated like any other");
+    assert!(lookup.result_for(&path("removed.txt")).is_none());
+    assert!(lookup.result_for(&path("gone/inside.txt")).is_none());
+    assert!(lookup.result_for(&path("absent.txt")).is_none());
+    assert!(
+        lookup.result_for(&path("vanished.txt")).is_none(),
+        "verification drops a live row whose file is gone"
+    );
+    let one_off = db
+        .result_for_path(&path("in-file.txt"))
+        .expect("one-off lookup")
+        .expect("found");
+    assert_eq!(one_off.path, in_file.path);
+}
+
+#[test]
+fn count_and_embeddable_files_follow_changes() {
+    let _guard = env_guard();
+    let db = Database::open_in_memory().expect("db opens");
+    install(
+        &db,
+        "/r",
+        &[
+            ("/r/a.txt", "text"),
+            ("/r/b.md", "markdown"),
+            ("/r/sub", "folder"),
+            ("/r/sub/c.txt", "text"),
+        ],
+        1,
+    );
+    install(&db, "/r/n", &[("/r/n/q.txt", "text")], 1);
+    install(&db, "/o", &[("/o/z.txt", "text")], 1);
+    let paths = |db: &Database| -> Vec<String> {
+        db.embeddable_files("/r")
+            .expect("embeddable files")
+            .into_iter()
+            .map(|file| file.path)
+            .collect()
+    };
+    assert_eq!(db.count_active().expect("count"), 6);
+    assert_eq!(paths(&db), ["/r/a.txt", "/r/b.md", "/r/sub/c.txt"]);
+
+    db.upsert_file(&live_record("/r", "/r/d.txt", "text", 7))
+        .expect("add a file");
+    assert_eq!(db.count_active().expect("count"), 7);
+    assert_eq!(
+        paths(&db),
+        ["/r/a.txt", "/r/b.md", "/r/d.txt", "/r/sub/c.txt"]
+    );
+    let added = db
+        .embeddable_files("/r")
+        .expect("embeddable files")
+        .into_iter()
+        .find(|file| file.path == "/r/d.txt")
+        .expect("the new file");
+    assert_eq!(added.size_bytes, 7);
+    assert_eq!(added.extension.as_deref(), Some("txt"));
+
+    db.mark_path_deleted("/r/a.txt").expect("remove a file");
+    assert_eq!(db.count_active().expect("count"), 6);
+    assert_eq!(paths(&db), ["/r/b.md", "/r/d.txt", "/r/sub/c.txt"]);
+
+    assert_eq!(db.mark_path_deleted("/r/sub").expect("remove folder"), 2);
+    assert_eq!(db.count_active().expect("count"), 4);
+    assert_eq!(paths(&db), ["/r/b.md", "/r/d.txt"]);
+}
+
+/// One row of an old index (written by lctr 0.4.x): the path, whether it is deleted, and the
+/// root that owns it.
+struct OldRow<'a> {
+    path: &'a str,
+    deleted: bool,
+    root: &'a str,
+}
+
+/// Writes an index in the old format at `path`: a `files` table, `scan_roots` (each root
+/// listed here is complete with token 7) and `access` with one open of `/old/opened.txt`.
+fn write_old_index(path: &Path, rows: &[OldRow], roots: &[&str]) {
+    let conn = rusqlite::Connection::open(path).expect("open raw old db");
+    conn.execute_batch(
+        "PRAGMA journal_mode = WAL;
+         CREATE TABLE files (
+            id INTEGER PRIMARY KEY,
+            path TEXT NOT NULL UNIQUE,
+            name TEXT NOT NULL,
+            name_lower TEXT,
+            parent TEXT NOT NULL,
+            extension TEXT,
+            root TEXT NOT NULL,
+            volume TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            created_at INTEGER,
+            modified_at INTEGER,
+            indexed_at INTEGER NOT NULL,
+            deleted INTEGER NOT NULL DEFAULT 0
+         );
+         CREATE TABLE scan_roots (
+            root TEXT PRIMARY KEY,
+            scan_token INTEGER NOT NULL,
+            complete INTEGER NOT NULL,
+            started_at INTEGER NOT NULL,
+            completed_at INTEGER
+         );
+         CREATE TABLE access (
+            path TEXT PRIMARY KEY,
+            open_count INTEGER NOT NULL DEFAULT 0,
+            last_opened_at INTEGER
+         );
+         INSERT INTO access (path, open_count, last_opened_at) VALUES ('/old/opened.txt', 3, 100);",
+    )
+    .expect("create old schema");
+    for row in rows {
+        let name = row.path.rsplit('/').next().expect("a name");
+        conn.execute(
+            "INSERT INTO files (path, name, name_lower, parent, extension, root, volume, kind,
+                                size_bytes, indexed_at, deleted)
+             VALUES (?1, ?2, ?3, '', NULL, ?4, 'local', 'txt', 0, 1, ?5)",
+            rusqlite::params![
+                row.path,
+                name,
+                name.to_lowercase(),
+                row.root,
+                row.deleted as i64
+            ],
+        )
+        .expect("insert old row");
+    }
+    for root in roots {
+        conn.execute(
+            "INSERT INTO scan_roots (root, scan_token, complete, started_at, completed_at)
+             VALUES (?1, 7, 1, 5, 6)",
+            [root],
+        )
+        .expect("insert old root");
+    }
+}
+
+/// Leaves empty `-wal` and `-shm` files beside the old index, as an unclean exit would.
+fn leave_old_index_sidecars(old: &Path) {
+    for suffix in ["-wal", "-shm"] {
+        std::fs::write(format!("{}{suffix}", old.display()), b"").expect("write sidecar");
+    }
+}
+
+fn old_index_files_exist(dir: &Path) -> bool {
+    ["index.sqlite", "index.sqlite-wal", "index.sqlite-shm"]
+        .iter()
+        .any(|name| dir.join(name).exists())
+}
+
+fn old_row<'a>(path: &'a str, root: &'a str) -> OldRow<'a> {
+    OldRow {
+        path,
+        deleted: false,
+        root,
+    }
+}
+
+#[test]
+fn an_old_index_beside_the_new_one_is_converted_and_removed() {
+    let _guard = env_guard();
+    let dir = tempdir().expect("temp dir");
+    let old = dir.path().join("index.sqlite");
+    write_old_index(
+        &old,
+        &[
+            old_row("/old/opened.txt", "/old"),
+            old_row("/old/notes.txt", "/old"),
+            OldRow {
+                path: "/old/gone.txt",
+                deleted: true,
+                root: "/old",
+            },
+        ],
+        &["/old"],
+    );
+    leave_old_index_sidecars(&old);
+    let new = dir.path().join("index.db");
+
+    let db = Database::open(&new).expect("open converts the old index");
+
+    assert_eq!(all_paths(&db), ["/old/notes.txt", "/old/opened.txt"]);
+    assert_eq!(
+        db.scan_completion_for_root("/old").expect("completion"),
+        ScanCompletion::Complete
+    );
+    let raw = rusqlite::Connection::open(&new).expect("raw connection");
+    let history: (i64, i64) = raw
+        .query_row(
+            "SELECT open_count, last_opened_at FROM access WHERE path = '/old/opened.txt'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("open history is kept");
+    assert_eq!(history, (3, 100));
+    assert!(!old_index_files_exist(dir.path()));
+}
+
+#[test]
+fn discovery_finds_a_folder_that_only_has_an_old_index() {
+    let _guard = env_guard();
+    let dir = tempdir().expect("temp dir");
+    let project = dir.path().join("proj");
+    let sub = project.join("sub");
+    let local = project.join(".locator");
+    std::fs::create_dir_all(&sub).expect("create dirs");
+    std::fs::create_dir_all(&local).expect("create index dir");
+    write_old_index(
+        &local.join("index.sqlite"),
+        &[old_row("/old/notes.txt", "/old")],
+        &["/old"],
+    );
+
+    let found = existing_db_path_for_working_dir(&sub)
+        .expect("discovery")
+        .expect("an index is found");
+
+    let expected = project
+        .canonicalize()
+        .expect("canonical project")
+        .join(".locator")
+        .join("index.db");
+    assert_eq!(found, expected);
+    let db = Database::open(&found).expect("open converts");
+    assert_eq!(all_paths(&db), ["/old/notes.txt"]);
+}
+
+#[test]
+fn an_old_index_that_reappears_replaces_its_roots_and_is_removed() {
+    let _guard = env_guard();
+    let dir = tempdir().expect("temp dir");
+    let old = dir.path().join("index.sqlite");
+    let new = dir.path().join("index.db");
+    write_old_index(&old, &[old_row("/old/first.txt", "/old")], &["/old"]);
+    drop(Database::open(&new).expect("first conversion"));
+    assert!(!old.exists());
+
+    write_old_index(&old, &[old_row("/old/second.txt", "/old")], &["/old"]);
+    let db = Database::open(&new).expect("second conversion");
+
+    assert_eq!(all_paths(&db), ["/old/second.txt"]);
+    assert!(!old_index_files_exist(dir.path()));
+}
+
+#[test]
+fn a_sibling_that_is_not_an_index_is_left_alone() {
+    let _guard = env_guard();
+    let dir = tempdir().expect("temp dir");
+    let sqlite_only = dir.path().join("a");
+    let not_sqlite = dir.path().join("b");
+    std::fs::create_dir_all(&sqlite_only).expect("create dir a");
+    std::fs::create_dir_all(&not_sqlite).expect("create dir b");
+    {
+        let conn = rusqlite::Connection::open(sqlite_only.join("index.sqlite")).expect("raw db");
+        conn.execute_batch("CREATE TABLE other (x INTEGER);")
+            .expect("create other table");
+    }
+    std::fs::write(not_sqlite.join("index.sqlite"), b"this is not a database")
+        .expect("write text file");
+    let sqlite_before = std::fs::read(sqlite_only.join("index.sqlite")).expect("read a");
+
+    Database::open(sqlite_only.join("index.db")).expect("open beside a plain sqlite file");
+    Database::open(not_sqlite.join("index.db")).expect("open beside a text file");
+
+    assert_eq!(
+        std::fs::read(sqlite_only.join("index.sqlite")).expect("a stays"),
+        sqlite_before
+    );
+    assert_eq!(
+        std::fs::read(not_sqlite.join("index.sqlite")).expect("b stays"),
+        b"this is not a database"
+    );
+}
+
+#[test]
+fn a_newer_database_is_refused_with_the_update_hint() {
+    let _guard = env_guard();
+    let dir = tempdir().expect("temp dir");
+    let path = dir.path().join("index.db");
+    drop(Database::open(&path).expect("create"));
+    rusqlite::Connection::open(&path)
+        .expect("raw connection")
+        .pragma_update(None, "user_version", 99)
+        .expect("set user_version");
+
+    let writable = Database::open(&path).err().expect("open is refused");
+    let readonly = Database::open_readonly(&path)
+        .err()
+        .expect("open_readonly is refused");
+
+    assert!(format!("{writable:#}").contains("lctr update"));
+    assert!(format!("{readonly:#}").contains("lctr update"));
+}
+
+#[test]
+fn delete_index_files_removes_old_and_new_files() {
+    let _guard = env_guard();
+    let dir = tempdir().expect("temp dir");
+    let db_path = dir.path().join("index.db");
+    {
+        let db = Database::open(&db_path).expect("db opens");
+        db.upsert_file(&record("/tmp/a.txt", "a.txt", Some("txt"), 1, 2024))
+            .expect("upsert");
+        db.compact_name_file().expect("compact");
+    }
+    for name in ["index.sqlite", "index.sqlite-wal", "index.sqlite-shm"] {
+        std::fs::write(dir.path().join(name), b"x").expect("write old file");
+    }
+
+    let removed = delete_index_files(&db_path).expect("delete index files");
+
+    assert!(!db_path.exists());
+    assert!(!name_file_path(&db_path).exists());
+    assert!(!old_index_files_exist(dir.path()));
+    assert!(removed >= 5, "removed {removed}");
+}
+
+#[test]
+fn an_old_index_in_another_root_keeps_this_index_rows() {
+    let _guard = env_guard();
+    let dir = tempdir().expect("temp dir");
+    let new = dir.path().join("index.db");
+    {
+        let db = Database::open(&new).expect("db opens");
+        install(&db, "/a", &[("/a/mine.txt", "txt")], 10);
+    }
+    write_old_index(
+        &dir.path().join("index.sqlite"),
+        &[old_row("/b/theirs.txt", "/b")],
+        &["/b"],
+    );
+
+    let db = Database::open(&new).expect("open converts");
+
+    assert_eq!(all_paths(&db), ["/a/mine.txt", "/b/theirs.txt"]);
+    assert_eq!(
+        db.scan_completion_for_root("/a").expect("completion"),
+        ScanCompletion::Complete
+    );
+    assert!(!dir.path().join("index.sqlite").exists());
+}
+
+#[test]
+fn remove_old_staging_files_clears_the_leftovers_of_an_interrupted_scan() {
+    let _guard = env_guard();
+    let dir = tempdir().expect("temp dir");
+    std::env::set_var("LCTR_DATA_DIR", dir.path().join("data"));
+    let root = dir.path().join("root");
+    std::fs::create_dir_all(&root).expect("create root");
+    let folder = fallback_db_path_for_root(&root)
+        .expect("fallback db path")
+        .parent()
+        .expect("index folder")
+        .to_path_buf();
+    let staging_names = [
+        "staging.sqlite",
+        "staging.sqlite-wal",
+        "staging.sqlite-shm",
+        "staging.names",
+        "staging.names.tmp",
+    ];
+    let write_staging = || {
+        std::fs::create_dir_all(&folder).expect("create index folder");
+        for name in staging_names {
+            std::fs::write(folder.join(name), "left behind").expect("write staging file");
+        }
+    };
+
+    write_staging();
+    locator::db::remove_old_staging_files(&root);
+    for name in staging_names {
+        assert!(!folder.join(name).exists(), "{name} should be gone");
+    }
+    assert!(!folder.exists(), "the empty folder should be gone");
+
+    write_staging();
+    std::fs::write(folder.join("index.db"), "a real index").expect("write index file");
+    locator::db::remove_old_staging_files(&root);
+    for name in staging_names {
+        assert!(!folder.join(name).exists(), "{name} should be gone");
+    }
+    assert!(folder.join("index.db").exists(), "the real index stays");
+    assert!(folder.exists(), "the folder with an index stays");
+    std::env::remove_var("LCTR_DATA_DIR");
 }
