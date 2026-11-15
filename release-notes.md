@@ -1,3 +1,19 @@
+# lctr v0.5.1
+
+Stops the search screen flickering while it sits idle, and cuts the number of packages a build compiles.
+
+## Search screen
+
+- The results title no longer flips to the spinner while you are not typing. With live watch on, every change under the root runs the query again, and each rerun used to show the spinner title and could change the status line. It happened in every search mode. A rerun now runs in the background: the rows on screen stay until the new rows are ready, then they are replaced in one step, and the selected row is kept. Rows that did not change are not redrawn.
+- In semantic mode the detail pane no longer shrinks and grows again on each rerun, which used to move the whole layout.
+- In semantic mode a rerun of the same query no longer runs the embedding model again. The model runs once per query text.
+
+## Smaller build
+
+- A build compiles 278 packages on macOS, where 0.5.0 compiled 321 (Linux: 277, was 322; Windows: 278, was 328). No dependency changed version.
+- Image previews are drawn by lctr's own half-block code. The `ratatui-image` crate is gone. Only its half-block output was in use, and the new code gives the same cells: a test compared the two over 384 renders and 758,640 cells before the crate was removed.
+- Removed `humansize`, which nothing used, and turned off parts of `arboard`, `syntect` and `ratatui` that lctr does not use (clipboard images, HTML output, plist and YAML loaders, the calendar widget, the macros crate).
+
 # lctr v0.5.0
 
 Replaces the index with a compact two-file format, makes scans and searches faster, and fixes search, watcher and embedding bugs.
