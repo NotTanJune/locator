@@ -1,3 +1,70 @@
+# lctr v0.5.0
+
+Replaces the index with a compact two-file format, makes scans and searches faster, and fixes search, watcher and embedding bugs.
+
+## New index format
+
+- An index is now two files: `index.db`, a small SQLite file with your roots, open history and recent changes, and `index.names`, which holds every indexed path in lz4 blocks. On a home folder with 1.63 million files the index takes 24 MB. In 0.4.2 it took about 1.1 GB.
+- A scan collects its rows in memory and writes `index.names` once at the end. Scanning a folder of 300,000 files takes 0.4 s, where 0.4.2 took 4.0 s. A scan that is interrupted leaves the previous index as it was.
+- The first run converts an index written by 0.4 or earlier and then deletes the old `index.sqlite` (about 8 s for 1.63 million files). Your roots, open history and embeddings carry over. Staging files left behind by interrupted scans are removed the next time you scan that folder.
+- lctr 0.4 and earlier cannot read the new files. If an older `lctr` writes a new `index.sqlite` beside them, the next run of 0.5 converts and removes it.
+- An index written by a newer format is refused with a message to run `lctr update`.
+
+## Search
+
+- `lctr find` and `lctr search` share one matching path with no candidate cap. Before, glob, regex and fuzzy searches looked at only the first 200 to 20,000 rows and could miss a file that exists.
+- Size and date filters and sorts read sizes and dates from disk. Before, they used columns that a scan leaves empty, so `--min-size`, `--sort size` and the date options returned wrong or empty results.
+- A query with a path separator, such as `src/ma`, matches paths. A query without one matches names. On Windows, type the separator as `\`, because that is what stored paths use.
+- Substring, exact, prefix and suffix searches run a byte search over the names, and regex, glob and fuzzy searches test every row. Both use every core.
+- While `lctr search` is open it keeps the file names in memory, so a query does not decode them again. On the 1.63 million file index that is 42 MB, and a selective query takes 1.4 ms where it would take 5.0 ms.
+- Results with equal names sort by path.
+
+Time for one `lctr find` on the 1.63 million file index, whole process, median of 7:
+
+| Query | 0.4.2 | 0.5.0 |
+|---|---|---|
+| `invoice` | 85 ms | 12 ms |
+| `config` | 155 ms | 23 ms |
+| `config --mode exact` | 1,654 ms | 13 ms |
+| `config --mode prefix` | 1,653 ms | 20 ms |
+| `.rs --mode suffix` | 2,265 ms | 33 ms |
+| `config --mode regex` | 1,449 ms, 13 of 50 rows | 52 ms |
+| `conf*.toml --mode glob` | 1,501 ms, no rows | 41 ms |
+| `cnfgtml --mode fuzzy` | 1,592 ms, 15 of 50 rows | 180 ms |
+| `a` | 1,002 ms | 281 ms |
+
+## Watching
+
+- `lctr watch` scans once and then follows file events. Idle, it uses no CPU. Before, it rescanned every 5 seconds.
+- The watcher keeps the files inside a directory that is renamed or moved into the root.
+- A refresh from the watcher no longer moves the selection to the first row.
+
+## Embedding and semantic search
+
+- `scan --em` no longer skips every file when the root is inside `~/Library` (Dropbox, Google Drive, OneDrive, iCloud Drive).
+- Images that were skipped because the vision model was missing are embedded after `lctr embed fetch --vision`.
+- Semantic `find` applies `--ext`, `--type`, size and date filters before it cuts to the result limit.
+- Semantic mode in `lctr search` shows the 300 best hits. Before, it ranked and listed every embedded file for each query.
+- `lctr remove-root` also removes the root's embeddings.
+
+## Fixes
+
+- One invalid value in `config.toml` falls back to its default with a warning. Before, it reset every setting, and the next `config set` wrote the defaults over the file. `config set` now refuses to overwrite a file that is not valid TOML.
+- `update_check = false` in the config is honored.
+- Files named `build` or `dist` are indexed.
+- Glob `[!a]` matches every character except `a`.
+- The shell wrapper no longer treats the value of `--depth` as the scan root.
+- Live search (no index) matches names, not the root path, and orders fuzzy results by score.
+- Search screen: a held arrow key keeps moving the selection on Linux, Windows and Intel Macs, fuzzy highlight is correct on names with decomposed accents, the cursor follows wide characters, and a preview that panics shows an error and keeps the session open.
+- Previews: a JPEG is decoded at reduced size (a 96 megapixel photo peaks at 20 MB, was 326 MB), and a file with one very long line no longer takes seconds to show.
+- The update check compares pre-release version tags correctly.
+
+## Compatibility
+
+- The `index_paths` setting is removed. A `config.toml` that still sets it loads without error.
+- `--stage-index`, `--no-stage-index`, `--batch-size` and `--writer-queue-batches` are still accepted and do nothing.
+- New dependencies: `lz4_flex`, `memmap2`, `memchr` and `jpeg-decoder`.
+
 # lctr v0.4.2
 
 Fixes unresponsive search sessions and makes the exit keys consistent.

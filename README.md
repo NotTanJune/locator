@@ -189,6 +189,8 @@ An index is two local files: `index.db`, a small SQLite file with your roots, op
 <ROOT>/.locator/index.names
 ```
 
+On a home folder with 1.6 million files the two files take 24 MB together. While `lctr search` is open it also keeps the file names in memory (42 MB for that index), so a query does not decode them again.
+
 When `lctr` writes an index into a `.locator` folder it also adds a `.gitignore` containing `*` there (older folders get it on the next scan), so a scanned git project never commits the index or the embeddings file (which holds short snippets of your text).
 
 If that location is not writable, `lctr` stores a fallback index in local app-support storage for your user account:

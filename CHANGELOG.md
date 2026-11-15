@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.5.0
+
+- Replaced the SQLite row store and the trigram index with a compact name file. An index is now `index.db` plus `index.names` (lz4 blocks), about 40 times smaller.
+- Scans collect their rows in memory and write the index once at the end. Removed the staging database and the writer thread.
+- Old indexes convert on first open and the old `index.sqlite` is removed. An index from a newer format is refused with an update hint.
+- `lctr find` and the search screen share one matching path with no candidate cap. Size and date filters and sorts read metadata from disk. A query with a path separator matches paths.
+- The search screen keeps the name file open and its decoded names in memory between queries.
+- `lctr watch` follows file events instead of rescanning, and the watcher keeps files inside renamed or moved-in directories.
+- Fixed `scan --em` for roots inside `~/Library`, images skipped for a missing vision model, and semantic `find` filters that ran after the result cut.
+- Fixed config loading with one invalid value, `update_check = false`, files named `build` or `dist`, glob `[!a]`, and the shell wrapper's handling of `--depth`.
+- Fixed search-screen selection on refresh, held arrow keys, fuzzy highlight on decomposed accents, cursor width, a stuck loading state, and preview panics. JPEG previews decode at reduced size.
+- Removed the `index_paths` setting. `--stage-index`, `--no-stage-index`, `--batch-size` and `--writer-queue-batches` are accepted and ignored.
+- The test suite no longer writes into the real config directory.
+
 ## 0.4.2
 
 - Fixed semantic-search candidate-count overflow with unlimited results and contained worker panics so failures appear in the status line instead of corrupting the terminal.

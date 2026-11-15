@@ -196,3 +196,7 @@ cmake, libclang (bindgen in `llama-cpp-sys-2`), and a C++ toolchain. llama.cpp c
 ### Test env lock rule
 
 Opening a `Database` no longer reads the user config. `locator_data_dir` (used by the default index path helpers) reads `LCTR_DATA_DIR`, and `src/config.rs` reads `LCTR_CONFIG_DIR`. A test that changes either variable races every other test in the same binary that reads it. `tests/db_tests.rs` has `env_guard()`, and every test in that file takes it once. Any new test that changes a `LCTR_*` variable, or that reads one in a binary where another test changes one, must take the same guard. Each integration test file is its own process. Unit tests under `src/` have no environment changes, so they need no guard.
+
+### Test fixture paths
+
+The index splits paths on `MAIN_SEPARATOR`, and CI runs the whole suite on Windows. A test that hands the index a made-up path writes it with `/` and passes it through `native()` on the way in, and compares results through `portable()` or against `native()` values. Both helpers are in `tests/db_tests.rs` and `tests/search_core_tests.rs`. A query that holds a separator is matched against paths, so it goes through `native()` too. Paths that come from the operating system (`tempdir()`, a real scan) are already native.

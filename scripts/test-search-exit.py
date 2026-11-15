@@ -110,7 +110,8 @@ def session(binary, root, env, focus, key):
                 if focus == "semantic_error":
                     read_until(b"embedding model not found")
                 else:
-                    read_until(b"600 results complete")
+                    # The search screen asks for the 300 best semantic hits, not all 600 files.
+                    read_until(b"300 results complete")
                     read_until(b"similarity")
         elif focus == "help":
             os.write(master, b"\x1bOP")  # F1 in the legacy terminal protocol.
