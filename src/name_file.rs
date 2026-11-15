@@ -27,6 +27,7 @@ use std::fs;
 use std::io::Write;
 use std::ops::Range;
 use std::path::{Path, PathBuf, MAIN_SEPARATOR};
+use std::sync::OnceLock;
 
 use anyhow::{anyhow, bail, Context, Result};
 
@@ -39,6 +40,8 @@ const HEADER_LEN: usize = 40 + SECTIONS * 16;
 const SEP: u8 = MAIN_SEPARATOR as u8;
 /// The largest raw size accepted for one block part, so a damaged index cannot ask for more.
 const MAX_PART_BYTES: usize = 1 << 29;
+/// Decoded names are kept only for a file whose names fit in this many bytes.
+const MAX_KEPT_NAME_BYTES: usize = 1 << 30;
 
 const KINDS: usize = 0;
 const PARENTS: usize = 1;
@@ -473,6 +476,9 @@ pub struct NameFile {
     folders: usize,
     kinds: Vec<String>,
     sections: [Range<usize>; SECTIONS],
+    /// The decoded names of each block, filled the first time a search reads them. Empty
+    /// unless the file keeps names (see `keeping_names`).
+    kept_names: Vec<OnceLock<Box<[u8]>>>,
 }
 
 impl NameFile {
@@ -555,6 +561,7 @@ impl NameFile {
             folders,
             kinds,
             sections,
+            kept_names: Vec::new(),
         };
         file.validate_folder_tables()?;
         Ok(file)
@@ -586,6 +593,20 @@ impl NameFile {
             return Err(bad());
         }
         Ok(())
+    }
+
+    /// Makes the file keep each block's decoded names in memory after the first read, so a
+    /// process that searches again and again decodes them once. A file whose names would
+    /// pass `MAX_KEPT_NAME_BYTES` is returned unchanged.
+    pub fn keeping_names(mut self) -> Self {
+        let blocks = self.block_count();
+        let bytes = (0..blocks)
+            .filter_map(|block| self.part(block, 0))
+            .fold(0usize, |total, (_, raw)| total.saturating_add(raw));
+        if bytes <= MAX_KEPT_NAME_BYTES {
+            self.kept_names = (0..blocks).map(|_| OnceLock::new()).collect();
+        }
+        self
     }
 
     pub fn snapshot_id(&self) -> u64 {
@@ -852,11 +873,28 @@ pub struct Reader<'a> {
     lookup: LookupCache,
 }
 
-impl Reader<'_> {
-    /// Decodes the lowercased names of `block` into `names`, each followed by a 0 byte.
-    /// `false` when the block cannot be read; `names` is then empty.
-    pub fn load_names(&mut self, block: usize, names: &mut Vec<u8>) -> bool {
-        self.file.decode_part(block, 0, names)
+impl<'a> Reader<'a> {
+    /// The lowercased names of `block`, each followed by a 0 byte, or `None` when the block
+    /// cannot be read. A file that keeps names returns its own copy and fills it on first
+    /// use; otherwise the names are decoded into `scratch`.
+    pub fn names<'b>(&self, block: usize, scratch: &'b mut Vec<u8>) -> Option<&'b [u8]>
+    where
+        'a: 'b,
+    {
+        let file = self.file;
+        let Some(kept) = file.kept_names.get(block) else {
+            return file
+                .decode_part(block, 0, scratch)
+                .then_some(scratch.as_slice());
+        };
+        if kept.get().is_none() {
+            if !file.decode_part(block, 0, scratch) {
+                return None;
+            }
+            // Another thread may have filled it meanwhile; both copies are the same bytes.
+            let _ = kept.set(scratch.as_slice().into());
+        }
+        kept.get().map(|names| &**names)
     }
 
     /// Row `index` of `block`. `lower_name` is its lowercased name as found in the block's
@@ -941,14 +979,14 @@ impl Reader<'_> {
     fn visit_rows(&mut self, rows: Range<usize>, visit: &mut dyn FnMut(Row<'_>) -> bool) -> bool {
         let end = rows.end.min(self.file.rows);
         let mut row = rows.start;
-        let mut names = Vec::new();
+        let mut scratch = Vec::new();
         while row < end {
             let block = row / BLOCK_ROWS;
             let block_end = ((block + 1) * BLOCK_ROWS).min(end);
-            if !self.load_names(block, &mut names) {
+            let Some(names) = self.names(block, &mut scratch) else {
                 row = block_end;
                 continue;
-            }
+            };
             let mut start = 0;
             for _ in 0..row % BLOCK_ROWS {
                 match memchr::memchr(0, names.get(start..).unwrap_or(&[])) {

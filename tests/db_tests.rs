@@ -1,7 +1,8 @@
 use chrono::{TimeZone, Utc};
 use locator::db::{
     db_path_for_working_dir, default_db_path, delete_index_files, existing_db_path_for_working_dir,
-    fallback_db_path_for_root, local_db_path_for_root, Database, FileRecord, ScanCompletion,
+    fallback_db_path_for_root, local_db_path_for_root, Database, FileRecord, NameFileCache,
+    ScanCompletion,
 };
 use locator::name_file::{name_file_path, NameFile, NameFileBuilder};
 use locator::query::{QueryMode, SearchFilters, SearchOptions, SortField};
@@ -1975,4 +1976,52 @@ fn remove_old_staging_files_clears_the_leftovers_of_an_interrupted_scan() {
     assert!(folder.join("index.db").exists(), "the real index stays");
     assert!(folder.exists(), "the folder with an index stays");
     std::env::remove_var("LCTR_DATA_DIR");
+}
+
+#[test]
+fn handles_that_share_a_cache_reuse_the_name_file_and_follow_a_new_one() {
+    let _guard = env_guard();
+    let dir = tempdir().expect("temp dir");
+    let db_path = dir.path().join("index.db");
+    let sep = std::path::MAIN_SEPARATOR;
+    let root = format!("{sep}tmp");
+    let old = format!("{root}{sep}alpha.txt");
+    let other = format!("{root}{sep}beta.txt");
+    let new = format!("{root}{sep}gamma.txt");
+
+    let writer = Database::open(&db_path).expect("open writable");
+    install(&writer, &root, &[(&old, "txt"), (&other, "txt")], 1234);
+    drop(writer);
+
+    let cache = NameFileCache::keeping_names();
+    let shared = || {
+        Database::open_readonly(&db_path)
+            .expect("open read-only")
+            .with_name_file_cache(cache.clone())
+    };
+    let find = |db: &Database, query: &str| -> Vec<String> {
+        db.search_with_options(&SearchOptions::new(query))
+            .expect("search works")
+            .into_iter()
+            .map(|result| result.path)
+            .collect()
+    };
+
+    assert_eq!(find(&shared(), "alpha"), vec![old.clone()]);
+
+    let writer = Database::open(&db_path).expect("open writable");
+    writer
+        .upsert_file(&live_record(&root, &new, "txt", 0))
+        .expect("upsert");
+    writer.compact_name_file().expect("compact");
+    drop(writer);
+
+    assert_eq!(find(&shared(), "gamma"), vec![new.clone()]);
+
+    std::fs::remove_file(name_file_path(&db_path)).expect("delete the name file");
+
+    assert_eq!(find(&shared(), "alpha"), vec![old]);
+    assert_eq!(find(&shared(), "gamma"), vec![new.clone()]);
+    let plain = Database::open_readonly(&db_path).expect("open read-only");
+    assert!(find(&plain, "gamma").is_empty());
 }

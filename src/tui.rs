@@ -33,8 +33,8 @@ use ratatui_image::StatefulImage;
 
 use crate::config::Config;
 use crate::db::{
-    existing_index_for_working_dir, sort_results_compiled, Database, ScanCompletion, SearchResult,
-    SearchStreamStatus, SEARCH_BATCH_SIZE,
+    existing_index_for_working_dir, sort_results_compiled, Database, NameFileCache, ScanCompletion,
+    SearchResult, SearchStreamStatus, SEARCH_BATCH_SIZE,
 };
 use crate::live_index::LiveIndex;
 #[cfg(test)]
@@ -1591,10 +1591,14 @@ fn open_search_database(path: &Path) -> Result<Database> {
         .map(Database::with_search_path_verification)
 }
 
-fn open_search_reader(path: &Path) -> Result<Database> {
-    // Backend selection already upgrades the schema. Queries only need a reader:
-    // no migration writes, and a fresh handle sees a staged index replacement.
-    Database::open_readonly(path).map(Database::with_search_path_verification)
+fn open_search_reader(path: &Path, names: &NameFileCache) -> Result<Database> {
+    // Backend selection already upgrades the schema. Queries only need a reader: no
+    // migration writes, and a fresh handle follows an index that was deleted and made
+    // again. `names` keeps the name file and its decoded names between queries.
+    Database::open_readonly(path).map(|db| {
+        db.with_search_path_verification()
+            .with_name_file_cache(names.clone())
+    })
 }
 
 #[cfg(test)]
@@ -1727,6 +1731,7 @@ fn search_worker_loop(
     query_rx: Receiver<QueuedSearchRequest>,
     result_tx: Sender<SearchUpdate>,
 ) {
+    let names = NameFileCache::keeping_names();
     match search_backend {
         SearchBackend::Indexed { db_path, .. } => {
             while let Ok(request) = query_rx.recv() {
@@ -1745,7 +1750,7 @@ fn search_worker_loop(
                     }
 
                     let mut next_request = None;
-                    let outcome = open_search_reader(&db_path).and_then(|db| {
+                    let outcome = open_search_reader(&db_path, &names).and_then(|db| {
                         db.search_streaming_with_options(
                             &options,
                             || {
@@ -1901,7 +1906,7 @@ fn search_worker_loop(
                     let mut next_request = None;
                     let mut seen_paths = HashSet::new();
                     let mut final_results = Vec::new();
-                    let indexed_outcome = open_search_reader(&db_path).and_then(|db| {
+                    let indexed_outcome = open_search_reader(&db_path, &names).and_then(|db| {
                         db.search_streaming_with_options(
                             &options,
                             || {
@@ -2013,7 +2018,7 @@ fn search_worker_loop(
                                 CompiledQuery::compile(options.mode, &options.query)
                             {
                                 let frecency = if options.sort == SortField::Relevance {
-                                    open_search_reader(&db_path)
+                                    open_search_reader(&db_path, &names)
                                         .map(|db| {
                                             db.frecency_for_paths(
                                                 final_results.iter().map(|r| r.path.as_str()),

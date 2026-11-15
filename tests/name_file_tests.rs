@@ -110,8 +110,8 @@ fn names_of_a_block_hold_every_row_once() {
     let mut reader = file.reader();
     let mut by_row = Vec::new();
     for block in 0..file.block_count() {
-        let mut names = Vec::new();
-        assert!(reader.load_names(block, &mut names));
+        let mut scratch = Vec::new();
+        let names = reader.names(block, &mut scratch).expect("names decode");
         let expected = (file.len() - block * BLOCK_ROWS).min(BLOCK_ROWS);
         assert_eq!(names.iter().filter(|byte| **byte == 0).count(), expected);
         let (mut start, mut index) = (0, 0);
@@ -125,6 +125,36 @@ fn names_of_a_block_hold_every_row_once() {
         assert_eq!(index, expected);
     }
     assert_eq!(by_row, all_rows(&file));
+}
+
+#[test]
+fn a_file_that_keeps_names_returns_the_same_rows_from_its_own_copy() {
+    let mut builder = NameFileBuilder::default();
+    for (path, kind) in &many_rows() {
+        builder.push(path, kind).unwrap();
+    }
+    let image = builder.finish(7).unwrap();
+    let plain = NameFile::from_bytes(image.clone()).unwrap();
+    let keeping = NameFile::from_bytes(image).unwrap().keeping_names();
+
+    assert_eq!(all_rows(&keeping), all_rows(&plain));
+    assert_eq!(all_rows(&keeping), all_rows(&plain));
+
+    let (keeping_reader, plain_reader) = (keeping.reader(), plain.reader());
+    for block in 0..keeping.block_count() {
+        let (mut kept_scratch, mut plain_scratch) = (Vec::new(), Vec::new());
+        let first = keeping_reader.names(block, &mut kept_scratch).unwrap();
+        let first_ptr = first.as_ptr();
+        let first_bytes = first.to_vec();
+        let second = keeping_reader.names(block, &mut kept_scratch).unwrap();
+        assert_eq!(first_ptr, second.as_ptr());
+        assert_ne!(first_ptr, kept_scratch.as_ptr());
+
+        let decoded = plain_reader.names(block, &mut plain_scratch).unwrap();
+        let (decoded_ptr, decoded_bytes) = (decoded.as_ptr(), decoded.to_vec());
+        assert_eq!(decoded_ptr, plain_scratch.as_ptr());
+        assert_eq!(decoded_bytes, first_bytes);
+    }
 }
 
 #[test]

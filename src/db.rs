@@ -1,9 +1,8 @@
-use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf, MAIN_SEPARATOR};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -107,13 +106,42 @@ pub struct EmbeddableFile {
 /// The changes table may hold this many rows before a search folds them into the name file.
 const MAX_PENDING_CHANGES: usize = 2_000;
 
+/// Where a handle keeps the name file it last opened. A handle normally has its own. The
+/// search screen gives one to every query's handle and asks it to keep names, so the open
+/// file and the names it has decoded stay in memory between queries.
+#[derive(Clone, Default)]
+pub struct NameFileCache {
+    file: Arc<Mutex<Option<Arc<NameFile>>>>,
+    keep_names: bool,
+}
+
+impl NameFileCache {
+    /// A cache whose name files keep their decoded names in memory.
+    pub fn keeping_names() -> Self {
+        Self {
+            file: Arc::default(),
+            keep_names: true,
+        }
+    }
+
+    fn get(&self) -> Option<Arc<NameFile>> {
+        self.file.lock().ok()?.clone()
+    }
+
+    fn set(&self, file: Option<Arc<NameFile>>) {
+        if let Ok(mut slot) = self.file.lock() {
+            *slot = file;
+        }
+    }
+}
+
 pub struct Database {
     conn: Connection,
     path: Option<PathBuf>,
     verify_paths_on_search: bool,
-    /// The name file last written or opened by this handle. For an in-memory database it is
-    /// the only copy. `Arc` keeps `Database` `Send`.
-    name_file: RefCell<Option<Arc<NameFile>>>,
+    /// The name file last written or opened by this handle, or by every handle that shares
+    /// its cache. For an in-memory database it is the only copy.
+    name_file: NameFileCache,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,7 +157,7 @@ impl Database {
             conn,
             path,
             verify_paths_on_search: false,
-            name_file: RefCell::new(None),
+            name_file: NameFileCache::default(),
         }
     }
 
@@ -204,6 +232,12 @@ impl Database {
 
     pub fn with_search_path_verification(mut self) -> Self {
         self.verify_paths_on_search = true;
+        self
+    }
+
+    /// Makes this handle use `cache` for its name file (see `NameFileCache`).
+    pub fn with_name_file_cache(mut self, cache: NameFileCache) -> Self {
+        self.name_file = cache;
         self
     }
 
@@ -678,9 +712,9 @@ impl Database {
         if snapshot_id == 0 {
             return empty_name_file();
         }
-        if let Some(cached) = self.name_file.borrow().as_ref() {
+        if let Some(cached) = self.name_file.get() {
             if cached.snapshot_id() == snapshot_id || self.path.is_none() {
-                return Ok(Arc::clone(cached));
+                return Ok(cached);
             }
         }
         let Some(db_path) = &self.path else {
@@ -688,8 +722,13 @@ impl Database {
         };
         match NameFile::open(&name_file_path(db_path)) {
             Ok(file) => {
+                let file = if self.name_file.keep_names {
+                    file.keeping_names()
+                } else {
+                    file
+                };
                 let file = Arc::new(file);
-                *self.name_file.borrow_mut() = Some(Arc::clone(&file));
+                self.name_file.set(Some(Arc::clone(&file)));
                 Ok(file)
             }
             Err(error) if is_not_found(&error) => empty_name_file(),
@@ -1075,13 +1114,13 @@ impl Database {
             "INSERT OR REPLACE INTO search_state(key, value) VALUES ('snapshot_id', ?1)",
             [i64::try_from(snapshot_id).unwrap_or(i64::MAX)],
         )?;
-        *self.name_file.borrow_mut() = if self.path.is_some() {
+        self.name_file.set(if self.path.is_some() {
             None
         } else {
             Some(Arc::new(
                 NameFile::from_bytes(image).context("load the new name file")?,
             ))
-        };
+        });
         Ok(())
     }
 
@@ -2196,14 +2235,14 @@ impl NameScan<'_> {
         &self,
         block: usize,
         reader: &mut Reader<'_>,
-        names: &mut Vec<u8>,
+        scratch: &mut Vec<u8>,
         finders: &[memchr::memmem::Finder<'_>],
         stop: &std::sync::atomic::AtomicBool,
         sink: &mut ScanSink<'_, '_>,
     ) -> bool {
-        if !reader.load_names(block, names) {
+        let Some(names) = reader.names(block, scratch) else {
             return true;
-        }
+        };
         for finder in finders {
             // `index` is the number of 0 bytes before `position`, so it is the row of the
             // name that starts there.
