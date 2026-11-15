@@ -27,9 +27,6 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Cell, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::{Frame, Terminal};
-use ratatui_image::picker::Picker;
-use ratatui_image::protocol::StatefulProtocol;
-use ratatui_image::StatefulImage;
 
 use crate::config::Config;
 use crate::db::{
@@ -46,8 +43,11 @@ use crate::query::{
     CompiledQuery, QueryMode, QueryScorer, SearchFilters, SearchOptions, SortField,
 };
 
+mod halfblock;
 mod input_trace;
 pub mod theme;
+
+use halfblock::HalfblockImage;
 
 use theme::Theme;
 
@@ -708,12 +708,6 @@ fn run_loop(
     });
     let mut watch_enabled = live_index.is_some();
     let mut live_generation = live_index.as_ref().map_or(0, LiveIndex::generation);
-    // Do not probe terminal capabilities before the first frame. The probe
-    // waits for a response on stdin and can block for seconds in terminals
-    // that do not implement the graphics query, while also racing input
-    // handling after its timeout. Half-block rendering remains available for
-    // image previews without delaying TUI startup.
-    let mut picker = Picker::halfblocks();
     let preview_worker = PreviewWorker::spawn();
     let mut preview_requested: Option<String> = None;
     let mut preview_state: Option<PreviewState> = None;
@@ -726,6 +720,7 @@ fn run_loop(
     let preview_enabled = config.preview;
     let mut search_worker = SearchWorker::spawn(search_backend)?;
     let mut loading_query: Option<String> = None;
+    let mut refresh = BackgroundRefresh::default();
     let mut last_edit = Instant::now();
     let update_rx = crate::update_check::check_async(update_check_disabled);
     let mut update_status: Option<crate::update_check::UpdateStatus> = None;
@@ -756,6 +751,67 @@ fn run_loop(
         drain_search_updates(&mut search_worker, RESULT_DRAIN_BUDGET, |update| {
             let query = input.as_str();
             match update {
+                SearchUpdate::Reset {
+                    request_id,
+                    options,
+                } if refresh.is(request_id)
+                    && search_state.accepts_update(request_id, query, &options) =>
+                {
+                    refresh.rows.clear();
+                }
+                SearchUpdate::Append {
+                    request_id,
+                    options,
+                    results: batch,
+                    ..
+                } if refresh.is(request_id)
+                    && search_state.accepts_update(request_id, query, &options) =>
+                {
+                    refresh.rows.extend(batch);
+                }
+                SearchUpdate::Complete {
+                    request_id,
+                    options,
+                    count,
+                    final_results,
+                    live_backfill,
+                } if refresh.is(request_id)
+                    && search_state.accepts_update(request_id, query, &options) =>
+                {
+                    let rows = refresh.finish(final_results);
+                    if live_backfill {
+                        search_state.mark_live_complete(options.query.clone());
+                    }
+                    // Unchanged rows need no redraw at all.
+                    if rows != results {
+                        selection_anchor = selected_path(&selected, &results).map(str::to_string);
+                        apply_result_batch(
+                            &mut results,
+                            &mut result_paths,
+                            &mut selected,
+                            &mut selection_anchor,
+                            true,
+                            rows,
+                        );
+                        selection_anchor = None;
+                        results_semantic = request_is_semantic(&options);
+                        results_stamp = results_stamp.wrapping_add(1);
+                        if status.ends_with(RESULTS_COMPLETE) {
+                            status = format!("{} {RESULTS_COMPLETE}", format_count(count));
+                        }
+                        needs_draw = true;
+                    }
+                }
+                SearchUpdate::Error {
+                    request_id,
+                    options,
+                    ..
+                } if refresh.is(request_id)
+                    && search_state.accepts_update(request_id, query, &options) =>
+                {
+                    // The rows on screen stay. The next change runs the query again.
+                    refresh.finish(None);
+                }
                 SearchUpdate::Reset {
                     request_id,
                     options,
@@ -815,7 +871,7 @@ fn run_loop(
                     if live_backfill {
                         search_state.mark_live_complete(options.query.clone());
                     }
-                    status = format!("{} results complete", format_count(count));
+                    status = format!("{} {RESULTS_COMPLETE}", format_count(count));
                     needs_draw = true;
                 }
                 SearchUpdate::Error {
@@ -852,11 +908,16 @@ fn run_loop(
         }
 
         // When the live watcher reports the index changed, re-run the current
-        // query so new/removed files surface without a keystroke.
+        // query so new/removed files surface without a keystroke. The rerun is
+        // a background refresh: no spinner and no status, and its rows replace
+        // the visible ones in one step when it completes.
         if let Some(live) = live_index.as_ref() {
             let current = live.generation();
             // A busy filesystem must not continually cancel an active search.
-            if current != live_generation && loading_query.is_none() {
+            if current != live_generation
+                && loading_query.is_none()
+                && !refresh.in_flight(&search_state)
+            {
                 live_generation = current;
                 let query = input.as_str();
                 if should_show_results(query) {
@@ -868,8 +929,7 @@ fn run_loop(
                         options: options.clone(),
                     }) {
                         search_state.mark_submitted_with_id(options, false, request_id);
-                        loading_query = Some(query.to_string());
-                        needs_draw = true;
+                        refresh.start(request_id);
                     }
                 }
             }
@@ -898,7 +958,7 @@ fn run_loop(
         }
         while let Ok((path, preview)) = preview_worker.rx.try_recv() {
             if preview_enabled && preview_target.as_deref() == Some(path.as_str()) {
-                preview_state = Some(build_preview(&mut picker, preview));
+                preview_state = Some(build_preview(preview));
                 needs_draw = true;
             }
         }
@@ -1265,7 +1325,9 @@ fn run_loop(
         let finder_pending = finder_reveal.reveal_pending();
         #[cfg(not(all(target_os = "macos", target_arch = "aarch64", not(test))))]
         let finder_pending = false;
-        let poll_timeout = input_poll_timeout(loading_query.is_some() || finder_pending);
+        let poll_timeout = input_poll_timeout(
+            loading_query.is_some() || refresh.in_flight(&search_state) || finder_pending,
+        );
         let Some(event) = read_normalized_input(
             &mut input_normalizer,
             &mut input_trace,
@@ -2224,9 +2286,8 @@ fn run_semantic_request(
 ) {
     let request_id = request.request_id;
     let options = request.request.options.clone();
-    if let Ok(mut shared) = details.lock() {
-        shared.clear();
-    }
+    // The details of the rows on screen stay until the new hits replace them. Clearing them
+    // here would shrink the detail pane for the length of every search.
     let _ = result_tx.send(SearchUpdate::Reset {
         request_id,
         options: options.clone(),
@@ -2257,6 +2318,9 @@ fn run_semantic_request(
             });
         }
         Err(error) => {
+            if let Ok(mut shared) = details.lock() {
+                shared.clear();
+            }
             let _ = result_tx.send(SearchUpdate::Error {
                 request_id,
                 options,
@@ -2372,6 +2436,42 @@ impl SearchInput {
     }
 }
 
+/// End of the status text a finished search leaves.
+const RESULTS_COMPLETE: &str = "results complete";
+
+/// A rerun of the query on screen that the live watcher started. It shows no spinner and
+/// changes no status text. Its rows are collected here and replace the visible rows in one
+/// step when the search completes, so the screen never shows a half-filled list.
+#[derive(Debug, Default)]
+struct BackgroundRefresh {
+    request_id: Option<u64>,
+    rows: Vec<SearchResult>,
+}
+
+impl BackgroundRefresh {
+    fn start(&mut self, request_id: u64) {
+        self.request_id = Some(request_id);
+        self.rows.clear();
+    }
+
+    fn is(&self, request_id: u64) -> bool {
+        self.request_id == Some(request_id)
+    }
+
+    /// True while the refresh is still the newest request. A search the user starts later
+    /// takes over `active_request_id`, so an abandoned refresh never blocks the next one.
+    fn in_flight(&self, search_state: &SearchState) -> bool {
+        self.request_id.is_some() && self.request_id == search_state.active_request_id
+    }
+
+    /// Ends the refresh and returns its rows. A backend that sends one final list wins.
+    fn finish(&mut self, final_results: Option<Vec<SearchResult>>) -> Vec<SearchResult> {
+        self.request_id = None;
+        let rows = std::mem::take(&mut self.rows);
+        final_results.unwrap_or(rows)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct SearchState {
     dirty: bool,
@@ -2470,7 +2570,7 @@ pub(crate) fn spinner_glyph(frame: usize) -> &'static str {
 
 enum PreviewRender {
     Lines(Vec<Line<'static>>),
-    Image(Box<StatefulProtocol>),
+    Image(Box<HalfblockImage>),
 }
 
 /// A slow filesystem read or decoder must never own the keyboard thread.
@@ -2514,17 +2614,18 @@ struct PreviewState {
     render: PreviewRender,
 }
 
-fn build_preview(picker: &mut Picker, preview: Preview) -> PreviewState {
+fn build_preview(preview: Preview) -> PreviewState {
     match preview {
         Preview::Text(lines) | Preview::Info(lines) => PreviewState {
             meta: Vec::new(),
             render: PreviewRender::Lines(lines),
         },
         Preview::Image { image, meta } => {
-            let protocol = picker.new_resize_protocol(*image);
+            // Half blocks need no terminal capability probe, which would wait on stdin
+            // and could block for seconds in terminals without a graphics protocol.
             PreviewState {
                 meta,
-                render: PreviewRender::Image(Box::new(protocol)),
+                render: PreviewRender::Image(Box::new(HalfblockImage::new(*image))),
             }
         }
     }
@@ -2566,7 +2667,7 @@ fn render_preview(frame: &mut Frame, area: Rect, state: &mut PreviewState, theme
             } else {
                 inner
             };
-            frame.render_stateful_widget(StatefulImage::new(), image_area, protocol.as_mut());
+            protocol.render(image_area, frame.buffer_mut());
         }
     }
 }
@@ -3369,8 +3470,8 @@ mod tests {
     use crate::tui::{
         apply_result_batch, detail_height, drain_search_updates, input_poll_timeout,
         request_is_semantic, search_bar_scroll, semantic_detail_lines, semantic_detail_map,
-        semantic_hit, still_loading, PreviewWorker, SearchUpdate, ACTIVE_POLL_INTERVAL,
-        TUI_SEMANTIC_RESULT_LIMIT,
+        semantic_hit, still_loading, BackgroundRefresh, PreviewWorker, SearchUpdate,
+        ACTIVE_POLL_INTERVAL, TUI_SEMANTIC_RESULT_LIMIT,
     };
     use ratatui::text::Line;
     use ratatui::widgets::TableState;
@@ -4575,6 +4676,166 @@ mod tests {
         assert_eq!(map.get("/a.txt"), Some(&(0.5, "alpha".to_string())));
     }
 
+    /// What the watcher does to a semantic search: the same request again and again. The
+    /// model must run once, and the details of the rows on screen must never be empty, or
+    /// the detail pane shrinks for the length of each rerun.
+    #[test]
+    fn a_semantic_rerun_embeds_once_and_keeps_the_details() {
+        use crate::embed::fake::HashEmbedder;
+        use crate::embed::pipeline::{run_pass, Depth, PassRequest};
+        use crate::embed::runtime::Embedder;
+        use crate::embed::search::SemanticSearcher;
+        use crate::tui::{run_semantic_request, QueuedSearchRequest, SemanticDetails};
+        use anyhow::Result;
+        use std::path::Path;
+        use std::sync::atomic::AtomicBool;
+        use std::sync::{mpsc, Arc, Mutex};
+
+        struct Counting {
+            inner: HashEmbedder,
+            batches: usize,
+            // The details map as each embed call sees it, and as each search starts.
+            details: SemanticDetails,
+            seen_empty: bool,
+        }
+        impl Embedder for Counting {
+            fn backend_label(&self) -> &str {
+                self.inner.backend_label()
+            }
+            fn supports_images(&self) -> bool {
+                false
+            }
+            fn embed_batch(&mut self, inputs: &[String]) -> Result<Vec<Vec<f32>>> {
+                self.batches += 1;
+                if self.batches > 1 && self.details.lock().unwrap().is_empty() {
+                    self.seen_empty = true;
+                }
+                self.inner.embed_batch(inputs)
+            }
+            fn embed_image(&mut self, path: &Path) -> Result<Vec<f32>> {
+                self.inner.embed_image(path)
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().join("docs");
+        std::fs::create_dir_all(&root).expect("root");
+        std::fs::write(root.join("budget.txt"), "quarterly budget marketing spend").unwrap();
+        std::fs::write(root.join("soup.md"), "tomato soup recipe with basil").unwrap();
+        let index = dir.path().join("index.db");
+        let db = Database::open(&index).expect("open index");
+        crate::scanner::scan_root(&db, &root, crate::scanner::ScanOptions::default())
+            .expect("scan");
+        drop(db);
+        let (progress, _progress_rx) = mpsc::channel();
+        run_pass(
+            &PassRequest {
+                index_path: index.clone(),
+                root: root.clone(),
+                dims: 768,
+                text_model: None,
+                vision_model: None,
+                fake: true,
+                depth: Depth::Deep,
+            },
+            progress,
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("embedding pass");
+
+        let mut searcher = SemanticSearcher::open(&index)
+            .unwrap()
+            .expect("has embeddings");
+        let details: SemanticDetails = Arc::new(Mutex::new(HashMap::new()));
+        let mut embedder = Counting {
+            inner: HashEmbedder,
+            batches: 0,
+            details: Arc::clone(&details),
+            seen_empty: false,
+        };
+        let (result_tx, result_rx) = mpsc::channel();
+        let options = tui_search_options("marketing budget", QueryMode::Semantic);
+        let mut first_rows = None;
+        for request_id in 1..=4u64 {
+            let request = QueuedSearchRequest {
+                request_id,
+                request: SearchRequest {
+                    options: options.clone(),
+                },
+            };
+            let before = details.lock().unwrap().clone();
+            run_semantic_request(&mut searcher, &mut embedder, &request, &result_tx, &details);
+            let mut rows = None;
+            let mut kinds = Vec::new();
+            while let Ok(update) = result_rx.try_recv() {
+                match update {
+                    SearchUpdate::Reset { .. } => kinds.push("reset"),
+                    SearchUpdate::Append { results, .. } => {
+                        kinds.push("append");
+                        rows = Some(results);
+                    }
+                    SearchUpdate::Complete { .. } => kinds.push("complete"),
+                    SearchUpdate::Error { error, .. } => panic!("search failed: {error}"),
+                }
+            }
+            assert_eq!(kinds, ["reset", "append", "complete"]);
+            let rows = rows.expect("rows");
+            assert!(!rows.is_empty());
+            let after = details.lock().unwrap().clone();
+            assert_eq!(after.len(), rows.len());
+            if request_id > 1 {
+                // A rerun leaves the same rows and the same details.
+                assert_eq!(Some(&rows), first_rows.as_ref());
+                assert_eq!(before, after);
+            }
+            first_rows.get_or_insert(rows);
+        }
+        assert_eq!(embedder.batches, 1, "the same query must be embedded once");
+
+        // A new query runs the model. While it runs, the details of the rows still on
+        // screen are in place.
+        let request = QueuedSearchRequest {
+            request_id: 5,
+            request: SearchRequest {
+                options: tui_search_options("tomato soup", QueryMode::Semantic),
+            },
+        };
+        run_semantic_request(&mut searcher, &mut embedder, &request, &result_tx, &details);
+        assert_eq!(embedder.batches, 2);
+        assert!(
+            !embedder.seen_empty,
+            "the details were emptied while a search was running"
+        );
+        let _ = result_rx.try_iter().count();
+
+        // A failed search empties the details, so no stale similarity line stays behind.
+        struct Failing;
+        impl Embedder for Failing {
+            fn backend_label(&self) -> &str {
+                "failing"
+            }
+            fn supports_images(&self) -> bool {
+                false
+            }
+            fn embed_batch(&mut self, _inputs: &[String]) -> Result<Vec<Vec<f32>>> {
+                anyhow::bail!("model busy")
+            }
+            fn embed_image(&mut self, _path: &Path) -> Result<Vec<f32>> {
+                anyhow::bail!("no images")
+            }
+        }
+        let request = QueuedSearchRequest {
+            request_id: 9,
+            request: SearchRequest {
+                options: tui_search_options("tomato basil", QueryMode::Semantic),
+            },
+        };
+        run_semantic_request(&mut searcher, &mut Failing, &request, &result_tx, &details);
+        assert!(details.lock().unwrap().is_empty());
+        let updates: Vec<_> = result_rx.try_iter().collect();
+        assert!(matches!(updates.last(), Some(SearchUpdate::Error { .. })));
+    }
+
     #[test]
     fn semantic_request_without_an_index_reports_no_embeddings() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4599,6 +4860,61 @@ mod tests {
             }
             assert!(Instant::now() < deadline, "no error update arrived");
         }
+    }
+
+    #[test]
+    fn background_refresh_collects_rows_until_it_finishes() {
+        let mut refresh = BackgroundRefresh::default();
+        let mut state = SearchState::default();
+        assert!(!refresh.in_flight(&state));
+
+        state.mark_submitted_with_id(SearchOptions::new("report"), false, 7);
+        refresh.start(7);
+        assert!(refresh.is(7));
+        assert!(!refresh.is(8));
+        assert!(refresh.in_flight(&state));
+
+        refresh
+            .rows
+            .push(test_result("a.txt", "text", Some("txt"), 1));
+        refresh
+            .rows
+            .push(test_result("b.txt", "text", Some("txt"), 2));
+        let rows = refresh.finish(None);
+        assert_eq!(rows.len(), 2);
+        assert!(!refresh.in_flight(&state));
+        assert!(!refresh.is(7));
+        assert!(refresh.rows.is_empty());
+    }
+
+    #[test]
+    fn background_refresh_prefers_a_final_list_and_restarts_empty() {
+        let mut refresh = BackgroundRefresh::default();
+        refresh.start(1);
+        refresh
+            .rows
+            .push(test_result("old.txt", "text", Some("txt"), 1));
+        let rows = refresh.finish(Some(vec![test_result("final.txt", "text", Some("txt"), 1)]));
+        assert_eq!(rows[0].name, "final.txt");
+
+        refresh
+            .rows
+            .push(test_result("stale.txt", "text", Some("txt"), 1));
+        refresh.start(2);
+        assert!(refresh.rows.is_empty());
+    }
+
+    #[test]
+    fn a_search_the_user_starts_ends_an_abandoned_background_refresh() {
+        let mut refresh = BackgroundRefresh::default();
+        let mut state = SearchState::default();
+        state.mark_submitted_with_id(SearchOptions::new("report"), false, 3);
+        refresh.start(3);
+        assert!(refresh.in_flight(&state));
+
+        // The user edits the query before the refresh completes.
+        state.mark_submitted_with_id(SearchOptions::new("reports"), false, 4);
+        assert!(!refresh.in_flight(&state));
     }
 
     #[test]

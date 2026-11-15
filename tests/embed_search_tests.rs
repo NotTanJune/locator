@@ -331,3 +331,141 @@ fn reload_cost_on_a_real_sidecar() {
         started.elapsed().as_secs_f64() * 1000.0
     );
 }
+
+/// Counts the text batches it is asked to embed, and otherwise behaves as `HashEmbedder`.
+struct CountingEmbedder {
+    inner: HashEmbedder,
+    batches: usize,
+}
+
+impl Embedder for CountingEmbedder {
+    fn backend_label(&self) -> &str {
+        self.inner.backend_label()
+    }
+    fn supports_images(&self) -> bool {
+        self.inner.supports_images()
+    }
+    fn embed_batch(&mut self, inputs: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+        self.batches += 1;
+        self.inner.embed_batch(inputs)
+    }
+    fn embed_image(&mut self, path: &Path) -> anyhow::Result<Vec<f32>> {
+        self.inner.embed_image(path)
+    }
+}
+
+fn hit_summary(hits: &[locator::embed::SemanticHit]) -> Vec<(String, u32, String)> {
+    hits.iter()
+        .map(|hit| {
+            (
+                hit.result.path.clone(),
+                hit.score.to_bits(),
+                hit.snippet.clone(),
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_repeated_query_is_embedded_once_and_gives_the_same_hits() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("docs");
+    fs::create_dir_all(&root).expect("root");
+    write_corpus(&root);
+    let index = dir.path().join("index.sqlite");
+    index_and_embed(&root, &index);
+
+    let mut searcher = SemanticSearcher::open(&index)
+        .expect("open")
+        .expect("has embeddings");
+    let mut embedder = CountingEmbedder {
+        inner: HashEmbedder,
+        batches: 0,
+    };
+
+    let first = searcher
+        .search(&mut embedder, &query("marketing budget"))
+        .expect("search");
+    assert_eq!(embedder.batches, 1);
+    // The search screen reruns the same query after every watcher batch.
+    for _ in 0..5 {
+        let again = searcher
+            .search(&mut embedder, &query("marketing budget"))
+            .expect("search");
+        assert_eq!(hit_summary(&again), hit_summary(&first));
+    }
+    assert_eq!(
+        embedder.batches, 1,
+        "a repeated query must not be embedded again"
+    );
+    // Surrounding spaces and other options do not change the text that is embedded.
+    searcher
+        .search(&mut embedder, &query("  marketing budget ").with_limit(1))
+        .expect("search");
+    assert_eq!(embedder.batches, 1);
+
+    // A different query is embedded, and the hits are those of a fresh searcher.
+    let soup = searcher
+        .search(&mut embedder, &query("tomato basil"))
+        .expect("search");
+    assert_eq!(embedder.batches, 2);
+    let mut fresh = SemanticSearcher::open(&index).unwrap().unwrap();
+    let expected = fresh
+        .search(&mut HashEmbedder, &query("tomato basil"))
+        .expect("search");
+    assert_eq!(hit_summary(&soup), hit_summary(&expected));
+
+    // Only the last query is kept.
+    let back = searcher
+        .search(&mut embedder, &query("marketing budget"))
+        .expect("search");
+    assert_eq!(embedder.batches, 3);
+    assert_eq!(hit_summary(&back), hit_summary(&first));
+}
+
+#[test]
+fn a_failed_embed_is_not_cached() {
+    struct FailsOnce {
+        inner: HashEmbedder,
+        calls: usize,
+    }
+    impl Embedder for FailsOnce {
+        fn backend_label(&self) -> &str {
+            self.inner.backend_label()
+        }
+        fn supports_images(&self) -> bool {
+            false
+        }
+        fn embed_batch(&mut self, inputs: &[String]) -> anyhow::Result<Vec<Vec<f32>>> {
+            self.calls += 1;
+            if self.calls == 1 {
+                anyhow::bail!("model busy");
+            }
+            self.inner.embed_batch(inputs)
+        }
+        fn embed_image(&mut self, path: &Path) -> anyhow::Result<Vec<f32>> {
+            self.inner.embed_image(path)
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path().join("docs");
+    fs::create_dir_all(&root).expect("root");
+    write_corpus(&root);
+    let index = dir.path().join("index.sqlite");
+    index_and_embed(&root, &index);
+    let mut searcher = SemanticSearcher::open(&index).unwrap().unwrap();
+    let mut embedder = FailsOnce {
+        inner: HashEmbedder,
+        calls: 0,
+    };
+
+    assert!(searcher
+        .search(&mut embedder, &query("marketing budget"))
+        .is_err());
+    let hits = searcher
+        .search(&mut embedder, &query("marketing budget"))
+        .expect("second search");
+    assert_eq!(embedder.calls, 2);
+    assert_eq!(file_name(&hits[0].result.path), "budget.txt");
+}

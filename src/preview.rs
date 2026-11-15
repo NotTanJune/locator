@@ -1,6 +1,6 @@
 //! File preview generation for the search TUI's preview pane. Produces
-//! syntax-highlighted text (via `syntect`), decoded images (rendered inline by
-//! `ratatui-image` in the TUI), extracted PDF text, directory listings, or a
+//! syntax-highlighted text (via `syntect`), decoded images (drawn as half blocks by
+//! `tui/halfblock.rs`), extracted PDF text, directory listings, or a
 //! metadata fallback for binaries. Heavy work (decode, highlight) is bounded and
 //! the TUI caches the result per selected path so it is not recomputed each tick.
 

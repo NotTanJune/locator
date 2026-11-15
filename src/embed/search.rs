@@ -28,6 +28,10 @@ pub struct SemanticSearcher {
     dims: usize,
     data_version: i64,
     last_check: std::time::Instant,
+    /// The last query text and the vector the embedder gave for it, before truncation. The
+    /// search screen runs the same query again after every watcher batch, and this saves
+    /// the model call each time. A searcher is used with one embedder for its whole life.
+    last_query: Option<(String, Vec<f32>)>,
 }
 
 /// Minimum time between checks of the sidecar for new commits.
@@ -56,10 +60,10 @@ impl SemanticSearcher {
             dims,
             data_version,
             last_check: std::time::Instant::now(),
+            last_query: None,
         }))
     }
 
-    /// Ranks files for `options.query`. Filters apply; the sort option does not (relevance order).
     /// Reloads the vectors if another process committed to the sidecar since the last load.
     /// Checks at most once per `RELOAD_CHECK_INTERVAL`. Returns true when it reloaded.
     pub fn refresh_if_changed(&mut self) -> Result<bool> {
@@ -79,6 +83,27 @@ impl SemanticSearcher {
         Ok(true)
     }
 
+    /// The query's vector at the sidecar's dims. The embedder runs only when the text differs
+    /// from the last query; a failed embed leaves nothing cached.
+    fn query_vector(&mut self, embedder: &mut dyn Embedder, query: &str) -> Result<Vec<f32>> {
+        if !matches!(&self.last_query, Some((text, _)) if text == query) {
+            let raw = embedder
+                .embed_batch(&[query_input(query)])
+                .context("embed query")?
+                .pop()
+                .ok_or_else(|| anyhow!("embedder returned no query vector"))?;
+            self.last_query = Some((query.to_string(), raw));
+        }
+        let raw = self
+            .last_query
+            .as_ref()
+            .map(|(_, raw)| raw.as_slice())
+            .unwrap_or_default();
+        // The dims can change when the sidecar is reloaded, so truncate on every search.
+        Ok(truncate_and_normalize(raw, self.dims))
+    }
+
+    /// Ranks files for `options.query`. Filters apply; the sort option does not (relevance order).
     pub fn search(
         &mut self,
         embedder: &mut dyn Embedder,
@@ -89,12 +114,7 @@ impl SemanticSearcher {
         if query.is_empty() || options.limit == 0 {
             return Ok(Vec::new());
         }
-        let raw = embedder
-            .embed_batch(&[query_input(query)])
-            .context("embed query")?
-            .pop()
-            .ok_or_else(|| anyhow!("embedder returned no query vector"))?;
-        let query_vector = truncate_and_normalize(&raw, self.dims);
+        let query_vector = self.query_vector(embedder, query)?;
 
         // Files in score order; hydration and filters drop some, so walk until `limit` are kept.
         let db = Database::open_readonly(&self.index_path)
