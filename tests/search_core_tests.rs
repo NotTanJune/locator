@@ -18,24 +18,31 @@ use locator::query::{
 use locator::scanner::{scan_root, ScanOptions};
 use tempfile::{tempdir, TempDir};
 
+/// A fixture path with `/` turned into the platform's separator, which is what the index
+/// splits paths on. Fixtures are written with `/` so they read the same on every system.
+fn native(path: &str) -> String {
+    path.replace('/', std::path::MAIN_SEPARATOR_STR)
+}
+
+/// The reverse of `native`, for comparing a result with a fixture literal.
+fn portable(path: &str) -> String {
+    path.replace(std::path::MAIN_SEPARATOR, "/")
+}
+
 /// A record as the scanner stores it: no size and no timestamps.
 fn light_record(root: &str, path: &str) -> FileRecord {
-    let as_path = Path::new(path);
+    // The name and parent come from a slash copy of the path, so they do not depend on how
+    // `Path` happens to split the path.
+    let slashed = portable(path);
+    let (parent, name) = slashed.rsplit_once('/').unwrap_or(("", &slashed));
     FileRecord {
-        path: path.to_string(),
-        name: as_path
-            .file_name()
-            .expect("record path has a name")
-            .to_string_lossy()
-            .to_string(),
-        parent: as_path
-            .parent()
-            .map(|parent| parent.to_string_lossy().to_string())
-            .unwrap_or_default(),
-        extension: as_path
+        path: native(path),
+        name: name.to_string(),
+        parent: native(parent),
+        extension: Path::new(name)
             .extension()
             .map(|ext| ext.to_string_lossy().to_ascii_lowercase()),
-        root: root.to_string(),
+        root: native(root),
         volume: "local".to_string(),
         kind: "file".to_string(),
         size_bytes: 0,
@@ -269,9 +276,9 @@ fn name_sort_orders_equal_names_by_path() {
     let ascending = db
         .search_with_options(&SearchOptions::new("notes").with_sort(SortField::Name))
         .expect("search works");
-    let paths: Vec<&str> = ascending
+    let paths: Vec<String> = ascending
         .iter()
-        .map(|result| result.path.as_str())
+        .map(|result| portable(&result.path))
         .collect();
     assert_eq!(
         paths,
@@ -289,9 +296,9 @@ fn name_sort_orders_equal_names_by_path() {
                 .with_reverse(true),
         )
         .expect("search works");
-    let paths: Vec<&str> = descending
+    let paths: Vec<String> = descending
         .iter()
-        .map(|result| result.path.as_str())
+        .map(|result| portable(&result.path))
         .collect();
     assert_eq!(
         paths,
@@ -418,6 +425,10 @@ fn sql_predicates_never_drop_a_row_the_matcher_accepts() {
     let mut checked = 0;
     for mode in modes {
         for query in queries {
+            // A query with a separator is matched against paths, so it needs the native one.
+            let has_separator = query.contains('/');
+            let query = native(query);
+            let query = query.as_str();
             let compiled = CompiledQuery::compile(mode, query).expect("query compiles");
             let expected: BTreeSet<String> = records
                 .iter()
@@ -436,7 +447,7 @@ fn sql_predicates_never_drop_a_row_the_matcher_accepts() {
                 .into_iter()
                 .map(|result| result.path)
                 .collect();
-            if mode == QueryMode::Contains && !query.contains('/') {
+            if mode == QueryMode::Contains && !has_separator {
                 // Contains without a path separator matches names only. Every name match
                 // must come back, and nothing the matcher rejects may. A query with a path
                 // separator also looks at the path and must find every path that contains it.
@@ -483,7 +494,7 @@ fn a_full_scan_split_across_readers_finds_each_match_once() {
     ] {
         let found: Vec<String> = db
             .search_with_options(
-                &SearchOptions::new(query)
+                &SearchOptions::new(native(query))
                     .with_mode(mode)
                     .with_limit(usize::MAX),
             )
@@ -512,7 +523,7 @@ fn paths_of(db: &Database, options: SearchOptions) -> BTreeSet<String> {
 }
 
 fn path_set(paths: &[&str]) -> BTreeSet<String> {
-    paths.iter().map(|path| path.to_string()).collect()
+    paths.iter().map(|path| native(path)).collect()
 }
 
 fn change_count(db_path: &Path) -> i64 {
@@ -589,6 +600,9 @@ fn name_file_search_agrees_with_the_matcher() {
     let mut matched_rows = 0;
     for mode in modes {
         for query in queries {
+            // A query with a separator is matched against paths, so it needs the native one.
+            let query = native(query);
+            let query = query.as_str();
             // A query the mode cannot compile (a leading `*` as a regex) has nothing to check.
             let Ok(compiled) = CompiledQuery::compile(mode, query) else {
                 continue;
@@ -648,7 +662,8 @@ fn a_removal_hides_a_row_and_its_subtree() {
         path_set(&["/r/dir/a.txt", "/r/dir/sub/b.txt", "/r/dirx/c.txt"])
     );
 
-    db.mark_path_deleted("/r/dir").expect("delete works");
+    db.mark_path_deleted(&native("/r/dir"))
+        .expect("delete works");
     assert_eq!(
         paths_of(&db, SearchOptions::new("txt")),
         path_set(&["/r/dirx/c.txt"])
@@ -660,19 +675,24 @@ fn a_deleted_then_recreated_path_is_found_once() {
     let (_dir, db_path) = file_backed(&["/r/a.txt", "/r/dir/b.txt"]);
     let db = Database::open(&db_path).expect("db reopens");
 
-    db.mark_path_deleted("/r/a.txt").expect("delete works");
+    db.mark_path_deleted(&native("/r/a.txt"))
+        .expect("delete works");
     db.upsert_file(&light_record("/r", "/r/a.txt"))
         .expect("recreate works");
     // The folder goes away and a file comes back beneath it: found once, not twice, though
     // both a subtree entry and a one-path entry name it.
-    db.mark_path_deleted("/r/dir").expect("delete works");
+    db.mark_path_deleted(&native("/r/dir"))
+        .expect("delete works");
     db.upsert_file(&light_record("/r", "/r/dir/b.txt"))
         .expect("recreate works");
 
     let results = db
         .search_with_options(&SearchOptions::new("txt").with_limit(usize::MAX))
         .expect("search works");
-    let mut paths: Vec<&str> = results.iter().map(|result| result.path.as_str()).collect();
+    let mut paths: Vec<String> = results
+        .iter()
+        .map(|result| portable(&result.path))
+        .collect();
     paths.sort();
     assert_eq!(paths, ["/r/a.txt", "/r/dir/b.txt"]);
 }
@@ -762,7 +782,7 @@ fn more_than_2000_changes_are_folded_into_the_name_file_on_search() {
 
     let found = paths_of(&db, SearchOptions::new("item-"));
     assert_eq!(found.len(), 2_100);
-    assert!(found.contains("/r/new/item-2099.log"));
+    assert!(found.contains(&native("/r/new/item-2099.log")));
     assert_eq!(change_count(&db_path), 0, "the search should have folded");
     assert_eq!(
         paths_of(&db, SearchOptions::new("old.txt")),
@@ -787,7 +807,7 @@ fn name_file_bench() {
 
     let dir = tempdir().expect("temp dir");
     let db_path = dir.path().join("index.db");
-    let root = "/bench/root";
+    let root = native("/bench/root");
     let db = Database::open(&db_path).expect("open");
 
     let build_start = Instant::now();
@@ -813,12 +833,12 @@ fn name_file_bench() {
             d % 500,
             i % 20
         );
-        rows.push(&path, "file").expect("push row");
+        rows.push(&native(&path), "file").expect("push row");
     }
     let push_wall = build_start.elapsed();
 
     let install_start = Instant::now();
-    db.install_scan(root, rows, 1_000).expect("install scan");
+    db.install_scan(&root, rows, 1_000).expect("install scan");
     let install_wall = install_start.elapsed();
     drop(db);
     let sqlite_bytes = fs::metadata(&db_path).expect("database file").len();
@@ -859,7 +879,7 @@ fn name_file_bench() {
             SearchOptions::new("ndlpdf").with_mode(QueryMode::Fuzzy),
         ),
         ("one letter", SearchOptions::new("e")),
-        ("with slash", SearchOptions::new("area07/group007")),
+        ("with slash", SearchOptions::new(native("area07/group007"))),
     ];
     for (label, options) in cases {
         // One warm-up run, then the median of five.

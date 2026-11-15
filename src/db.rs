@@ -2634,6 +2634,12 @@ mod tests {
     use crate::name_file::NameFileBuilder;
     use crate::query::SortField;
 
+    /// A fixture path with `/` turned into the platform's separator, which is what the index
+    /// splits paths on. Fixtures are written with `/` so they read the same on every system.
+    fn native(path: &str) -> String {
+        path.replace('/', std::path::MAIN_SEPARATOR_STR)
+    }
+
     #[test]
     fn streaming_search_emits_every_match_in_500_item_batches() {
         let dir = tempdir().expect("create temp directory");
@@ -2752,7 +2758,7 @@ mod tests {
     #[test]
     fn find_and_streaming_search_return_the_same_order() {
         let db = Database::open_in_memory().expect("open database");
-        let root = std::path::Path::new("/same-order");
+        let root = std::path::PathBuf::from(native("/same-order"));
         let paths: Vec<std::path::PathBuf> = [
             "report",
             "Report.txt",
@@ -2764,9 +2770,10 @@ mod tests {
             "lib.rs",
         ]
         .iter()
-        .map(|name| root.join(name))
+        // Built from text rather than `Path::join`, which would add the real separator.
+        .map(|name| std::path::PathBuf::from(native(&format!("/same-order/{name}"))))
         .collect();
-        install_rows(&db, root, &paths);
+        install_rows(&db, &root, &paths);
 
         for (mode, query) in [
             (QueryMode::Contains, "report"),
@@ -2936,33 +2943,46 @@ mod tests {
                  CREATE TABLE scan_roots (
                     root TEXT PRIMARY KEY, scan_token INTEGER NOT NULL, complete INTEGER NOT NULL,
                     started_at INTEGER NOT NULL, completed_at INTEGER
-                 );
-                 INSERT INTO scan_roots VALUES ('/legacy', 7, 1, 7, 8);
-                 INSERT INTO files (path, name, parent, root, volume, kind, size_bytes, indexed_at)
-                 VALUES ('/legacy/live.pdf', 'live.pdf', '/legacy', '/legacy', 'local', 'pdf', 1, 1);
-                 INSERT INTO files (path, name, parent, root, volume, kind, size_bytes, indexed_at, deleted)
-                 VALUES ('/legacy/gone.pdf', 'gone.pdf', '/legacy', '/legacy', 'local', 'pdf', 1, 1, 1);
-                 INSERT INTO files (path, name, parent, root, volume, kind, size_bytes, indexed_at)
-                 VALUES ('/other/seen.txt', 'seen.txt', '/other', '/other', 'local', 'text', 1, 1);",
+                 );",
             )
             .expect("create legacy schema");
+            conn.execute(
+                "INSERT INTO scan_roots VALUES (?1, 7, 1, 7, 8)",
+                [native("/legacy")],
+            )
+            .expect("insert the root");
+            for (path, name, parent, kind, deleted) in [
+                ("/legacy/live.pdf", "live.pdf", "/legacy", "pdf", 0),
+                ("/legacy/gone.pdf", "gone.pdf", "/legacy", "pdf", 1),
+                ("/other/seen.txt", "seen.txt", "/other", "text", 0),
+            ] {
+                conn.execute(
+                    "INSERT INTO files (path, name, parent, root, volume, kind, size_bytes,
+                                        indexed_at, deleted)
+                     VALUES (?1, ?2, ?3, ?3, 'local', ?4, 1, 1, ?5)",
+                    rusqlite::params![native(path), name, native(parent), kind, deleted],
+                )
+                .expect("insert a file row");
+            }
         }
 
         let db = Database::open(&db_path).expect("convert");
         assert_eq!(
             found_paths(&db),
-            [
-                "/legacy/live.pdf".to_string(),
-                "/other/seen.txt".to_string()
-            ]
+            [native("/legacy/live.pdf"), native("/other/seen.txt")]
         );
-        assert_eq!(db.roots().expect("roots"), ["/legacy", "/other"]);
         assert_eq!(
-            db.scan_completion_for_root("/legacy").expect("completion"),
+            db.roots().expect("roots"),
+            [native("/legacy"), native("/other")]
+        );
+        assert_eq!(
+            db.scan_completion_for_root(&native("/legacy"))
+                .expect("completion"),
             ScanCompletion::Complete
         );
         assert_eq!(
-            db.scan_completion_for_root("/other").expect("completion"),
+            db.scan_completion_for_root(&native("/other"))
+                .expect("completion"),
             ScanCompletion::Incomplete
         );
         assert!(!table_exists(&db.conn, "files").expect("table check"));

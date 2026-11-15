@@ -24,13 +24,33 @@ fn env_guard() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|error| error.into_inner())
 }
 
+/// A fixture path with `/` turned into the platform's separator, which is what the index
+/// splits paths on. Fixtures are written with `/` so they read the same on every system.
+fn native(path: &str) -> String {
+    path.replace('/', std::path::MAIN_SEPARATOR_STR)
+}
+
+/// The reverse of `native`, for comparing a result with a fixture literal.
+fn portable(path: &str) -> String {
+    path.replace(std::path::MAIN_SEPARATOR, "/")
+}
+
+/// The registered roots, as fixture paths.
+fn roots(db: &Database) -> Vec<String> {
+    db.roots()
+        .expect("roots")
+        .iter()
+        .map(|root| portable(root))
+        .collect()
+}
+
 fn record(path: &str, name: &str, ext: Option<&str>, size: u64, modified_year: i32) -> FileRecord {
     FileRecord {
-        path: path.into(),
+        path: native(path),
         name: name.into(),
-        parent: "/tmp".into(),
+        parent: native("/tmp"),
         extension: ext.map(str::to_string),
-        root: "/tmp".into(),
+        root: native("/tmp"),
         volume: "local".into(),
         kind: ext.unwrap_or("file").into(),
         size_bytes: size,
@@ -67,20 +87,23 @@ fn record_for_path(path: &Path, ext: Option<&str>, size: u64, modified_year: i32
 fn install(db: &Database, root: &str, rows: &[(&str, &str)], token: i64) {
     let mut builder = NameFileBuilder::default();
     for (path, kind) in rows {
-        builder.push(path, kind).expect("push row");
+        builder.push(&native(path), kind).expect("push row");
     }
-    db.install_scan(root, builder, token).expect("install scan");
+    db.install_scan(&native(root), builder, token)
+        .expect("install scan");
 }
 
 /// A row the watcher would record for `path` under `root`.
 fn live_record(root: &str, path: &str, kind: &str, size: u64) -> FileRecord {
-    let name = path.rsplit('/').next().expect("a name");
+    // Split a slash copy of the path, so a path that is already native splits the same way.
+    let slashed = portable(path);
+    let name = slashed.rsplit('/').next().expect("a name");
     FileRecord {
-        path: path.into(),
+        path: native(path),
         name: name.into(),
-        parent: path[..path.len() - name.len()].trim_end_matches('/').into(),
+        parent: native(slashed[..slashed.len() - name.len()].trim_end_matches('/')),
         extension: name.rsplit_once('.').map(|(_, ext)| ext.to_string()),
-        root: root.into(),
+        root: native(root),
         volume: "local".into(),
         kind: kind.into(),
         size_bytes: size,
@@ -89,13 +112,13 @@ fn live_record(root: &str, path: &str, kind: &str, size: u64) -> FileRecord {
     }
 }
 
-/// The path of every active row, sorted.
+/// The path of every active row, as a fixture path, sorted.
 fn all_paths(db: &Database) -> Vec<String> {
     let mut paths: Vec<String> = db
         .search("", &SearchFilters::new(), 1_000_000)
         .expect("list every row")
         .into_iter()
-        .map(|result| result.path)
+        .map(|result| portable(&result.path))
         .collect();
     paths.sort();
     paths
@@ -149,7 +172,7 @@ fn finds_records_by_keyword_and_filters() {
     let results = db.search("invoice", &filters, 20).expect("search works");
 
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].path, "/tmp/invoice.pdf");
+    assert_eq!(portable(&results[0].path), "/tmp/invoice.pdf");
 }
 
 #[test]
@@ -326,7 +349,7 @@ fn installed_scan_rows_are_searchable_with_a_name_and_a_path_only() {
         .expect("search works");
 
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].path, "/tmp/a.pdf");
+    assert_eq!(portable(&results[0].path), "/tmp/a.pdf");
     assert_eq!(results[0].extension.as_deref(), Some("pdf"));
     assert_eq!(results[0].size_bytes, 0);
     assert!(results[0].modified_at.is_none());
@@ -348,7 +371,7 @@ fn installed_scan_rows_are_found_by_interactive_search() {
         .expect("interactive search works");
 
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].path, "/tmp/a.pdf");
+    assert_eq!(portable(&results[0].path), "/tmp/a.pdf");
 }
 
 #[test]
@@ -412,13 +435,16 @@ fn opening_a_database_with_the_old_trigram_index_drops_it() {
              CREATE TRIGGER files_au AFTER UPDATE ON files BEGIN
                 INSERT INTO files_fts(files_fts, rowid, name) VALUES('delete', old.id, old.name);
                 INSERT INTO files_fts(rowid, name) VALUES (new.id, new.name);
-             END;
-             INSERT INTO files (path, name, name_lower, parent, extension, root, volume, kind,
-                                size_bytes, indexed_at)
-             VALUES ('/tmp/legacy.pdf', 'legacy.pdf', 'legacy.pdf', '/tmp', 'pdf', '/tmp',
-                     'local', 'pdf', 10, 1);",
+             END;",
         )
         .expect("create legacy schema");
+        conn.execute(
+            "INSERT INTO files (path, name, name_lower, parent, extension, root, volume, kind,
+                                size_bytes, indexed_at)
+             VALUES (?1, 'legacy.pdf', 'legacy.pdf', ?2, 'pdf', ?2, 'local', 'pdf', 10, 1)",
+            [native("/tmp/legacy.pdf"), native("/tmp")],
+        )
+        .expect("insert legacy row");
     }
 
     let db = Database::open(&db_path).expect("migrates legacy db");
@@ -439,8 +465,8 @@ fn opening_a_database_with_the_old_trigram_index_drops_it() {
         .search("legacy", &SearchFilters::new(), 10)
         .expect("search works");
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].path, "/tmp/legacy.pdf");
-    assert_eq!(db.roots().expect("roots"), ["/tmp"]);
+    assert_eq!(portable(&results[0].path), "/tmp/legacy.pdf");
+    assert_eq!(roots(&db), ["/tmp"]);
 }
 
 #[test]
@@ -615,20 +641,23 @@ fn scan_completion_tracks_incomplete_and_complete_roots() {
     let db = Database::open_in_memory().expect("db opens");
 
     assert_eq!(
-        db.scan_completion_for_root("/tmp").expect("status"),
+        db.scan_completion_for_root(&native("/tmp"))
+            .expect("status"),
         ScanCompletion::Unknown
     );
 
     db.upsert_file(&record("/tmp/a.pdf", "a.pdf", Some("pdf"), 1, 2024))
         .expect("a watcher row registers the root");
     assert_eq!(
-        db.scan_completion_for_root("/tmp").expect("status"),
+        db.scan_completion_for_root(&native("/tmp"))
+            .expect("status"),
         ScanCompletion::Incomplete
     );
 
     install(&db, "/tmp", &[("/tmp/a.pdf", "pdf")], 10);
     assert_eq!(
-        db.scan_completion_for_root("/tmp").expect("status"),
+        db.scan_completion_for_root(&native("/tmp"))
+            .expect("status"),
         ScanCompletion::Complete
     );
 }
@@ -983,7 +1012,8 @@ fn compacting_writes_a_name_file_that_matches_the_rows() {
         record("/tmp/gone.txt", "gone.txt", Some("txt"), 3, 2024),
     ])
     .expect("upsert");
-    db.mark_path_deleted("/tmp/gone.txt").expect("soft delete");
+    db.mark_path_deleted(&native("/tmp/gone.txt"))
+        .expect("soft delete");
 
     db.compact_name_file().expect("compact");
 
@@ -994,7 +1024,7 @@ fn compacting_writes_a_name_file_that_matches_the_rows() {
         true
     });
     paths.sort();
-    assert_eq!(paths, ["/tmp/a.txt", "/tmp/b.txt"]);
+    assert_eq!(paths, [native("/tmp/a.txt"), native("/tmp/b.txt")]);
 }
 
 #[test]
@@ -1028,7 +1058,7 @@ fn upserts_and_deletes_are_recorded_as_changes() {
     let db = Database::open(&db_path).expect("db opens");
     db.upsert_file(&record("/tmp/a.txt", "a.txt", Some("txt"), 1, 2024))
         .expect("upsert");
-    db.mark_path_deleted("/tmp/dir")
+    db.mark_path_deleted(&native("/tmp/dir"))
         .expect("delete a directory");
 
     let conn = rusqlite::Connection::open(&db_path).expect("raw connection");
@@ -1043,8 +1073,8 @@ fn upserts_and_deletes_are_recorded_as_changes() {
     assert_eq!(
         changes,
         [
-            ("/tmp/a.txt".to_string(), Some("txt".to_string())),
-            ("/tmp/dir".to_string(), None)
+            (native("/tmp/a.txt"), Some("txt".to_string())),
+            (native("/tmp/dir"), None)
         ]
     );
 }
@@ -1057,7 +1087,7 @@ fn compacting_clears_the_changes_and_sets_a_snapshot_id() {
     let db = Database::open(&db_path).expect("db opens");
     db.upsert_file(&record("/tmp/a.txt", "a.txt", Some("txt"), 1, 2024))
         .expect("upsert");
-    db.mark_path_deleted("/tmp/dir")
+    db.mark_path_deleted(&native("/tmp/dir"))
         .expect("delete a directory");
 
     db.compact_name_file().expect("compact");
@@ -1083,7 +1113,9 @@ fn next_scan_token_never_repeats_for_a_root() {
     let db = Database::open_in_memory().expect("db opens");
     let now = chrono::Utc::now().timestamp_millis();
 
-    let first = db.next_scan_token("/tmp/a").expect("token for a new root");
+    let first = db
+        .next_scan_token(&native("/tmp/a"))
+        .expect("token for a new root");
     assert!(
         (first - now).abs() < 5_000,
         "token {first} is not near {now}"
@@ -1091,10 +1123,13 @@ fn next_scan_token_never_repeats_for_a_root() {
 
     let far_future = now + 24 * 60 * 60 * 1000;
     install(&db, "/tmp/a", &[], far_future);
-    assert_eq!(db.next_scan_token("/tmp/a").unwrap(), far_future + 1);
+    assert_eq!(
+        db.next_scan_token(&native("/tmp/a")).unwrap(),
+        far_future + 1
+    );
 
     let other = db
-        .next_scan_token("/tmp/b")
+        .next_scan_token(&native("/tmp/b"))
         .expect("token for another root");
     assert!(
         (other - now).abs() < 5_000,
@@ -1121,10 +1156,10 @@ fn install_scan_replaces_only_its_root() {
     install(&db, "/a", &[("/a/one.txt", "text")], 2);
 
     assert_eq!(all_paths(&db), ["/a/one.txt", "/b/x.txt", "/b/y.txt"]);
-    assert_eq!(db.roots().expect("roots"), ["/a", "/b"]);
+    assert_eq!(roots(&db), ["/a", "/b"]);
     for root in ["/a", "/b"] {
         assert_eq!(
-            db.scan_completion_for_root(root).expect("status"),
+            db.scan_completion_for_root(&native(root)).expect("status"),
             ScanCompletion::Complete
         );
     }
@@ -1157,7 +1192,10 @@ fn a_rescan_keeps_changes_made_while_it_ran() {
     db.upsert_files_with_indexed_at(&[live_record("/r", "/r/early.txt", "text", 5)], token - 1)
         .expect("live row before the token");
     // A removal is stamped with the current time in milliseconds, far above the token.
-    assert_eq!(db.mark_path_deleted("/r/old.txt").expect("remove"), 1);
+    assert_eq!(
+        db.mark_path_deleted(&native("/r/old.txt")).expect("remove"),
+        1
+    );
     assert_eq!(change_count(&db_path), 3);
 
     // The walk saw `old.txt` before it was removed, and never saw `live.txt`.
@@ -1183,7 +1221,10 @@ fn a_rescan_drops_changes_older_than_its_token() {
     let (db_path, db) = rescan_fixture(dir.path());
     db.upsert_files_with_indexed_at(&[live_record("/r", "/r/live.txt", "text", 5)], 100)
         .expect("live row");
-    assert_eq!(db.mark_path_deleted("/r/old.txt").expect("remove"), 1);
+    assert_eq!(
+        db.mark_path_deleted(&native("/r/old.txt")).expect("remove"),
+        1
+    );
 
     // The scan started after both changes, so what it saw is the truth.
     install(
@@ -1198,10 +1239,10 @@ fn a_rescan_drops_changes_older_than_its_token() {
 }
 
 fn embeddable_paths(db: &Database, root: &str) -> Vec<String> {
-    db.embeddable_files(root)
+    db.embeddable_files(&native(root))
         .expect("embeddable files")
         .into_iter()
-        .map(|file| file.path)
+        .map(|file| portable(&file.path))
         .collect()
 }
 
@@ -1222,7 +1263,7 @@ fn an_outer_scan_takes_over_a_nested_root_it_walked() {
         2,
     );
 
-    assert_eq!(db.roots().expect("roots"), ["/r"]);
+    assert_eq!(roots(&db), ["/r"]);
     assert_eq!(all_paths(&db), ["/r/sub/a.txt", "/r/top.txt"]);
     assert_eq!(embeddable_paths(&db, "/r"), ["/r/sub/a.txt", "/r/top.txt"]);
 }
@@ -1242,7 +1283,7 @@ fn an_outer_scan_leaves_a_nested_root_it_did_not_walk() {
     );
     install(&db, "/r", &[("/r/a.txt", "text"), ("/r/b.txt", "text")], 2);
 
-    assert_eq!(db.roots().expect("roots"), ["/r", "/r/build/app"]);
+    assert_eq!(roots(&db), ["/r", "/r/build/app"]);
     assert_eq!(
         all_paths(&db),
         [
@@ -1281,8 +1322,10 @@ fn changed_fixture(dir: &Path) -> (std::path::PathBuf, Database) {
         .expect("new file");
     db.upsert_file(&live_record("/r", "/r/d2.txt", "text", 9))
         .expect("sibling with the folder's prefix");
-    db.mark_path_deleted("/r/d").expect("remove the folder");
-    db.mark_path_deleted("/r/a.txt").expect("remove a file");
+    db.mark_path_deleted(&native("/r/d"))
+        .expect("remove the folder");
+    db.mark_path_deleted(&native("/r/a.txt"))
+        .expect("remove a file");
     (db_path, db)
 }
 
@@ -1320,7 +1363,8 @@ fn folded_changes_applied_again_change_nothing() {
     let _guard = env_guard();
     let dir = tempdir().expect("temp dir");
     let (db_path, db) = changed_fixture(dir.path());
-    let queries = ["", "txt", "new", "c.txt", "d2", "/r/d"];
+    let folder_query = native("/r/d");
+    let queries = ["", "txt", "new", "c.txt", "d2", folder_query.as_str()];
     let snapshot = |db: &Database| -> Vec<Vec<String>> {
         queries
             .iter()
@@ -1400,7 +1444,11 @@ fn a_file_recreated_under_a_removed_folder_is_found() {
         ],
         1,
     );
-    assert_eq!(db.mark_path_deleted("/r/d").expect("remove folder"), 2);
+    assert_eq!(
+        db.mark_path_deleted(&native("/r/d"))
+            .expect("remove folder"),
+        2
+    );
     assert_eq!(all_paths(&db), ["/r/z.txt"]);
 
     db.upsert_file(&live_record("/r", "/r/d/x.txt", "text", 3))
@@ -1437,15 +1485,16 @@ fn remove_root_drops_its_rows_and_its_registration() {
     install(&db, "/b", &[("/b/w.txt", "text")], 1);
     db.upsert_file(&live_record("/a", "/a/live.txt", "text", 1))
         .expect("live row owned by the root");
-    db.mark_path_deleted("/b/gone.txt").expect("a removal");
+    db.mark_path_deleted(&native("/b/gone.txt"))
+        .expect("a removal");
 
-    let dropped = db.remove_root("/a").expect("remove root");
+    let dropped = db.remove_root(&native("/a")).expect("remove root");
 
     assert_eq!(dropped, 4, "three scanned rows and one live row");
     assert_eq!(all_paths(&db), ["/a/n/q.txt", "/b/w.txt"]);
-    assert_eq!(db.roots().expect("roots"), ["/a/n", "/b"]);
+    assert_eq!(roots(&db), ["/a/n", "/b"]);
     assert_eq!(
-        db.scan_completion_for_root("/a").expect("status"),
+        db.scan_completion_for_root(&native("/a")).expect("status"),
         ScanCompletion::Unknown
     );
     assert_eq!(change_count(&db_path), 0);
@@ -1467,20 +1516,22 @@ fn an_abandoned_scan_changes_nothing() {
     let file_before = std::fs::read(&names).expect("read the name file");
 
     let mut abandoned = NameFileBuilder::default();
-    abandoned.push("/r/fresh.txt", "text").expect("push");
+    abandoned
+        .push(&native("/r/fresh.txt"), "text")
+        .expect("push");
     drop(abandoned);
 
     assert_eq!(std::fs::read(&names).expect("read again"), file_before);
     assert_eq!(all_paths(&db), ["/r/old.txt", "/r/older.txt"]);
     assert_eq!(
-        db.scan_completion_for_root("/r").expect("status"),
+        db.scan_completion_for_root(&native("/r")).expect("status"),
         ScanCompletion::Complete
     );
     drop(db);
     let db = Database::open(&db_path).expect("reopen");
     assert_eq!(all_paths(&db), ["/r/old.txt", "/r/older.txt"]);
     assert_eq!(
-        db.scan_completion_for_root("/r").expect("status"),
+        db.scan_completion_for_root(&native("/r")).expect("status"),
         ScanCompletion::Complete
     );
 }
@@ -1494,7 +1545,7 @@ fn a_missing_name_file_marks_roots_incomplete() {
         let db = Database::open(&db_path).expect("db opens");
         install(&db, "/r", &[("/r/a.txt", "text")], 1);
         assert_eq!(
-            db.scan_completion_for_root("/r").expect("status"),
+            db.scan_completion_for_root(&native("/r")).expect("status"),
             ScanCompletion::Complete
         );
     }
@@ -1503,7 +1554,7 @@ fn a_missing_name_file_marks_roots_incomplete() {
     let db = Database::open(&db_path).expect("reopen");
 
     assert_eq!(
-        db.scan_completion_for_root("/r").expect("status"),
+        db.scan_completion_for_root(&native("/r")).expect("status"),
         ScanCompletion::Incomplete
     );
     let results = db
@@ -1557,7 +1608,7 @@ fn path_lookup_sees_the_file_and_the_changes() {
     let _guard = env_guard();
     let dir = tempdir().expect("temp dir");
     let root = dir.path();
-    let path = |name: &str| root.join(name).to_string_lossy().to_string();
+    let path = |name: &str| root.join(native(name)).to_string_lossy().to_string();
     std::fs::create_dir(root.join("gone")).expect("create folder");
     for name in ["in-file.txt", "live.txt", "removed.txt", "gone/inside.txt"] {
         std::fs::write(root.join(name), "four").expect("write file");
@@ -1623,13 +1674,7 @@ fn count_and_embeddable_files_follow_changes() {
     );
     install(&db, "/r/n", &[("/r/n/q.txt", "text")], 1);
     install(&db, "/o", &[("/o/z.txt", "text")], 1);
-    let paths = |db: &Database| -> Vec<String> {
-        db.embeddable_files("/r")
-            .expect("embeddable files")
-            .into_iter()
-            .map(|file| file.path)
-            .collect()
-    };
+    let paths = |db: &Database| embeddable_paths(db, "/r");
     assert_eq!(db.count_active().expect("count"), 6);
     assert_eq!(paths(&db), ["/r/a.txt", "/r/b.md", "/r/sub/c.txt"]);
 
@@ -1641,19 +1686,24 @@ fn count_and_embeddable_files_follow_changes() {
         ["/r/a.txt", "/r/b.md", "/r/d.txt", "/r/sub/c.txt"]
     );
     let added = db
-        .embeddable_files("/r")
+        .embeddable_files(&native("/r"))
         .expect("embeddable files")
         .into_iter()
-        .find(|file| file.path == "/r/d.txt")
+        .find(|file| portable(&file.path) == "/r/d.txt")
         .expect("the new file");
     assert_eq!(added.size_bytes, 7);
     assert_eq!(added.extension.as_deref(), Some("txt"));
 
-    db.mark_path_deleted("/r/a.txt").expect("remove a file");
+    db.mark_path_deleted(&native("/r/a.txt"))
+        .expect("remove a file");
     assert_eq!(db.count_active().expect("count"), 6);
     assert_eq!(paths(&db), ["/r/b.md", "/r/d.txt", "/r/sub/c.txt"]);
 
-    assert_eq!(db.mark_path_deleted("/r/sub").expect("remove folder"), 2);
+    assert_eq!(
+        db.mark_path_deleted(&native("/r/sub"))
+            .expect("remove folder"),
+        2
+    );
     assert_eq!(db.count_active().expect("count"), 4);
     assert_eq!(paths(&db), ["/r/b.md", "/r/d.txt"]);
 }
@@ -1710,10 +1760,10 @@ fn write_old_index(path: &Path, rows: &[OldRow], roots: &[&str]) {
                                 size_bytes, indexed_at, deleted)
              VALUES (?1, ?2, ?3, '', NULL, ?4, 'local', 'txt', 0, 1, ?5)",
             rusqlite::params![
-                row.path,
+                native(row.path),
                 name,
                 name.to_lowercase(),
-                row.root,
+                native(row.root),
                 row.deleted as i64
             ],
         )
@@ -1723,7 +1773,7 @@ fn write_old_index(path: &Path, rows: &[OldRow], roots: &[&str]) {
         conn.execute(
             "INSERT INTO scan_roots (root, scan_token, complete, started_at, completed_at)
              VALUES (?1, 7, 1, 5, 6)",
-            [root],
+            [native(root)],
         )
         .expect("insert old root");
     }
@@ -1775,7 +1825,8 @@ fn an_old_index_beside_the_new_one_is_converted_and_removed() {
 
     assert_eq!(all_paths(&db), ["/old/notes.txt", "/old/opened.txt"]);
     assert_eq!(
-        db.scan_completion_for_root("/old").expect("completion"),
+        db.scan_completion_for_root(&native("/old"))
+            .expect("completion"),
         ScanCompletion::Complete
     );
     let raw = rusqlite::Connection::open(&new).expect("raw connection");
@@ -1928,7 +1979,8 @@ fn an_old_index_in_another_root_keeps_this_index_rows() {
 
     assert_eq!(all_paths(&db), ["/a/mine.txt", "/b/theirs.txt"]);
     assert_eq!(
-        db.scan_completion_for_root("/a").expect("completion"),
+        db.scan_completion_for_root(&native("/a"))
+            .expect("completion"),
         ScanCompletion::Complete
     );
     assert!(!dir.path().join("index.sqlite").exists());

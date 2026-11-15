@@ -1,13 +1,19 @@
 use locator::db::{Database, FileRecord};
 use locator::query::SearchOptions;
 
+/// A fixture path with `/` turned into the platform's separator, which is what the index
+/// splits paths on. Fixtures are written with `/` so they read the same on every system.
+fn native(path: &str) -> String {
+    path.replace('/', std::path::MAIN_SEPARATOR_STR)
+}
+
 fn record(path: &str, name: &str) -> FileRecord {
     FileRecord {
-        path: path.to_string(),
+        path: native(path),
         name: name.to_string(),
-        parent: "/tmp".to_string(),
+        parent: native("/tmp"),
         extension: Some("txt".to_string()),
-        root: "/tmp".to_string(),
+        root: native("/tmp"),
         volume: "local".to_string(),
         kind: "text".to_string(),
         size_bytes: 1,
@@ -38,7 +44,7 @@ fn frecently_opened_files_rank_higher_under_relevance() {
 
     // Opening beta repeatedly should lift it above alpha within the tier.
     for _ in 0..5 {
-        db.record_access("/tmp/beta_report.txt").unwrap();
+        db.record_access(&native("/tmp/beta_report.txt")).unwrap();
     }
 
     let after = names(&db, "report");
