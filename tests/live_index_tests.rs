@@ -109,6 +109,9 @@ fn live_index_indexes_files_under_renamed_directory() {
     assert!(found, "file under renamed directory should be indexed");
 }
 
+/// Unix only. Windows refuses to delete an index file while the watcher has it open, so the
+/// index cannot be replaced under a running watcher there.
+#[cfg(unix)]
 #[test]
 fn live_index_follows_replaced_index_file() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -122,7 +125,8 @@ fn live_index_follows_replaced_index_file() {
         || !paths_matching(&db_path, "before_swap").is_empty()
     ));
 
-    // Replace the index by rename, as a staged scan does.
+    // Delete the index and put a new one in its place, as `lctr delete-index` followed by
+    // `lctr scan` does.
     let replacement = root.join(".locator").join("replacement.sqlite");
     drop(Database::open(&replacement).expect("create replacement"));
     locator::db::delete_index_files(&db_path).expect("remove old index files");
