@@ -1,3 +1,16 @@
+# lctr v0.5.2
+
+Lets the date filters on `lctr find` take relative values such as `7d` or `3mo`.
+
+## Date filters
+
+- `--created-after`, `--created-before`, `--modified-after` and `--modified-before` now accept `today`, `yesterday` and `<N><unit>` as well as `YYYY-MM-DD`. The units are `h` (hours), `d` (days), `w` (weeks), `mo` (calendar months) and `y` (calendar years). For example, `lctr find report --modified-after 7d` finds files changed in the last 7 days.
+- A relative value counts back from the current time and keeps the time of day. `today` and `yesterday` mean midnight UTC, the same as a `YYYY-MM-DD` date.
+- Months and years follow the calendar. On March 31, `1mo` is the last day of February.
+- Values are case-insensitive and may have a space between the number and the unit, so `7d`, `7D` and `7 d` are the same.
+- `m` is rejected because it could mean minutes or months, and the error suggests `mo`. Negative numbers, fractions, unknown units and amounts too large to count back return an error that lists the accepted formats.
+- `lctr find --help` describes the new formats, and the README has a Date filters section.
+
 # lctr v0.5.1
 
 Stops the search screen flickering while it sits idle, and cuts the number of packages a build compiles.

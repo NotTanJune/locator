@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.2
+
+- The `lctr find` date filters accept `today`, `yesterday` and relative values (`12h`, `7d`, `2w`, `3mo`, `1y`) as well as `YYYY-MM-DD`. Added `query::parse_date_at` for parsing against a fixed time.
+
 ## 0.5.0
 
 - Replaced the SQLite row store and the trigram index with a compact name file. An index is now `index.db` plus `index.names` (lz4 blocks), about 40 times smaller.
