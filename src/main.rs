@@ -217,12 +217,16 @@ struct FindArgs {
     min_size: Option<String>,
     #[arg(long)]
     max_size: Option<String>,
+    /// Only files created on or after this date: YYYY-MM-DD, today, yesterday, or relative like 7d, 2w, 1mo, 1y (h/d/w/mo/y)
     #[arg(long)]
     created_after: Option<String>,
+    /// Only files created on or before this date: YYYY-MM-DD, today, yesterday, or relative like 7d, 2w, 1mo, 1y (h/d/w/mo/y)
     #[arg(long)]
     created_before: Option<String>,
+    /// Only files modified on or after this date: YYYY-MM-DD, today, yesterday, or relative like 7d, 2w, 1mo, 1y (h/d/w/mo/y)
     #[arg(long)]
     modified_after: Option<String>,
+    /// Only files modified on or before this date: YYYY-MM-DD, today, yesterday, or relative like 7d, 2w, 1mo, 1y (h/d/w/mo/y)
     #[arg(long)]
     modified_before: Option<String>,
     #[arg(long)]

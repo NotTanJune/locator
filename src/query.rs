@@ -576,13 +576,88 @@ impl SearchFilters {
     }
 }
 
+const DATE_FORMATS: &str =
+    "YYYY-MM-DD, today, yesterday, or <N><unit> with unit h, d, w, mo, or y (for example 7d, 2w, 1mo)";
+
 pub fn parse_date(value: &str) -> Result<DateTime<Utc>> {
-    let date = NaiveDate::parse_from_str(value, "%Y-%m-%d")
-        .map_err(|_| anyhow!("invalid date '{value}', expected YYYY-MM-DD"))?;
-    Ok(date
-        .and_hms_opt(0, 0, 0)
-        .ok_or_else(|| anyhow!("invalid date '{value}'"))?
-        .and_utc())
+    parse_date_at(value, Utc::now())
+}
+
+/// Parses a date filter value. Relative values (`7d`, `1mo`, `yesterday`) are resolved against
+/// `now`, so callers and tests can pin the clock.
+pub fn parse_date_at(value: &str, now: DateTime<Utc>) -> Result<DateTime<Utc>> {
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        return Err(anyhow!("empty date, expected {DATE_FORMATS}"));
+    }
+
+    if let Ok(date) = NaiveDate::parse_from_str(&normalized, "%Y-%m-%d") {
+        return Ok(midnight_utc(date));
+    }
+
+    match normalized.as_str() {
+        "today" => return Ok(midnight_utc(now.date_naive())),
+        "yesterday" => {
+            let day = now.date_naive().pred_opt().ok_or_else(|| {
+                anyhow!("date '{value}' is out of range, expected {DATE_FORMATS}")
+            })?;
+            return Ok(midnight_utc(day));
+        }
+        _ => {}
+    }
+
+    let split_at = normalized
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(normalized.len());
+    let (number, unit) = normalized.split_at(split_at);
+    let unit = unit.trim_start();
+
+    if number.is_empty() {
+        return Err(anyhow!("invalid date '{value}', expected {DATE_FORMATS}"));
+    }
+    if unit.is_empty() {
+        return Err(anyhow!(
+            "invalid date '{value}', missing a unit after the number; expected {DATE_FORMATS}"
+        ));
+    }
+    let amount: u64 = number
+        .parse()
+        .map_err(|_| anyhow!("date '{value}' is out of range, expected {DATE_FORMATS}"))?;
+
+    let out_of_range = || anyhow!("date '{value}' is out of range, expected {DATE_FORMATS}");
+    let subtract_duration = |duration: Option<chrono::Duration>| {
+        duration
+            .and_then(|duration| now.checked_sub_signed(duration))
+            .ok_or_else(out_of_range)
+    };
+    let signed = i64::try_from(amount);
+    let subtract_months = |months: Option<u32>| {
+        months
+            .and_then(|months| now.checked_sub_months(chrono::Months::new(months)))
+            .ok_or_else(out_of_range)
+    };
+
+    match unit {
+        "h" => subtract_duration(signed.ok().and_then(chrono::Duration::try_hours)),
+        "d" => subtract_duration(signed.ok().and_then(chrono::Duration::try_days)),
+        "w" => subtract_duration(signed.ok().and_then(chrono::Duration::try_weeks)),
+        "mo" => subtract_months(u32::try_from(amount).ok()),
+        "y" => subtract_months(
+            u32::try_from(amount)
+                .ok()
+                .and_then(|years| years.checked_mul(12)),
+        ),
+        "m" => Err(anyhow!(
+            "ambiguous unit 'm' in '{value}', use 'mo' for months; expected {DATE_FORMATS}"
+        )),
+        _ => Err(anyhow!(
+            "unknown unit '{unit}' in '{value}', expected {DATE_FORMATS}"
+        )),
+    }
+}
+
+fn midnight_utc(date: NaiveDate) -> DateTime<Utc> {
+    date.and_time(chrono::NaiveTime::MIN).and_utc()
 }
 
 fn parse_size(value: &str) -> Result<u64> {

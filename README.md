@@ -86,6 +86,22 @@ Interactive searches are uncapped and arrive in 500-result batches. Indexed resu
 
 Cargo-installed binaries download the matching prebuilt GitHub release archive when `lctr update` runs, so updates do not rebuild the Rust dependency graph locally. Homebrew installs update through `brew upgrade lctr`. Scoop installs update through `scoop update lctr` (close `lctr` first). The Windows direct installer's default location updates through `lctr update`.
 
+### Date filters
+
+`lctr find` takes `--created-after`, `--created-before`, `--modified-after`, and `--modified-before`.
+Each accepts one of these (case-insensitive):
+
+- `YYYY-MM-DD`: midnight UTC of that date, for example `2024-01-31`.
+- `today` or `yesterday`: midnight UTC of the current or previous day.
+- `<N><unit>`: the current time minus that amount, keeping the time of day. Units are `h` (hours),
+  `d` (days), `w` (weeks), `mo` (calendar months), and `y` (calendar years). `7d` and `7 d` are the
+  same. Use `mo` for months, because `m` is rejected as ambiguous.
+
+```sh
+lctr find report --modified-after 7d                       # changed in the last 7 days
+lctr find invoice --created-after 2024-01-01 --created-before 1mo
+```
+
 ## Semantic search
 
 `lctr scan <dir> --em` also embeds the contents of text files and images, so you can search by meaning

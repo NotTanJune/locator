@@ -1,4 +1,5 @@
-use chrono::{TimeZone, Utc};
+use chrono::{DateTime, Duration, TimeZone, Utc};
+use locator::query::{parse_date, parse_date_at};
 use locator::query::{
     CompiledQuery, FileKind, QueryMode, QueryScorer, SearchFilters, SearchOptions, SizeBound,
     SortField,
@@ -199,4 +200,233 @@ fn fuzzy_positions_are_char_indices_for_decomposed_accents() {
         q.match_positions(&mut scorer, "notes.txt"),
         vec![0, 1, 2, 3, 4]
     );
+}
+
+fn at(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(y, mo, d, h, mi, s).unwrap()
+}
+
+#[test]
+fn parse_date_at_keeps_absolute_dates() {
+    let now = at(2024, 3, 31, 15, 30, 45);
+
+    assert_eq!(
+        parse_date_at("2020-02-29", now).unwrap(),
+        at(2020, 2, 29, 0, 0, 0)
+    );
+    assert_eq!(
+        parse_date_at("  2020-02-29 ", now).unwrap(),
+        at(2020, 2, 29, 0, 0, 0)
+    );
+}
+
+#[test]
+fn parse_date_at_resolves_today_and_yesterday() {
+    let now = at(2024, 3, 1, 15, 30, 45);
+
+    assert_eq!(
+        parse_date_at("today", now).unwrap(),
+        at(2024, 3, 1, 0, 0, 0)
+    );
+    assert_eq!(
+        parse_date_at(" Yesterday ", now).unwrap(),
+        at(2024, 2, 29, 0, 0, 0)
+    );
+    assert_eq!(
+        parse_date_at("TODAY", now).unwrap(),
+        at(2024, 3, 1, 0, 0, 0)
+    );
+}
+
+#[test]
+fn parse_date_at_subtracts_relative_amounts() {
+    let now = at(2024, 3, 31, 15, 30, 45);
+
+    assert_eq!(
+        parse_date_at("5h", now).unwrap(),
+        at(2024, 3, 31, 10, 30, 45)
+    );
+    assert_eq!(
+        parse_date_at("7d", now).unwrap(),
+        at(2024, 3, 24, 15, 30, 45)
+    );
+    assert_eq!(
+        parse_date_at("7 d", now).unwrap(),
+        parse_date_at("7d", now).unwrap()
+    );
+    assert_eq!(
+        parse_date_at("2w", now).unwrap(),
+        at(2024, 3, 17, 15, 30, 45)
+    );
+    assert_eq!(
+        parse_date_at("1mo", now).unwrap(),
+        at(2024, 2, 29, 15, 30, 45)
+    );
+    assert_eq!(
+        parse_date_at("1y", now).unwrap(),
+        at(2023, 3, 31, 15, 30, 45)
+    );
+    assert_eq!(
+        parse_date_at("  3 MO ", now).unwrap(),
+        at(2023, 12, 31, 15, 30, 45)
+    );
+    assert_eq!(
+        parse_date_at("1y", at(2024, 2, 29, 1, 2, 3)).unwrap(),
+        at(2023, 2, 28, 1, 2, 3)
+    );
+    assert_eq!(
+        parse_date_at("12mo", now).unwrap(),
+        parse_date_at("1y", now).unwrap()
+    );
+}
+
+#[test]
+fn parse_date_at_zero_amount_returns_now() {
+    let now = at(2024, 3, 31, 15, 30, 45);
+
+    for value in ["0h", "0d", "0w", "0mo", "0y", "000d"] {
+        assert_eq!(parse_date_at(value, now).unwrap(), now, "{value}");
+    }
+}
+
+#[test]
+fn parse_date_at_rejects_invalid_input() {
+    let now = at(2024, 3, 31, 15, 30, 45);
+
+    for value in [
+        "",
+        "   ",
+        "-7d",
+        "1.5d",
+        "d",
+        "7",
+        "7x",
+        "7dd",
+        "7m",
+        "+7d",
+        "7 7d",
+        "tomorrow",
+        "7d ago",
+        "2024-13-01",
+        "abc",
+    ] {
+        assert!(
+            parse_date_at(value, now).is_err(),
+            "{value:?} should be rejected"
+        );
+    }
+}
+
+#[test]
+fn parse_date_at_points_months_users_to_mo() {
+    let now = at(2024, 3, 31, 15, 30, 45);
+    let message = parse_date_at("7m", now).unwrap_err().to_string();
+
+    assert!(message.contains("mo"), "{message}");
+    let message = parse_date_at("nonsense", now).unwrap_err().to_string();
+    assert!(
+        message.contains("YYYY-MM-DD") && message.contains("yesterday"),
+        "{message}"
+    );
+}
+
+#[test]
+fn parse_date_at_returns_errors_instead_of_overflowing() {
+    let now = at(2024, 3, 31, 15, 30, 45);
+
+    for value in [
+        "99999999999999999999d",
+        "999999999999d",
+        "999999999999999h",
+        "9223372036854775807d",
+        "9223372036854775808d",
+        "999999999999w",
+        "99999999999mo",
+        "4294967295mo",
+        "4294967295y",
+        "999999999y",
+        "99999999999999999999y",
+    ] {
+        assert!(
+            parse_date_at(value, now).is_err(),
+            "{value} should overflow to an error"
+        );
+    }
+}
+
+#[test]
+fn parse_date_matches_parse_date_at_for_absolute_and_relative_values() {
+    assert_eq!(parse_date("2024-01-01").unwrap(), at(2024, 1, 1, 0, 0, 0));
+
+    let before = Utc::now();
+    let parsed = parse_date("1d").unwrap();
+    let after = Utc::now();
+    assert!(parsed >= before - Duration::days(1) && parsed <= after - Duration::days(1));
+    assert!(parse_date("7m").is_err());
+}
+
+#[test]
+fn filter_builders_accept_relative_dates() {
+    let before = Utc::now();
+    let filters = SearchFilters::new()
+        .with_created_after("7d")
+        .unwrap()
+        .with_created_before("yesterday")
+        .unwrap()
+        .with_modified_after("1mo")
+        .unwrap()
+        .with_modified_before("2024-01-01")
+        .unwrap();
+    let after = Utc::now();
+
+    let created_after = filters.created_after.unwrap();
+    assert!(
+        created_after >= before - Duration::days(7) && created_after <= after - Duration::days(7)
+    );
+    assert_eq!(
+        filters.created_before.unwrap(),
+        parse_date("yesterday").unwrap()
+    );
+    assert!(filters.modified_after.unwrap() < before - Duration::days(27));
+    assert_eq!(filters.modified_before, Some(at(2024, 1, 1, 0, 0, 0)));
+
+    let options = SearchOptions::new("report")
+        .with_created_after("2h")
+        .unwrap()
+        .with_created_before("today")
+        .unwrap()
+        .with_modified_after("1w")
+        .unwrap()
+        .with_modified_before("1y")
+        .unwrap();
+    assert!(options.filters.created_after.is_some());
+    assert!(options.filters.created_before.is_some());
+    assert!(options.filters.modified_after.is_some());
+    assert!(options.filters.modified_before.is_some());
+}
+
+#[test]
+fn filter_builders_reject_invalid_relative_dates() {
+    for value in ["7m", "-7d", "", "99999999999999999999d", "7"] {
+        assert!(
+            SearchFilters::new().with_created_after(value).is_err(),
+            "{value:?}"
+        );
+        assert!(
+            SearchFilters::new().with_created_before(value).is_err(),
+            "{value:?}"
+        );
+        assert!(
+            SearchFilters::new().with_modified_after(value).is_err(),
+            "{value:?}"
+        );
+        assert!(
+            SearchFilters::new().with_modified_before(value).is_err(),
+            "{value:?}"
+        );
+        assert!(
+            SearchOptions::new("x").with_modified_before(value).is_err(),
+            "{value:?}"
+        );
+    }
 }
